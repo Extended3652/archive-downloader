@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import curses
 import json
+import math
 import os
 import re
 import shutil
@@ -22,6 +23,14 @@ LOG_PATH = os.path.join(MEDIA_ROOT, ".ia_dl.log")
 
 FILTERS = ["movies", "audio", "texts", "software", "any"]
 ROWS_PER_PAGE = 30
+SORT_OPTIONS = ["", "downloads desc", "date desc", "date asc", "titleSorter asc"]
+SORT_LABELS = {
+    "": "relevance",
+    "downloads desc": "most downloaded",
+    "date desc": "newest",
+    "date asc": "oldest",
+    "titleSorter asc": "title A-Z",
+}
 
 MIN_H = 18
 MIN_W = 70
@@ -206,7 +215,7 @@ def ia_ok() -> Tuple[bool, str]:
     return False, msg or "ia not available"
 
 
-def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchResult], str]:
+def ia_search_via_curl(query: str, rows: int, page: int, sort: str = "") -> Tuple[List[SearchResult], int, str]:
     start = max(0, (page - 1) * rows)
 
     cmd = [
@@ -231,18 +240,22 @@ def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchRes
         "--data-urlencode",
         f"start={start}",
     ]
+    if sort:
+        cmd += ["--data-urlencode", f"sort[]={sort}"]
 
     code, out, err = run_cmd(cmd, timeout=60)
     if code != 0:
         msg = (err or out).strip()
-        return [], msg or f"search failed (code {code})"
+        return [], 0, msg or f"search failed (code {code})"
 
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
-        return [], "search returned non-JSON"
+        return [], 0, "search returned non-JSON"
 
-    docs = (((data or {}).get("response") or {}).get("docs") or [])
+    response_block = (data or {}).get("response") or {}
+    num_found = int(response_block.get("numFound", 0))
+    docs = response_block.get("docs") or []
     results: List[SearchResult] = []
     for d in docs:
         ident = str(d.get("identifier", "")).strip()
@@ -253,7 +266,7 @@ def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchRes
         creator = str(d.get("creator", "")).strip()
         results.append(SearchResult(ident, title, year, creator))
 
-    return results, ""
+    return results, num_found, ""
 
 
 def ia_metadata_json(identifier: str) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -369,6 +382,8 @@ class RetroWaveIA:
         self.title_only = False
         self.enforce_license_gate = False
         self.page = 1
+        self.total_results = 0
+        self.sort_by = ""  # "" = relevance (API default)
 
         self.results: List[SearchResult] = []
         self.sel_r = 0
@@ -609,11 +624,13 @@ class RetroWaveIA:
                             and self.is_fav_item(self.results[self.sel_r].identifier))
                 else "Fav"
             )
+            sort_label = SORT_LABELS.get(self.sort_by, self.sort_by or "relevance")
             return [
                 ("Search", "search"),
                 (f"Filter: {self.filter}", "filter"),
                 (f"Title only: {'On' if self.title_only else 'Off'}", "title"),
                 (f"License gate: {'On' if self.enforce_license_gate else 'Off'}", "license_gate"),
+                (f"Sort: {sort_label}", "sort"),
                 ("Prev", "prev_page"),
                 ("Next", "next_page"),
                 ("Open", "open"),
@@ -801,6 +818,14 @@ class RetroWaveIA:
         self.filter = FILTERS[(idx + 1) % len(FILTERS)]
         self.status = f"Filter set to: {self.filter}"
 
+    def cycle_sort(self) -> None:
+        idx = SORT_OPTIONS.index(self.sort_by) if self.sort_by in SORT_OPTIONS else 0
+        self.sort_by = SORT_OPTIONS[(idx + 1) % len(SORT_OPTIONS)]
+        label = SORT_LABELS.get(self.sort_by, self.sort_by or "relevance")
+        self.status = f"Sort set to: {label}"
+        if self.query_text:
+            self.do_search(reset_page=True)
+
     def do_search(self, reset_page: bool = True) -> None:
         if reset_page:
             self.page = 1
@@ -812,7 +837,9 @@ class RetroWaveIA:
         self.status = "Searching..."
         self.render()
 
-        self.results, err = ia_search_via_curl(self.query_built, rows=ROWS_PER_PAGE, page=self.page)
+        self.results, self.total_results, err = ia_search_via_curl(
+            self.query_built, rows=ROWS_PER_PAGE, page=self.page, sort=self.sort_by
+        )
         if err:
             self.status = err
             return
@@ -820,11 +847,19 @@ class RetroWaveIA:
         self.sel_r = 0
         self.mode = "RESULTS"
         self.focus = "LIST"
-        self.status = f"Found {len(self.results)} results. Use arrows, then [Open]."
+        total_pages = max(1, math.ceil(self.total_results / ROWS_PER_PAGE))
+        self.status = (
+            f"Page {self.page}/{total_pages}  \u2014  "
+            f"{self.total_results} total results. Use arrows, then [Open]."
+        )
 
     def next_page(self) -> None:
         if not self.query_text:
             self.status = "No search yet. Choose [Search]."
+            return
+        total_pages = max(1, math.ceil(self.total_results / ROWS_PER_PAGE))
+        if self.page >= total_pages:
+            self.status = f"Already on last page ({self.page}/{total_pages})."
             return
         saved_focus = self.focus
         saved_menu_idx = self.menu_idx
@@ -1829,6 +1864,9 @@ class RetroWaveIA:
                 return
             if action == "filter":
                 self.cycle_filter()
+                return
+            if action == "sort":
+                self.cycle_sort()
                 return
             if action == "title":
                 self.title_only = not self.title_only
