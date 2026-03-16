@@ -1807,6 +1807,7 @@ class RetroWaveIA:
                         self.safe_addstr(list_top + (i - start), 0, line, attr)
 
 
+        ry = list_top
         details: List[str] = []
 
         if self.mode in ("RESULTS", "SEARCH"):
