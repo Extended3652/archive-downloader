@@ -15,6 +15,7 @@ STAGING_ROOT = os.path.join(MEDIA_ROOT, ".ia_staging")
 
 BUCKET_TV = os.path.join(MEDIA_ROOT, "TV")
 BUCKET_MOVIES = os.path.join(MEDIA_ROOT, "Movies")
+BUCKET_MUSIC = os.path.join(MEDIA_ROOT, "Music")
 BUCKET_OTHER = os.path.join(MEDIA_ROOT, "Other")
 
 FAVS_PATH = os.path.join(MEDIA_ROOT, ".ia_favorites.json")
@@ -110,6 +111,7 @@ def ensure_dirs() -> None:
     os.makedirs(STAGING_ROOT, exist_ok=True)
     os.makedirs(BUCKET_TV, exist_ok=True)
     os.makedirs(BUCKET_MOVIES, exist_ok=True)
+    os.makedirs(BUCKET_MUSIC, exist_ok=True)
     os.makedirs(BUCKET_OTHER, exist_ok=True)
 
 
@@ -706,7 +708,7 @@ class RetroWaveIA:
         if self.mode == "DOWNLOADING":
             keybar = "c cancels  |  q quits after cancel  |  (progress updates live)"
         elif self.mode in ("RESULTS", "SEARCH"):
-            keybar = "Arrows/Enter navigate  |  Tab menu/list  |  n/p or [ ] page  |  / search  |  q quit"
+            keybar = "Arrows/Enter navigate  |  Tab menu/list  |  n/p or [ ] page  |  s/  search  |  q quit"
         else:
             keybar = "Arrows move  |  Tab switches menu/list  |  Enter selects  |  q quits"
         self.safe_addstr(h - 2, 0, keybar[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(2))
@@ -902,7 +904,7 @@ class RetroWaveIA:
         return files
 
     def cycle_bucket(self) -> None:
-        order = ["TV", "Movies", "Other"]
+        order = ["TV", "Movies", "Music", "Other"]
         try:
             i = order.index(self.last_bucket)
         except Exception:
@@ -920,14 +922,13 @@ class RetroWaveIA:
         staging_path = staging_file_path(identifier, filename)
         if not os.path.exists(staging_path):
             return f"Downloaded, but staging file not found: {staging_path}"
-    
-        # --- helpers (local, minimal impact) ---
+
+        # --- helpers ---
         def has_year_hint(s: str) -> bool:
             if not s:
                 return False
-            # common patterns: "(1993)", "1993", "- 1993 -"
             return bool(re.search(r"\((19|20)\d{2}\)", s) or re.search(r"(19|20)\d{2}", s))
-    
+
         def is_single_large_video(name: str) -> bool:
             try:
                 video_files = [f for f in self.files if is_video_file(f.name, f.fmt)]
@@ -935,21 +936,28 @@ class RetroWaveIA:
                 return (len(large_video_files) == 1 and (large_video_files[0].name or "") == name)
             except Exception:
                 return False
-    
+
         ep = detect_sxxeyy(filename) or detect_sxxeyy(item_title)
-    
-        # Start from last bucket, but allow smart overrides
-        bucket = self.last_bucket if self.last_bucket in ("TV", "Movies", "Other") else "Other"
-    
-        # If it clearly looks episodic, force TV regardless of last choice
+
+        # Auto-detect a suggested bucket
         if ep:
-            bucket = "TV"
+            suggested = "TV"
+        elif has_year_hint(filename) or has_year_hint(item_title) or is_single_large_video(filename):
+            suggested = "Movies"
+        elif self.last_bucket in ("TV", "Movies", "Music", "Other"):
+            suggested = self.last_bucket
         else:
-            # If it looks like a movie, force Movies regardless of last choice
-            # (year hint OR single large video file with no SxxEyy)
-            if has_year_hint(filename) or has_year_hint(item_title) or is_single_large_video(filename):
-                bucket = "Movies"
-    
+            suggested = "Other"
+
+        # Ask user to confirm / choose bucket at download time
+        bucket_raw = self.prompt("Save to (TV/Movies/Music/Other): ", suggested)
+        if bucket_raw is None:
+            return f"Left in staging: {staging_path}"
+        bucket = bucket_raw.strip().title()
+        if bucket not in ("TV", "Movies", "Music", "Other"):
+            bucket = suggested
+        self.last_bucket = bucket
+
         if bucket == "TV":
             show_default = sanitize_folder(item_title)
             show = self.prompt('Show name (Enter default, or type "*" for favorites): ', show_default)
@@ -960,8 +968,7 @@ class RetroWaveIA:
                 show = pick if pick else show_default
             show = sanitize_folder(show)
             self.add_folder_fav("TV", show)
-    
-            # If we detected SxxEyy, do not ask season/episode questions
+
             if ep:
                 season, episode = ep
                 episode_override: Optional[int] = None
@@ -980,18 +987,18 @@ class RetroWaveIA:
                     episode_override = int(e) if e.strip() else None
                 except Exception:
                     episode_override = None
-    
+
             season_dir = os.path.join(BUCKET_TV, show, f"Season {season:02d}")
             os.makedirs(season_dir, exist_ok=True)
-    
+
             new_name = filename
             if ep or episode_override is not None:
                 ext = os.path.splitext(filename)[1] or ".mp4"
                 ep_num = ep[1] if ep else (episode_override if episode_override is not None else 1)
                 new_name = f"{show} - S{season:02d}E{ep_num:02d}{ext}"
-    
+
             final_path = os.path.join(season_dir, new_name)
-    
+
         elif bucket == "Movies":
             title_default = auto_clean_movie_folder_name(item_title, filename)
             movie = self.prompt('Movie folder (Enter default, or type "*" for favorites): ', title_default)
@@ -1002,11 +1009,24 @@ class RetroWaveIA:
                 movie = pick if pick else title_default
             movie = sanitize_folder(movie)
             self.add_folder_fav("Movies", movie)
-    
+
             movie_dir = os.path.join(BUCKET_MOVIES, movie)
-            os.makedirs(movie_dir, exist_ok=True)
             final_path = os.path.join(movie_dir, filename)
-    
+
+        elif bucket == "Music":
+            artist_default = sanitize_folder(item_title)
+            artist = self.prompt('Artist/album folder (Enter default, or type "*" for favorites): ', artist_default)
+            if artist is None:
+                return f"Left in staging: {staging_path}"
+            if artist.strip() == "*":
+                pick = self.pick_folder_fav_if_requested("Music")
+                artist = pick if pick else artist_default
+            artist = sanitize_folder(artist)
+            self.add_folder_fav("Music", artist)
+
+            music_dir = os.path.join(BUCKET_MUSIC, artist)
+            final_path = os.path.join(music_dir, filename)
+
         else:
             sub = self.prompt('Other subfolder (Enter "Misc", or type "*" for favorites): ', "Misc")
             if sub is None:
@@ -1016,16 +1036,16 @@ class RetroWaveIA:
                 sub = pick if pick else "Misc"
             sub = sanitize_folder(sub)
             self.add_folder_fav("Other", sub)
-    
+
             other_dir = os.path.join(BUCKET_OTHER, sub)
-            os.makedirs(other_dir, exist_ok=True)
             final_path = os.path.join(other_dir, filename)
-    
+
         if os.path.exists(final_path):
             base, ext = os.path.splitext(final_path)
             stamp = time.strftime("%Y%m%d_%H%M%S")
             final_path = f"{base}_{stamp}{ext}"
-    
+
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
         shutil.move(staging_path, final_path)
         return f"Saved: {final_path}"
     
@@ -1326,8 +1346,8 @@ class RetroWaveIA:
             return
 
         if not ok and not self.enforce_license_gate:
-            s = self.prompt('Rights unclear. Type "DOWNLOAD" to proceed, or Esc to cancel: ', "")
-            if s is None or s.strip().upper() != "DOWNLOAD":
+            s = self.prompt('Rights unclear. Press Enter to proceed, or Esc to cancel: ', "")
+            if s is None:
                 self.status = "Canceled."
                 self.mode = "FILES"
                 self.focus = "LIST"
@@ -1997,7 +2017,7 @@ class RetroWaveIA:
                         self.activate_menu_action(action)
                     continue
 
-            if ch == ord('/'):
+            if ch in (ord('/'), ord('s'), ord('S')):
                 s = self.prompt("Search: ", self.query_text)
                 if s is not None:
                     self.query_text = s
