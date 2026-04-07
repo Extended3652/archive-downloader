@@ -1026,6 +1026,7 @@ class RetroWaveIA:
             stamp = time.strftime("%Y%m%d_%H%M%S")
             final_path = f"{base}_{stamp}{ext}"
     
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
         shutil.move(staging_path, final_path)
         return f"Saved: {final_path}"
     
