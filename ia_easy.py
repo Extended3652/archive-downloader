@@ -2,57 +2,18 @@
 import json
 import os
 import re
-import subprocess
 import sys
-from dataclasses import dataclass
 from typing import List, Optional
 
-@dataclass
-class SearchResult:
-    identifier: str
-    title: str
-    year: str
-
-@dataclass
-class IAFile:
-    name: str
-    size: int
-    fmt: str
-
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
-VIDEO_FORMAT_HINTS = (
-    "h.264", "h264", "mpeg4", "mp4", "matroska", "webm", "quicktime", "avi"
+from ia_common import (
+    IACommandError,
+    IAFile,
+    IANotInstalled,
+    SearchResult,
+    human_size,
+    is_video_file,
+    run,
 )
-
-def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
-    except FileNotFoundError:
-        print("\nError: 'ia' command not found.")
-        print("Install with: pip3 install --user internetarchive\n")
-        sys.exit(2)
-    except subprocess.CalledProcessError as e:
-        msg = (e.stderr or e.stdout or "").strip()
-        print("\nThat command failed:")
-        print(" ".join(cmd))
-        if msg:
-            print("\n" + msg + "\n")
-        sys.exit(e.returncode)
-
-def human_size(n: int) -> str:
-    try:
-        n = int(n)
-    except Exception:
-        return "?"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    f = float(n)
-    i = 0
-    while f >= 1024.0 and i < len(units) - 1:
-        f /= 1024.0
-        i += 1
-    if i == 0:
-        return f"{int(f)}{units[i]}"
-    return f"{f:.2f}{units[i]}"
 
 def prompt(msg: str) -> str:
     return input(msg).strip()
@@ -114,15 +75,8 @@ def ia_metadata_files(identifier: str) -> List[IAFile]:
         files.append(IAFile(name=name, size=size, fmt=fmt))
     return files
 
-def is_video_file(f: IAFile) -> bool:
-    ext = os.path.splitext(f.name.lower())[1]
-    if ext in VIDEO_EXTS:
-        return True
-    fmt_l = (f.fmt or "").lower()
-    return any(h in fmt_l for h in VIDEO_FORMAT_HINTS)
-
 def filter_video_files(files: List[IAFile], keyword: Optional[str]) -> List[IAFile]:
-    vids = [f for f in files if is_video_file(f)]
+    vids = [f for f in files if is_video_file(f.name, f.fmt)]
     if keyword:
         rx = re.compile(re.escape(keyword), re.IGNORECASE)
         vids = [f for f in vids if rx.search(f.name) or rx.search(f.fmt)]
@@ -146,9 +100,10 @@ def main() -> int:
     print("- Press Enter on any prompt to cancel/back out.")
     print("- Search is limited to mediatype:movies by default.\n")
 
-    dest = prompt("Download folder (default: ~/Downloads): ")
+    default_dest = os.environ.get("XDG_DOWNLOAD_DIR") or os.path.expanduser("~/Downloads")
+    dest = prompt(f"Download folder (default: {default_dest}): ")
     if not dest:
-        dest = os.path.expanduser("~/Downloads")
+        dest = default_dest
     else:
         dest = os.path.expanduser(dest)
 
@@ -158,7 +113,12 @@ def main() -> int:
             print("\nBye.")
             return 0
 
-        results = ia_search_simple(q, rows=25)
+        try:
+            results = ia_search_simple(q, rows=25)
+        except IACommandError as e:
+            print(f"Search failed: {e.stderr or e}")
+            continue
+
         if not results:
             print("No results. Try different words.")
             continue
@@ -177,6 +137,9 @@ def main() -> int:
         item = results[idx - 1]
         try:
             files = ia_metadata_files(item.identifier)
+        except IACommandError as e:
+            print(f"Could not fetch metadata: {e.stderr or e}")
+            continue
         except json.JSONDecodeError:
             print("Could not read metadata for that item.")
             continue
@@ -198,7 +161,11 @@ def main() -> int:
             continue
 
         chosen = vids[fidx - 1]
-        download_file(item.identifier, chosen.name, dest)
+        try:
+            download_file(item.identifier, chosen.name, dest)
+        except IACommandError as e:
+            print(f"Download failed: {e.stderr or e}")
+            continue
 
         again = prompt("\nDownload another? (y/n): ").lower()
         if again not in ("y", "yes"):
@@ -206,4 +173,12 @@ def main() -> int:
             return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except IANotInstalled:
+        print("\nError: 'ia' command not found.")
+        print("Install with: pip3 install --user internetarchive\n")
+        raise SystemExit(2)
+    except KeyboardInterrupt:
+        print("\nBye.")
+        raise SystemExit(0)

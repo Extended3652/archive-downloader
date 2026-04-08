@@ -6,11 +6,22 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 
+from ia_common import (
+    IAFile,
+    SearchResult,
+    VIDEO_EXTS,
+    VIDEO_FORMAT_HINTS,
+    human_size,
+    is_video_file,
+    safe_path_under,
+)
 
-MEDIA_ROOT = "/mnt/ssd/media"
+
+# MEDIA_ROOT is configurable via the IA_MEDIA_ROOT env var. Default lives under
+# the user's home directory so the tool runs without machine-specific tweaks.
+MEDIA_ROOT = os.environ.get("IA_MEDIA_ROOT") or os.path.expanduser("~/Media")
 STAGING_ROOT = os.path.join(MEDIA_ROOT, ".ia_staging")
 
 BUCKET_TV = os.path.join(MEDIA_ROOT, "TV")
@@ -31,33 +42,7 @@ MIN_W = 70
 # This also reduces confusion when verifying "new downloads" by timestamp.
 IA_NO_CHANGE_TIMESTAMP = True
 
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
-VIDEO_FORMAT_HINTS = (
-    "h.264",
-    "h264",
-    "mpeg4",
-    "mp4",
-    "matroska",
-    "webm",
-    "quicktime",
-    "avi",
-)
 LARGE_VIDEO_BYTES = 500 * 1024 * 1024
-
-
-@dataclass
-class SearchResult:
-    identifier: str
-    title: str
-    year: str
-    creator: str
-
-
-@dataclass
-class IAFile:
-    name: str
-    size: int
-    fmt: str
 
 
 def log_line(msg: str) -> None:
@@ -91,22 +76,6 @@ def run_cmd(cmd: List[str], timeout: int = 60) -> Tuple[int, str, str]:
         return 124, "", "command timed out"
 
 
-def human_size(n: int) -> str:
-    try:
-        n = int(n)
-    except Exception:
-        return "?"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    f = float(n)
-    i = 0
-    while f >= 1024 and i < len(units) - 1:
-        f /= 1024.0
-        i += 1
-    if i == 0:
-        return f"{int(f)}{units[i]}"
-    return f"{f:.2f}{units[i]}"
-
-
 def ensure_dirs() -> None:
     os.makedirs(STAGING_ROOT, exist_ok=True)
     os.makedirs(BUCKET_TV, exist_ok=True)
@@ -127,14 +96,6 @@ def detect_sxxeyy(text: str) -> Optional[Tuple[int, int]]:
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
-
-
-def is_video_file(name: str, fmt: str = "") -> bool:
-    ext = os.path.splitext((name or "").lower())[1]
-    if ext in VIDEO_EXTS:
-        return True
-    fmt_l = (fmt or "").lower()
-    return any(h in fmt_l for h in VIDEO_FORMAT_HINTS)
 
 
 def auto_clean_movie_folder_name(item_title: str, filename: str) -> str:
@@ -317,8 +278,21 @@ def is_openly_licensed(meta: Dict[str, Any]) -> Tuple[bool, str]:
         "no redistribution",
         "permission required",
     ]
+    # Phrases that LOOK open at first glance but are actually negated.
+    # We bail out before allow-marker matching if any of these are present.
+    negation_markers = [
+        "not in the public domain",
+        "not public domain",
+        "not creative commons",
+        "no public domain",
+    ]
 
     joined = " | ".join([p for p in possible if p])
+
+    for n in negation_markers:
+        if n in joined:
+            return False, f"Negated open-license phrase: {n}"
+
     for d in deny_markers:
         if d in joined:
             return False, f"Blocked by rights metadata: {d}"
@@ -657,14 +631,9 @@ class RetroWaveIA:
         if self.mode == "PREVIEW_DL":
             return [("Confirm", "confirm_download"), ("Cancel", "cancel_preview")]
         if self.mode == "FAVS":
-            tab = self.favs_tab
-            tab_label = f"Tab: {tab}"
-            primary = "Open" if tab == "ITEMS" else ("Download" if tab == "FILES" else "Use")
             return [
                 ("Back", "back"),
-                (tab_label, "tab"),
-                (primary, "primary"),
-                ("Remove", "remove"),
+                (f"Tab: {self.favs_tab}", "tab"),
                 ("Help", "help"),
                 ("Quit", "quit"),
             ]
@@ -1044,6 +1013,13 @@ class RetroWaveIA:
             base, ext = os.path.splitext(final_path)
             stamp = time.strftime("%Y%m%d_%H%M%S")
             final_path = f"{base}_{stamp}{ext}"
+
+        # Defense in depth: sanitize_folder() strips path separators but does
+        # not block ".." components. Resolve and verify the destination is
+        # actually under MEDIA_ROOT before moving any bytes.
+        if not safe_path_under(MEDIA_ROOT, final_path):
+            log_line(f"REFUSED move outside MEDIA_ROOT: {final_path}")
+            return f"Refused: destination escapes media root: {final_path}"
 
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         shutil.move(staging_path, final_path)
@@ -1520,7 +1496,7 @@ class RetroWaveIA:
             "  - Downloads are blocked unless metadata indicates an open license (CC/PD).",
             "  - Staging is used first, then files are moved into TV/Movies/Other.",
             f"  - {'--no-change-timestamp is enabled (mtimes set to now).' if IA_NO_CHANGE_TIMESTAMP else 'Source mtimes are preserved.'}",
-            "  - Log file: /mnt/ssd/media/.ia_dl.log",
+            f"  - Log file: {LOG_PATH}",
         ]
 
         for line in lines:
@@ -1954,19 +1930,11 @@ class RetroWaveIA:
                 order = ["ITEMS", "FILES", "FOLDERS"]
                 try:
                     i = order.index(self.favs_tab)
-                except Exception:
+                except ValueError:
                     i = 0
                 self.favs_tab = order[(i + 1) % len(order)]
                 self.favs_idx = 0
                 self.status = f"Favorites tab: {self.favs_tab}"
-                return
-
-            if action == "remove":
-                self.status = "Remove not implemented in this build."
-                return
-
-            if action == "primary":
-                self.status = "Primary not implemented in this build."
                 return
 
     # ---------- input loop ----------

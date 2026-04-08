@@ -3,49 +3,10 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-@dataclass
-class SearchResult:
-    identifier: str
-    title: str
-    year: str
-
-@dataclass
-class IAFile:
-    name: str
-    size: int
-    format: str
-
-def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
-    except FileNotFoundError:
-        print("Error: 'ia' command not found. Install it with: pip3 install --user internetarchive", file=sys.stderr)
-        sys.exit(2)
-    except subprocess.CalledProcessError as e:
-        msg = e.stderr.strip() or e.stdout.strip()
-        print(f"Command failed: {' '.join(cmd)}", file=sys.stderr)
-        if msg:
-            print(msg, file=sys.stderr)
-        sys.exit(e.returncode)
-
-def human_size(n: int) -> str:
-    if n is None:
-        return "?"
-    n = int(n)
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = 0
-    f = float(n)
-    while f >= 1024 and i < len(units) - 1:
-        f /= 1024.0
-        i += 1
-    if i == 0:
-        return f"{int(f)}{units[i]}"
-    return f"{f:.2f}{units[i]}"
+from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, human_size, run
 
 def sanitize_query(q: str) -> str:
     q = q.strip()
@@ -69,8 +30,9 @@ def ia_search(query: str, rows: int) -> List[SearchResult]:
         identifier = str(obj.get("identifier", "")).strip()
         title = str(obj.get("title", "")).strip()
         year = str(obj.get("year", "")).strip()
+        creator = str(obj.get("creator", "")).strip()
         if identifier:
-            results.append(SearchResult(identifier=identifier, title=title or "(no title)", year=year or ""))
+            results.append(SearchResult(identifier=identifier, title=title or "(no title)", year=year or "", creator=creator))
     return results
 
 def choose_result(results: List[SearchResult]) -> Optional[SearchResult]:
@@ -110,21 +72,22 @@ def ia_list_files(identifier: str) -> List[IAFile]:
         except (TypeError, ValueError):
             size = 0
         fmt = str(f.get("format", "")).strip()
-        files.append(IAFile(name=name, size=size, format=fmt))
+        files.append(IAFile(name=name, size=size, fmt=fmt))
     return files
 
 def filter_files(files: List[IAFile], exts: Optional[List[str]], regex: Optional[str]) -> List[IAFile]:
     out = files[:]
     if exts:
-        norm_exts = []
+        norm_exts = set()
         for e in exts:
-            e = e.strip().lower()
-            if not e:
+            e = (e or "").strip().lower()
+            if not e or e == ".":
                 continue
             if not e.startswith("."):
                 e = "." + e
-            norm_exts.append(e)
-        out = [f for f in out if os.path.splitext(f.name.lower())[1] in norm_exts]
+            norm_exts.add(e)
+        if norm_exts:
+            out = [f for f in out if os.path.splitext(f.name.lower())[1] in norm_exts]
     if regex:
         try:
             rx = re.compile(regex, re.IGNORECASE)
@@ -139,7 +102,7 @@ def print_files(files: List[IAFile]) -> None:
         print("(no matching files)")
         return
     for i, f in enumerate(files, start=1):
-        fmt = f.format if f.format else ""
+        fmt = f.fmt if f.fmt else ""
         print(f"{i:2d}. {human_size(f.size):>10}  {fmt:<20}  {f.name}")
 
 def choose_file(files: List[IAFile]) -> Optional[IAFile]:
@@ -173,6 +136,12 @@ def ia_download(identifier: str, dest: str, glob_pat: Optional[str], exact_file:
     run(cmd, check=True)
     print("Done.")
 
+def positive_int(s: str) -> int:
+    v = int(s)
+    if v < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return v
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="ia_dl",
@@ -182,7 +151,7 @@ def main() -> int:
 
     sp = sub.add_parser("search", help="Search items and print results.")
     sp.add_argument("query", help='Search query. Example: \'title:"Test Copy" AND mediatype:movies\'')
-    sp.add_argument("--rows", type=int, default=20, help="Max results (default 20).")
+    sp.add_argument("--rows", type=positive_int, default=20, help="Max results (default 20).")
 
     lp = sub.add_parser("list", help="List files for an item identifier.")
     lp.add_argument("identifier", help="Internet Archive identifier.")
@@ -192,7 +161,7 @@ def main() -> int:
     dp = sub.add_parser("download", help="Download a file (interactive or automatic).")
     dp.add_argument("identifier", nargs="?", help="Identifier. If omitted, you can use --search to find one.")
     dp.add_argument("--search", help='Search query to pick an identifier interactively.')
-    dp.add_argument("--rows", type=int, default=20, help="Max search results (default 20).")
+    dp.add_argument("--rows", type=positive_int, default=20, help="Max search results (default 20).")
     dp.add_argument("--dest", default=".", help="Destination directory (default current dir).")
     dp.add_argument("--ext", action="append", help="Filter by extension (repeatable), e.g. --ext mp4")
     dp.add_argument("--regex", help="Filter by filename regex (case-insensitive).")
@@ -272,4 +241,13 @@ def main() -> int:
     return 0
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except IANotInstalled:
+        print("Error: 'ia' command not found. Install it with: pip3 install --user internetarchive", file=sys.stderr)
+        raise SystemExit(2)
+    except IACommandError as e:
+        print(f"Command failed: {' '.join(e.cmd)}", file=sys.stderr)
+        if e.stderr:
+            print(e.stderr, file=sys.stderr)
+        raise SystemExit(e.returncode or 1)
