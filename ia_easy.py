@@ -15,6 +15,13 @@ from ia_common import (
     run,
 )
 
+DEFAULT_MEDIA_ROOT = os.environ.get("XDG_DOWNLOAD_DIR") or os.path.expanduser("~/Downloads")
+DEST_BUCKETS = {
+    "tv": os.path.join(DEFAULT_MEDIA_ROOT, "TV"),
+    "movie": os.path.join(DEFAULT_MEDIA_ROOT, "Movies"),
+    "other": os.path.join(DEFAULT_MEDIA_ROOT, "Other"),
+}
+
 def prompt(msg: str) -> str:
     return input(msg).strip()
 
@@ -37,12 +44,20 @@ def ia_search_simple(q: str, rows: int = 20) -> List[SearchResult]:
         return []
 
     if ("mediatype:" not in q) and ("title:" not in q) and ("AND" not in q) and ("OR" not in q):
-        query = f'title:("{q}") AND mediatype:movies'
+        # Better default search:
+        # - prioritize title matches
+        # - still allow metadata-only hits from description/subject/creator
+        # - include videos and audio by default (many items are not tagged as movies)
+        query = (
+            f'((title:("{q}")^3) OR description:("{q}") OR subject:("{q}") OR creator:("{q}")) '
+            f'AND (mediatype:movies OR mediatype:video OR mediatype:audio)'
+        )
     else:
         query = q
 
     p = run(["ia", "search", query, "--rows", str(rows), "--json"])
-    out: List[SearchResult] = []
+    tokens = [t.lower() for t in re.findall(r"[\w']+", q)]
+    scored: List[tuple[int, SearchResult]] = []
     for line in p.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -55,8 +70,21 @@ def ia_search_simple(q: str, rows: int = 20) -> List[SearchResult]:
         title = str(obj.get("title", "")).strip() or "(no title)"
         year = str(obj.get("year", "")).strip()
         if ident:
-            out.append(SearchResult(identifier=ident, title=title, year=year))
-    return out
+            item = SearchResult(identifier=ident, title=title, year=year)
+            score = 0
+            title_l = title.lower()
+            ident_l = ident.lower()
+            for tok in tokens:
+                if tok in title_l:
+                    score += 3
+                if tok in ident_l:
+                    score += 1
+            if year and year.isdigit():
+                score += 1
+            scored.append((score, item))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [i for _, i in scored]
 
 def ia_metadata_files(identifier: str) -> List[IAFile]:
     p = run(["ia", "metadata", identifier, "--json"])
@@ -93,19 +121,50 @@ def download_file(identifier: str, filename: str, dest: str) -> None:
     print("\nDone.")
     print(f"Saved to: {os.path.join(dest, identifier, filename)}")
 
+
+def infer_destination_bucket(identifier: str, filename: str) -> str:
+    check = f"{identifier} {filename}".lower()
+    if re.search(r"\bs\d{1,2}e\d{1,2}\b", check):
+        return "tv"
+    return "movie"
+
+
+def choose_destination(identifier: str, filename: str) -> str:
+    default_bucket = infer_destination_bucket(identifier, filename)
+    print("\nWhere should this download go?")
+    print(f" 1) TV     -> {DEST_BUCKETS['tv']}")
+    print(f" 2) Movie  -> {DEST_BUCKETS['movie']}")
+    print(f" 3) Other  -> {DEST_BUCKETS['other']}")
+    print(" 4) Custom folder")
+
+    default_choice = {"tv": "1", "movie": "2", "other": "3"}[default_bucket]
+    while True:
+        choice = prompt(f"Choose destination [{default_choice}]: ")
+        if not choice:
+            choice = default_choice
+
+        if choice == "1":
+            return DEST_BUCKETS["tv"]
+        if choice == "2":
+            return DEST_BUCKETS["movie"]
+        if choice == "3":
+            return DEST_BUCKETS["other"]
+        if choice == "4":
+            custom = prompt("Custom path: ")
+            if custom:
+                return os.path.expanduser(custom)
+            print("Please enter a custom path.")
+            continue
+
+        print("Choose 1, 2, 3, or 4.")
+
+
 def main() -> int:
     print("\nInternet Archive Downloader (easy mode)")
     print("-------------------------------------")
     print("Tips:")
     print("- Press Enter on any prompt to cancel/back out.")
-    print("- Search is limited to mediatype:movies by default.\n")
-
-    default_dest = os.environ.get("XDG_DOWNLOAD_DIR") or os.path.expanduser("~/Downloads")
-    dest = prompt(f"Download folder (default: {default_dest}): ")
-    if not dest:
-        dest = default_dest
-    else:
-        dest = os.path.expanduser(dest)
+    print("- Search prioritizes title matches and checks common media types.\n")
 
     while True:
         q = prompt("\nSearch title (example: Test Copy) or full IA query: ")
@@ -161,6 +220,7 @@ def main() -> int:
             continue
 
         chosen = vids[fidx - 1]
+        dest = choose_destination(item.identifier, chosen.name)
         try:
             download_file(item.identifier, chosen.name, dest)
         except IACommandError as e:
