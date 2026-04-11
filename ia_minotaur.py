@@ -137,7 +137,8 @@ def is_video_file(name: str, fmt: str = "") -> bool:
     return any(h in fmt_l for h in VIDEO_FORMAT_HINTS)
 
 
-def auto_clean_movie_folder_name(item_title: str, filename: str) -> str:
+def auto_clean_movie_folder_name(item_title: str, filename: str,
+                                 fallback_year: str = "") -> str:
     raw = (item_title or "").strip() or (filename or "").strip()
     raw = os.path.basename(raw)
     raw = os.path.splitext(raw)[0]
@@ -152,6 +153,9 @@ def auto_clean_movie_folder_name(item_title: str, filename: str) -> str:
         title_part = raw[: year_match.start()]
     else:
         title_part = raw
+        fy = (fallback_year or "").strip()
+        if re.fullmatch(r"(19|20)\d{2}", fy):
+            year = fy
 
     scene_rx = re.compile(
         r"\b(?:"
@@ -918,7 +922,7 @@ class RetroWaveIA:
             return None
         return self.prompt_list(f"{bucket} favorites", [str(x) for x in opts if str(x).strip()])
 
-    def choose_bucket_and_path(self, identifier: str, filename: str, item_title: str) -> str:
+    def choose_bucket_and_path(self, identifier: str, filename: str, item_title: str, item_year: str = "") -> str:
         staging_path = staging_file_path(identifier, filename)
         if not os.path.exists(staging_path):
             return f"Downloaded, but staging file not found: {staging_path}"
@@ -1000,18 +1004,29 @@ class RetroWaveIA:
             final_path = os.path.join(season_dir, new_name)
 
         elif bucket == "Movies":
-            title_default = auto_clean_movie_folder_name(item_title, filename)
-            movie = self.prompt('Movie folder (Enter default, or type "*" for favorites): ', title_default)
-            if movie is None:
-                return f"Left in staging: {staging_path}"
-            if movie.strip() == "*":
-                pick = self.pick_folder_fav_if_requested("Movies")
-                movie = pick if pick else title_default
-            movie = sanitize_folder(movie)
+            title_default = auto_clean_movie_folder_name(item_title, filename, item_year)
+            confident = bool(re.search(r"\((19|20)\d{2}\)\s*$", title_default))
+
+            if confident:
+                movie = sanitize_folder(title_default)
+            else:
+                movie = self.prompt('Movie folder (Enter default, or type "*" for favorites): ', title_default)
+                if movie is None:
+                    return f"Left in staging: {staging_path}"
+                if movie.strip() == "*":
+                    pick = self.pick_folder_fav_if_requested("Movies")
+                    movie = pick if pick else title_default
+                movie = sanitize_folder(movie)
+
             self.add_folder_fav("Movies", movie)
 
             movie_dir = os.path.join(BUCKET_MOVIES, movie)
-            final_path = os.path.join(movie_dir, filename)
+            if is_single_large_video(filename):
+                ext = os.path.splitext(filename)[1] or ".mp4"
+                new_name = f"{movie}{ext}"
+            else:
+                new_name = filename
+            final_path = os.path.join(movie_dir, new_name)
 
         elif bucket == "Music":
             artist_default = sanitize_folder(item_title)
@@ -1381,7 +1396,7 @@ class RetroWaveIA:
                 self.download_log = self.download_log[:8]
                 return
 
-            msg = self.choose_bucket_and_path(item.identifier, f.name, item.title)
+            msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, item.year)
             self.download_log.insert(0, msg)
             self.download_log = self.download_log[:8]
             self.status = msg
@@ -1440,7 +1455,7 @@ class RetroWaveIA:
                         self.download_log = self.download_log[:8]
                         return
 
-                    msg = self.choose_bucket_and_path(item.identifier, f.name, item.title)
+                    msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, item.year)
                     self.download_log.insert(0, msg)
                     self.download_log = self.download_log[:8]
                     self.status = msg
@@ -1477,7 +1492,7 @@ class RetroWaveIA:
                     self.download_log = self.download_log[:8]
                     return
 
-                msg = self.choose_bucket_and_path(item.identifier, f.name, item.title)
+                msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, item.year)
                 self.download_log.insert(0, msg)
                 self.download_log = self.download_log[:8]
                 self.status = msg
