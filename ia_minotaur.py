@@ -330,6 +330,173 @@ def dir_total_size(root: str) -> int:
     return total
 
 
+class FavoritesStore:
+    """Manages favorites persistence (items, files, folders) independently of UI."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.data: Dict[str, Any] = self._load()
+
+    @staticmethod
+    def _base() -> Dict[str, Any]:
+        return {"items": [], "files": [], "folders": {"TV": [], "Movies": [], "Other": []}}
+
+    def _load(self) -> Dict[str, Any]:
+        base = self._base()
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    base["items"] = data.get("items", []) if isinstance(data.get("items", []), list) else []
+                    base["files"] = data.get("files", []) if isinstance(data.get("files", []), list) else []
+                    folders = data.get("folders", {})
+                    if isinstance(folders, dict):
+                        for k in ("TV", "Movies", "Other"):
+                            v = folders.get(k, [])
+                            base["folders"][k] = v if isinstance(v, list) else []
+        except Exception:
+            pass
+        return base
+
+    def save(self) -> None:
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2)
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    def is_fav_item(self, identifier: str) -> bool:
+        ident = (identifier or "").strip()
+        for it in self.data.get("items", []):
+            if str(it.get("identifier", "")).strip() == ident:
+                return True
+        return False
+
+    def toggle_fav_item(self, r: SearchResult) -> str:
+        ident = (r.identifier or "").strip()
+        if not ident:
+            return ""
+        items = self.data.get("items", [])
+        if not isinstance(items, list):
+            items = []
+            self.data["items"] = items
+
+        if self.is_fav_item(ident):
+            self.data["items"] = [it for it in items if str(it.get("identifier", "")).strip() != ident]
+            msg = "Removed favorite item."
+        else:
+            items.insert(0, {"identifier": r.identifier, "title": r.title, "year": r.year, "creator": r.creator})
+            msg = "Added favorite item."
+        self.save()
+        return msg
+
+    @staticmethod
+    def file_fav_key(identifier: str, filename: str) -> str:
+        return f"{(identifier or '').strip()}::{(filename or '').strip()}"
+
+    def is_fav_file(self, identifier: str, filename: str) -> bool:
+        key = self.file_fav_key(identifier, filename)
+        for it in self.data.get("files", []):
+            k2 = self.file_fav_key(it.get("identifier", ""), it.get("filename", ""))
+            if k2 == key:
+                return True
+        return False
+
+    def toggle_fav_file(self, item: SearchResult, f: IAFile) -> str:
+        ident = (item.identifier or "").strip()
+        fname = (f.name or "").strip()
+        if not ident or not fname:
+            return ""
+
+        files = self.data.get("files", [])
+        if not isinstance(files, list):
+            files = []
+            self.data["files"] = files
+
+        if self.is_fav_file(ident, fname):
+            self.data["files"] = [
+                it
+                for it in files
+                if self.file_fav_key(it.get("identifier", ""), it.get("filename", "")) != self.file_fav_key(ident, fname)
+            ]
+            msg = "Removed favorite file."
+        else:
+            files.insert(
+                0,
+                {
+                    "identifier": item.identifier,
+                    "item_title": item.title,
+                    "year": item.year,
+                    "creator": item.creator,
+                    "filename": f.name,
+                    "size": int(f.size or 0),
+                    "fmt": f.fmt,
+                },
+            )
+            msg = "Added favorite file."
+        self.save()
+        return msg
+
+    def add_folder_fav(self, bucket: str, folder_name: str) -> None:
+        bucket = bucket if bucket in ("TV", "Movies", "Other") else "Other"
+        name = sanitize_folder(folder_name)
+        arr = self.data.get("folders", {}).get(bucket, [])
+        if not isinstance(arr, list):
+            self.data["folders"][bucket] = []
+            arr = self.data["folders"][bucket]
+        lowered = {str(x).strip().lower() for x in arr}
+        if name.strip().lower() not in lowered:
+            arr.insert(0, name)
+            self.data["folders"][bucket] = arr[:30]
+            self.save()
+
+    def folders(self, bucket: str) -> List[str]:
+        arr = self.data.get("folders", {}).get(bucket, [])
+        return arr if isinstance(arr, list) else []
+
+    def remove_item(self, index: int) -> Optional[str]:
+        lst = self.data.get("items") or []
+        if not lst or not (0 <= index < len(lst)):
+            return None
+        removed = lst.pop(index)
+        self.data["items"] = lst
+        self.save()
+        return removed.get("title") or removed.get("identifier", "?")
+
+    def remove_file(self, index: int) -> Optional[str]:
+        lst = self.data.get("files") or []
+        if not lst or not (0 <= index < len(lst)):
+            return None
+        removed = lst.pop(index)
+        self.data["files"] = lst
+        self.save()
+        return removed.get("filename", "?")
+
+    def remove_folder(self, index: int) -> Optional[str]:
+        folders = self.data.get("folders") or {}
+        flat: List[Tuple[str, str]] = []
+        for b in ("TV", "Movies", "Other"):
+            for n in (folders.get(b) or []):
+                flat.append((b, n))
+        if not flat or not (0 <= index < len(flat)):
+            return None
+        bucket, name = flat[index]
+        self.data["folders"][bucket] = [n for n in (folders.get(bucket) or []) if n != name]
+        self.save()
+        return name
+
+    def flat_folders(self) -> List[Tuple[str, str]]:
+        folders = self.data.get("folders") or {}
+        result: List[Tuple[str, str]] = []
+        for b in ("TV", "Movies", "Other"):
+            for n in (folders.get(b) or []):
+                result.append((b, n))
+        return result
+
+
 class RetroWaveIA:
     def __init__(self, stdscr):
         self.stdscr = stdscr
@@ -362,7 +529,7 @@ class RetroWaveIA:
 
         self.exit_requested = False
 
-        self.favs = self.load_favs()
+        self.fav_store = FavoritesStore(FAVS_PATH)
         self.favs_tab = "ITEMS"  # ITEMS / FILES / FOLDERS
         self.favs_idx = 0
 
@@ -386,38 +553,6 @@ class RetroWaveIA:
         if not self.ia_present:
             self.mode = "ERROR"
             self.status = self.ia_version
-
-    # ---------- favorites persistence ----------
-    def load_favs(self) -> Dict[str, Any]:
-        base = {
-            "items": [],
-            "files": [],
-            "folders": {"TV": [], "Movies": [], "Other": []},
-        }
-        try:
-            if os.path.exists(FAVS_PATH):
-                with open(FAVS_PATH, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    base["items"] = data.get("items", []) if isinstance(data.get("items", []), list) else []
-                    base["files"] = data.get("files", []) if isinstance(data.get("files", []), list) else []
-                    folders = data.get("folders", {})
-                    if isinstance(folders, dict):
-                        for k in ("TV", "Movies", "Other"):
-                            v = folders.get(k, [])
-                            base["folders"][k] = v if isinstance(v, list) else []
-        except Exception:
-            pass
-        return base
-
-    def save_favs(self) -> None:
-        try:
-            tmp = FAVS_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.favs, f, indent=2)
-            os.replace(tmp, FAVS_PATH)
-        except Exception:
-            pass
 
     def _save_session(self) -> None:
         try:
@@ -443,88 +578,6 @@ class RetroWaveIA:
                 self.page = max(1, int(data.get("page") or 1))
         except Exception:
             pass
-
-    def is_fav_item(self, identifier: str) -> bool:
-        ident = (identifier or "").strip()
-        for it in self.favs.get("items", []):
-            if str(it.get("identifier", "")).strip() == ident:
-                return True
-        return False
-
-    def toggle_fav_item(self, r: SearchResult) -> None:
-        ident = (r.identifier or "").strip()
-        if not ident:
-            return
-        items = self.favs.get("items", [])
-        if not isinstance(items, list):
-            items = []
-            self.favs["items"] = items
-
-        if self.is_fav_item(ident):
-            self.favs["items"] = [it for it in items if str(it.get("identifier", "")).strip() != ident]
-            self.status = "Removed favorite item."
-        else:
-            items.insert(0, {"identifier": r.identifier, "title": r.title, "year": r.year, "creator": r.creator})
-            self.status = "Added favorite item."
-        self.save_favs()
-
-    def file_fav_key(self, identifier: str, filename: str) -> str:
-        return f"{(identifier or '').strip()}::{(filename or '').strip()}"
-
-    def is_fav_file(self, identifier: str, filename: str) -> bool:
-        key = self.file_fav_key(identifier, filename)
-        for it in self.favs.get("files", []):
-            k2 = self.file_fav_key(it.get("identifier", ""), it.get("filename", ""))
-            if k2 == key:
-                return True
-        return False
-
-    def toggle_fav_file(self, item: SearchResult, f: IAFile) -> None:
-        ident = (item.identifier or "").strip()
-        fname = (f.name or "").strip()
-        if not ident or not fname:
-            return
-
-        files = self.favs.get("files", [])
-        if not isinstance(files, list):
-            files = []
-            self.favs["files"] = files
-
-        if self.is_fav_file(ident, fname):
-            self.favs["files"] = [
-                it
-                for it in files
-                if self.file_fav_key(it.get("identifier", ""), it.get("filename", "")) != self.file_fav_key(ident, fname)
-            ]
-            self.status = "Removed favorite file."
-        else:
-            files.insert(
-                0,
-                {
-                    "identifier": item.identifier,
-                    "item_title": item.title,
-                    "year": item.year,
-                    "creator": item.creator,
-                    "filename": f.name,
-                    "size": int(f.size or 0),
-                    "fmt": f.fmt,
-                },
-            )
-            self.status = "Added favorite file."
-        self.save_favs()
-
-    def add_folder_fav(self, bucket: str, folder_name: str) -> None:
-        bucket = bucket if bucket in ("TV", "Movies", "Other") else "Other"
-        name = sanitize_folder(folder_name)
-        arr = self.favs.get("folders", {}).get(bucket, [])
-        if not isinstance(arr, list):
-            self.favs["folders"][bucket] = []
-            arr = self.favs["folders"][bucket]
-        lowered = {str(x).strip().lower() for x in arr}
-        if name.strip().lower() not in lowered:
-            arr.insert(0, name)
-            self.favs["folders"][bucket] = arr[:30]
-            self.save_favs()
 
     # ---------- safe drawing ----------
     def safe_addstr(self, y: int, x: int, s: str, attr: int = 0) -> None:
@@ -615,7 +668,7 @@ class RetroWaveIA:
         if self.mode in ("RESULTS", "SEARCH"):
             fav_label = (
                 "Unfav" if (self.results and 0 <= self.sel_r < len(self.results)
-                            and self.is_fav_item(self.results[self.sel_r].identifier))
+                            and self.fav_store.is_fav_item(self.results[self.sel_r].identifier))
                 else "Fav"
             )
             return [
@@ -637,7 +690,7 @@ class RetroWaveIA:
             sel = visible[self.sel_f] if (visible and 0 <= self.sel_f < len(visible)) else None
             is_f = False
             if item and sel:
-                is_f = self.is_fav_file(item.identifier, sel.name)
+                is_f = self.fav_store.is_fav_file(item.identifier, sel.name)
             fav_file_label = "Fav File" if not is_f else "Unfav File"
             return [
                 ("Back", "back"),
@@ -658,6 +711,8 @@ class RetroWaveIA:
             return [
                 ("Back", "back"),
                 (f"Tab: {self.favs_tab}", "tab"),
+                ("Open", "primary"),
+                ("Remove", "remove"),
                 ("Help", "help"),
                 ("Quit", "quit"),
             ]
@@ -924,10 +979,10 @@ class RetroWaveIA:
         self.status = f"Save bucket: {self.last_bucket}"
 
     def pick_folder_fav_if_requested(self, bucket: str) -> Optional[str]:
-        opts = self.favs.get("folders", {}).get(bucket, [])
-        if not isinstance(opts, list) or not opts:
+        opts = self.fav_store.folders(bucket)
+        if not opts:
             return None
-        return self.prompt_list(f"{bucket} favorites", [str(x) for x in opts if str(x).strip()])
+        return self.prompt_list(f"{bucket} favorites", opts)
 
     def choose_bucket_and_path(self, identifier: str, filename: str, item_title: str) -> str:
         staging_path = staging_file_path(identifier, filename)
@@ -978,7 +1033,7 @@ class RetroWaveIA:
                 pick = self.pick_folder_fav_if_requested("TV")
                 show = pick if pick else show_default
             show = sanitize_folder(show)
-            self.add_folder_fav("TV", show)
+            self.fav_store.add_folder_fav("TV", show)
 
             if ep:
                 season, episode = ep
@@ -1019,7 +1074,7 @@ class RetroWaveIA:
                 pick = self.pick_folder_fav_if_requested("Movies")
                 movie = pick if pick else title_default
             movie = sanitize_folder(movie)
-            self.add_folder_fav("Movies", movie)
+            self.fav_store.add_folder_fav("Movies", movie)
 
             movie_dir = os.path.join(BUCKET_MOVIES, movie)
             final_path = os.path.join(movie_dir, filename)
@@ -1033,7 +1088,7 @@ class RetroWaveIA:
                 pick = self.pick_folder_fav_if_requested("Music")
                 artist = pick if pick else artist_default
             artist = sanitize_folder(artist)
-            self.add_folder_fav("Music", artist)
+            self.fav_store.add_folder_fav("Music", artist)
 
             music_dir = os.path.join(BUCKET_MUSIC, artist)
             final_path = os.path.join(music_dir, filename)
@@ -1046,7 +1101,7 @@ class RetroWaveIA:
                 pick = self.pick_folder_fav_if_requested("Other")
                 sub = pick if pick else "Misc"
             sub = sanitize_folder(sub)
-            self.add_folder_fav("Other", sub)
+            self.fav_store.add_folder_fav("Other", sub)
 
             other_dir = os.path.join(BUCKET_OTHER, sub)
             final_path = os.path.join(other_dir, filename)
@@ -1703,7 +1758,7 @@ class RetroWaveIA:
                     raw_title = (r.title or "")
                     title = (raw_title[:39] + "…") if len(raw_title) > 40 else raw_title
                     year = f" ({r.year})" if r.year else ""
-                    star = "*" if self.is_fav_item(r.identifier) else " "
+                    star = "*" if self.fav_store.is_fav_item(r.identifier) else " "
                     line = f"{marker} {idx} {star} │ {title}{year}"
                     line = line[: max(0, left_w - 1)].ljust(max(0, left_w - 1))
 
@@ -1730,7 +1785,7 @@ class RetroWaveIA:
                     f = visible[i]
                     marker = ">" if i == self.sel_f else " "
                     star = " "
-                    if item and self.is_fav_file(item.identifier, f.name):
+                    if item and self.fav_store.is_fav_file(item.identifier, f.name):
                         star = "*"
                     line = f"{marker} {i+1:02d} {star} │ {human_size(f.size):>9}  {f.name}"
                     line = line[: max(0, left_w - 1)].ljust(max(0, left_w - 1))
@@ -1745,7 +1800,7 @@ class RetroWaveIA:
 
         elif self.mode == "FAVS":
             if self.favs_tab == "ITEMS":
-                items_list = self.favs.get("items") or []
+                items_list = self.fav_store.data.get("items") or []
                 if not items_list:
                     self.safe_addstr(list_top, 0, "No saved items. Press [Fav] on a result to add one.".ljust(max(0, left_w - 1)), curses.color_pair(6))
                 else:
@@ -1764,7 +1819,7 @@ class RetroWaveIA:
                         self.safe_addstr(list_top + (i - start), 0, line, attr)
 
             elif self.favs_tab == "FILES":
-                files_list = self.favs.get("files") or []
+                files_list = self.fav_store.data.get("files") or []
                 if not files_list:
                     self.safe_addstr(list_top, 0, "No saved files. Press [Fav File] when viewing files.".ljust(max(0, left_w - 1)), curses.color_pair(6))
                 else:
@@ -1784,11 +1839,7 @@ class RetroWaveIA:
                         self.safe_addstr(list_top + (i - start), 0, line, attr)
 
             elif self.favs_tab == "FOLDERS":
-                folders = self.favs.get("folders") or {}
-                flat: List[Tuple[str, str]] = []
-                for bucket in ("TV", "Movies", "Other"):
-                    for name in (folders.get(bucket) or []):
-                        flat.append((bucket, name))
+                flat = self.fav_store.flat_folders()
                 if not flat:
                     self.safe_addstr(list_top, 0, "No saved folders.".ljust(max(0, left_w - 1)), curses.color_pair(6))
                 else:
@@ -2001,7 +2052,8 @@ class RetroWaveIA:
                 if not self.results:
                     self.status = "No result selected."
                     return
-                self.toggle_fav_item(self.results[self.sel_r])
+                r = self.results[self.sel_r]
+                self.status = self.fav_store.toggle_fav_item(r)
                 return
 
         if self.mode == "FILES":
@@ -2042,7 +2094,7 @@ class RetroWaveIA:
                     return
                 idx = self.sel_f
                 if 0 <= idx < len(visible):
-                    self.toggle_fav_file(item, visible[idx])
+                    self.status = self.fav_store.toggle_fav_file(item, visible[idx])
                 else:
                     self.status = "Bad selection."
                 return
@@ -2071,36 +2123,23 @@ class RetroWaveIA:
 
             if action == "remove":
                 if self.favs_tab == "ITEMS":
-                    lst = self.favs.get("items") or []
-                    if lst and 0 <= self.favs_idx < len(lst):
-                        removed = lst.pop(self.favs_idx)
-                        self.favs["items"] = lst
-                        self.favs_idx = max(0, min(self.favs_idx, len(lst) - 1))
-                        self.save_favs()
-                        self.status = f"Removed: {removed.get('title') or removed.get('identifier', '?')}"
+                    name = self.fav_store.remove_item(self.favs_idx)
+                    if name:
+                        self.favs_idx = max(0, min(self.favs_idx, len(self.fav_store.data.get("items") or []) - 1))
+                        self.status = f"Removed: {name}"
                     else:
                         self.status = "Nothing to remove."
                 elif self.favs_tab == "FILES":
-                    lst = self.favs.get("files") or []
-                    if lst and 0 <= self.favs_idx < len(lst):
-                        removed = lst.pop(self.favs_idx)
-                        self.favs["files"] = lst
-                        self.favs_idx = max(0, min(self.favs_idx, len(lst) - 1))
-                        self.save_favs()
-                        self.status = f"Removed: {removed.get('filename', '?')}"
+                    name = self.fav_store.remove_file(self.favs_idx)
+                    if name:
+                        self.favs_idx = max(0, min(self.favs_idx, len(self.fav_store.data.get("files") or []) - 1))
+                        self.status = f"Removed: {name}"
                     else:
                         self.status = "Nothing to remove."
                 elif self.favs_tab == "FOLDERS":
-                    folders = self.favs.get("folders") or {}
-                    flat: List[Tuple[str, str]] = []
-                    for b in ("TV", "Movies", "Other"):
-                        for n in (folders.get(b) or []):
-                            flat.append((b, n))
-                    if flat and 0 <= self.favs_idx < len(flat):
-                        bucket, name = flat[self.favs_idx]
-                        self.favs["folders"][bucket] = [n for n in (folders.get(bucket) or []) if n != name]
-                        self.favs_idx = max(0, min(self.favs_idx, len(flat) - 2))
-                        self.save_favs()
+                    name = self.fav_store.remove_folder(self.favs_idx)
+                    if name:
+                        self.favs_idx = max(0, min(self.favs_idx, len(self.fav_store.flat_folders()) - 1))
                         self.status = f"Removed folder: {name}"
                     else:
                         self.status = "Nothing to remove."
@@ -2108,7 +2147,7 @@ class RetroWaveIA:
 
             if action == "primary":
                 if self.favs_tab == "ITEMS":
-                    lst = self.favs.get("items") or []
+                    lst = self.fav_store.data.get("items") or []
                     if lst and 0 <= self.favs_idx < len(lst):
                         it = lst[self.favs_idx]
                         fav_sr = SearchResult(
@@ -2129,7 +2168,7 @@ class RetroWaveIA:
                     else:
                         self.status = "No item selected."
                 elif self.favs_tab == "FILES":
-                    lst = self.favs.get("files") or []
+                    lst = self.fav_store.data.get("files") or []
                     if lst and 0 <= self.favs_idx < len(lst):
                         it = lst[self.favs_idx]
                         ident = it.get("identifier", "")
@@ -2157,11 +2196,7 @@ class RetroWaveIA:
                     else:
                         self.status = "No file selected."
                 elif self.favs_tab == "FOLDERS":
-                    folders = self.favs.get("folders") or {}
-                    flat2: List[Tuple[str, str]] = []
-                    for b in ("TV", "Movies", "Other"):
-                        for n in (folders.get(b) or []):
-                            flat2.append((b, n))
+                    flat2 = self.fav_store.flat_folders()
                     if flat2 and 0 <= self.favs_idx < len(flat2):
                         bucket, name = flat2[self.favs_idx]
                         self.last_bucket = bucket
@@ -2269,12 +2304,11 @@ class RetroWaveIA:
 
                 if self.mode == "FAVS":
                     if self.favs_tab == "ITEMS":
-                        favs_len = len(self.favs.get("items") or [])
+                        favs_len = len(self.fav_store.data.get("items") or [])
                     elif self.favs_tab == "FILES":
-                        favs_len = len(self.favs.get("files") or [])
+                        favs_len = len(self.fav_store.data.get("files") or [])
                     else:
-                        folders = self.favs.get("folders") or {}
-                        favs_len = sum(len(folders.get(b) or []) for b in ("TV", "Movies", "Other"))
+                        favs_len = len(self.fav_store.flat_folders())
                     if ch == curses.KEY_UP and favs_len:
                         self.favs_idx = max(0, self.favs_idx - 1)
                         continue
