@@ -1011,7 +1011,8 @@ class RetroWaveIA:
             self.add_folder_fav("Movies", movie)
 
             movie_dir = os.path.join(BUCKET_MOVIES, movie)
-            final_path = os.path.join(movie_dir, filename)
+            ext = os.path.splitext(filename)[1] or ".mp4"
+            final_path = os.path.join(movie_dir, f"{movie}{ext}")
 
         elif bucket == "Music":
             artist_default = sanitize_folder(item_title)

@@ -146,9 +146,9 @@ def main() -> int:
     print("- Press Enter on any prompt to cancel/back out.")
     print("- Search is limited to mediatype:movies by default.\n")
 
-    dest = prompt("Download folder (default: ~/Downloads): ")
+    dest = prompt("Download folder (default: /mnt/ssd/media): ")
     if not dest:
-        dest = os.path.expanduser("~/Downloads")
+        dest = "/mnt/ssd/media"
     else:
         dest = os.path.expanduser(dest)
 

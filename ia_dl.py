@@ -193,7 +193,7 @@ def main() -> int:
     dp.add_argument("identifier", nargs="?", help="Identifier. If omitted, you can use --search to find one.")
     dp.add_argument("--search", help='Search query to pick an identifier interactively.')
     dp.add_argument("--rows", type=int, default=20, help="Max search results (default 20).")
-    dp.add_argument("--dest", default=".", help="Destination directory (default current dir).")
+    dp.add_argument("--dest", default="/mnt/ssd/media", help="Destination directory (default /mnt/ssd/media).")
     dp.add_argument("--ext", action="append", help="Filter by extension (repeatable), e.g. --ext mp4")
     dp.add_argument("--regex", help="Filter by filename regex (case-insensitive).")
     dp.add_argument("--biggest", action="store_true", help="Auto-pick biggest matching file (no prompt).")
