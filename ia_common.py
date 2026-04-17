@@ -16,6 +16,7 @@ class SearchResult:
     title: str
     year: str = ""
     creator: str = ""
+    description: str = ""
 
 
 @dataclass

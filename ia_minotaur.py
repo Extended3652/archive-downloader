@@ -33,7 +33,15 @@ LOG_PATH = os.path.join(MEDIA_ROOT, ".ia_dl.log")
 SESSION_PATH = os.path.expanduser("~/.ia_minotaur_session.json")
 
 FILTERS = ["movies", "audio", "texts", "software", "any"]
+SORT_OPTIONS = [
+    ("relevance", ""),
+    ("year (new)", "date desc"),
+    ("year (old)", "date asc"),
+    ("title A-Z", "titleSorter asc"),
+    ("downloads", "downloads desc"),
+]
 ROWS_PER_PAGE = 30
+MAX_HISTORY = 20
 
 MIN_H = 18
 MIN_W = 70
@@ -169,7 +177,7 @@ def ia_ok() -> Tuple[bool, str]:
     return False, msg or "ia not available"
 
 
-def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchResult], int, str]:
+def ia_search_via_curl(query: str, rows: int, page: int, sort: str = "") -> Tuple[List[SearchResult], int, str]:
     cmd = [
         "curl",
         "-sS",
@@ -186,12 +194,16 @@ def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchRes
         "--data-urlencode",
         "fl[]=creator",
         "--data-urlencode",
+        "fl[]=description",
+        "--data-urlencode",
         "output=json",
         "--data-urlencode",
         f"rows={rows}",
         "--data-urlencode",
         f"page={page}",
     ]
+    if sort:
+        cmd += ["--data-urlencode", f"sort[]={sort}"]
 
     code, out, err = run_cmd(cmd, timeout=60)
     if code != 0:
@@ -214,7 +226,11 @@ def ia_search_via_curl(query: str, rows: int, page: int) -> Tuple[List[SearchRes
         title = str(d.get("title", "")).strip() or "(no title)"
         year = str(d.get("year", "")).strip()
         creator = str(d.get("creator", "")).strip()
-        results.append(SearchResult(ident, title, year, creator))
+        desc_raw = d.get("description", "")
+        if isinstance(desc_raw, list):
+            desc_raw = " ".join(str(x) for x in desc_raw)
+        desc = str(desc_raw or "").strip()[:500]
+        results.append(SearchResult(ident, title, year, creator, desc))
 
     return results, num_found, ""
 
@@ -343,8 +359,10 @@ class RetroWaveIA:
         self.filter = "movies"
         self.title_only = False
         self.enforce_license_gate = False
+        self.sort_by = ""
         self.page = 1
         self.total_results: int = 0
+        self.search_history: List[str] = []
 
         self.results: List[SearchResult] = []
         self.sel_r = 0
@@ -352,6 +370,7 @@ class RetroWaveIA:
         self.files: List[IAFile] = []
         self.sel_f = 0
         self.file_kw = ""
+        self.video_only = False
 
         self.last_bucket = "TV"  # TV/Movies/Other
         self.download_log: List[str] = []
@@ -427,6 +446,8 @@ class RetroWaveIA:
                     "filter": self.filter,
                     "title_only": self.title_only,
                     "page": self.page,
+                    "sort_by": self.sort_by,
+                    "search_history": self.search_history[:MAX_HISTORY],
                 }, f)
         except Exception:
             pass
@@ -441,6 +462,12 @@ class RetroWaveIA:
                     self.filter = data["filter"]
                 self.title_only = bool(data.get("title_only", False))
                 self.page = max(1, int(data.get("page") or 1))
+                sort_val = str(data.get("sort_by") or "")
+                if any(v == sort_val for _, v in SORT_OPTIONS):
+                    self.sort_by = sort_val
+                hist = data.get("search_history")
+                if isinstance(hist, list):
+                    self.search_history = [str(x) for x in hist if str(x).strip()][:MAX_HISTORY]
         except Exception:
             pass
 
@@ -601,7 +628,8 @@ class RetroWaveIA:
             page_info = f"Page: {self.page}/{total_pages}  ({self.total_results} found)"
         else:
             page_info = f"Page: {self.page}"
-        line1 = f"{header}  |  Filter: {self.filter}  |  Search: {search_mode}  |  {page_info}"
+        sort_info = f"  |  Sort: {self._sort_label()}" if self.sort_by else ""
+        line1 = f"{header}  |  Filter: {self.filter}  |  Search: {search_mode}{sort_info}  |  {page_info}"
         self.safe_addstr(y, 0, line1[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(3)); y += 1
 
         if self.query_built and self.mode in ("RESULTS", "SEARCH"):
@@ -610,6 +638,12 @@ class RetroWaveIA:
             line2 = f"Root: {MEDIA_ROOT}   Staging: {STAGING_ROOT}"
         self.safe_addstr(y, 0, line2[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(3)); y += 1
         return y
+
+    def _sort_label(self) -> str:
+        for label, val in SORT_OPTIONS:
+            if val == self.sort_by:
+                return label
+        return "relevance"
 
     def get_menu_items(self) -> List[Tuple[str, str]]:
         if self.mode in ("RESULTS", "SEARCH"):
@@ -621,11 +655,13 @@ class RetroWaveIA:
             return [
                 ("Search", "search"),
                 (f"Filter: {self.filter}", "filter"),
+                (f"Sort: {self._sort_label()}", "sort"),
                 (f"Title only: {'On' if self.title_only else 'Off'}", "title"),
                 (f"License gate: {'On' if self.enforce_license_gate else 'Off'}", "license_gate"),
                 ("Prev", "prev_page"),
                 ("Next", "next_page"),
                 ("Open", "open"),
+                ("History", "history"),
                 (fav_label, "fav_item"),
                 ("Favs", "favs"),
                 ("Help", "help"),
@@ -642,6 +678,7 @@ class RetroWaveIA:
             return [
                 ("Back", "back"),
                 ("Keyword", "keyword"),
+                (f"Video only: {'On' if self.video_only else 'Off'}", "video_only"),
                 ("Preview", "preview"),
                 ("Folder", "folder"),
                 ("Item", "item"),
@@ -701,13 +738,15 @@ class RetroWaveIA:
         if self.mode == "DOWNLOADING":
             keybar = "c cancels  |  q quits after cancel  |  (progress updates live)"
         elif self.mode in ("RESULTS", "SEARCH"):
-            keybar = "Arrows/Enter navigate  |  Tab menu/list  |  n/p or [ ] page  |  s/  search  |  q quit"
+            keybar = "j/k navigate  |  Tab menu/list  |  n/p page  |  # go-to-page  |  /  search  |  q quit"
+        elif self.mode == "FILES":
+            keybar = "j/k navigate  |  v video-only  |  Tab menu/list  |  Backspace back  |  q quits"
         else:
-            keybar = "Arrows move  |  Tab switches menu/list  |  Enter selects  |  q quits"
+            keybar = "j/k navigate  |  Tab menu/list  |  Enter selects  |  Backspace back  |  q quits"
         self.safe_addstr(h - 2, 0, keybar[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(2))
         self.safe_addstr(h - 1, 0, ("═" * max(0, w - 1)), curses.color_pair(1))
 
-    def prompt(self, label: str, default: str = "") -> Optional[str]:
+    def prompt(self, label: str, default: str = "", history: Optional[List[str]] = None) -> Optional[str]:
         h, w = self.stdscr.getmaxyx()
         if h < 6 or w < 10:
             return None
@@ -715,12 +754,17 @@ class RetroWaveIA:
         y = h - 5
         buf = list(default)
         pos = len(buf)
+        hist_idx = -1
+        saved_buf = ""
         curses.curs_set(1)
         while True:
             text = "".join(buf)
             bar = f"{label}{text}"
+            hint = ""
+            if history:
+                hint = "  (Up/Down for history)"
             self.safe_addstr(y, 0, " " * max(0, w - 1), curses.color_pair(8))
-            self.safe_addstr(y, 0, bar[: max(0, w - 1)], curses.color_pair(8))
+            self.safe_addstr(y, 0, (bar + hint)[: max(0, w - 1)], curses.color_pair(8))
             try:
                 self.stdscr.move(y, min(w - 2, len(label) + pos))
             except curses.error:
@@ -734,7 +778,23 @@ class RetroWaveIA:
             if ch in (27,):
                 curses.curs_set(0)
                 return None
-            if ch == curses.KEY_LEFT:
+            if ch == curses.KEY_UP and history:
+                if hist_idx == -1:
+                    saved_buf = "".join(buf)
+                if hist_idx < len(history) - 1:
+                    hist_idx += 1
+                    buf = list(history[hist_idx])
+                    pos = len(buf)
+            elif ch == curses.KEY_DOWN and history:
+                if hist_idx > 0:
+                    hist_idx -= 1
+                    buf = list(history[hist_idx])
+                    pos = len(buf)
+                elif hist_idx == 0:
+                    hist_idx = -1
+                    buf = list(saved_buf)
+                    pos = len(buf)
+            elif ch == curses.KEY_LEFT:
                 pos = max(0, pos - 1)
             elif ch == curses.KEY_RIGHT:
                 pos = min(len(buf), pos + 1)
@@ -825,6 +885,23 @@ class RetroWaveIA:
         self.filter = FILTERS[(idx + 1) % len(FILTERS)]
         self.status = f"Filter set to: {self.filter}"
 
+    def cycle_sort(self) -> None:
+        labels = [v for _, v in SORT_OPTIONS]
+        try:
+            idx = labels.index(self.sort_by)
+        except ValueError:
+            idx = 0
+        self.sort_by = labels[(idx + 1) % len(labels)]
+        label = next(l for l, v in SORT_OPTIONS if v == self.sort_by)
+        self.status = f"Sort: {label}"
+
+    def _add_to_history(self, query: str) -> None:
+        q = query.strip()
+        if not q:
+            return
+        self.search_history = [q] + [h for h in self.search_history if h != q]
+        self.search_history = self.search_history[:MAX_HISTORY]
+
     def do_search(self, reset_page: bool = True) -> None:
         if reset_page:
             self.page = 1
@@ -833,10 +910,11 @@ class RetroWaveIA:
             self.status = "Select [Search] in the menu to search."
             return
 
+        self._add_to_history(self.query_text)
         self.status = "Searching..."
         self.render()
 
-        self.results, self.total_results, err = ia_search_via_curl(self.query_built, rows=ROWS_PER_PAGE, page=self.page)
+        self.results, self.total_results, err = ia_search_via_curl(self.query_built, rows=ROWS_PER_PAGE, page=self.page, sort=self.sort_by)
         if err:
             self.status = err
             return
@@ -908,6 +986,8 @@ class RetroWaveIA:
 
     def get_visible_files(self) -> List[IAFile]:
         files = list(self.files)
+        if self.video_only:
+            files = [f for f in files if is_video_file(f.name, f.fmt)]
         kw = self.file_kw.strip()
         if kw:
             rx = re.compile(re.escape(kw), re.IGNORECASE)
@@ -1522,17 +1602,22 @@ class RetroWaveIA:
 
         lines = [
             "KEYBOARD SHORTCUTS:",
-            "  /          Open search bar (works anywhere)",
-            "  Tab        Switch MENU ↔ LIST focus",
+            "  /  s       Open search bar (works anywhere)",
+            "  Tab        Switch MENU <-> LIST focus",
             "  Arrows     Navigate menu items or list",
+            "  j / k      Move down / up in list (vim-style)",
+            "  g / Home   Jump to first item in list",
+            "  G / End    Jump to last item in list",
             "  Enter      Activate menu button / open item or file",
             "  n  ]  PgDn  Next page of results",
             "  p  [  PgUp  Previous page of results",
-            "  Backspace   Back to results (in FILES mode)",
-            "  q           Quit",
+            "  #          Go to specific page number",
+            "  v          Toggle video-only filter (in FILES mode)",
+            "  Backspace  Go back (works in FILES, FAVS, HELP, PREVIEW)",
+            "  q          Quit",
             "",
             "SEARCH FLOW:",
-            "  1) [Search] -> type query -> Enter",
+            "  1) [Search] -> type query -> Enter  (Up/Down recalls history)",
             "  2) Pick result with arrows, Enter/[Open] to view files",
             "  3) Pick file, then [Preview] -> [Confirm] to download",
             "  4) Or [Folder] to download all files sharing a prefix",
@@ -1540,7 +1625,10 @@ class RetroWaveIA:
             "",
             "SEARCH OPTIONS:",
             "  [Filter]     cycle: movies / audio / texts / software / any",
+            "  [Sort]       cycle: relevance / year / title / downloads",
             "  [Title only] search within item titles only",
+            "  [History]    pick from recent searches",
+            "  Changing filter, sort, or title-only auto-refreshes results",
             "  Advanced:    use IA syntax directly, e.g. creator:(Chaplin)",
             "",
             "FAVORITES:",
@@ -1570,13 +1658,18 @@ class RetroWaveIA:
             "Welcome.",
             "",
             "Press  /  to search, or choose [Search] in the menu.",
+            "Use  j/k  or arrows to navigate,  g/G  to jump to start/end.",
             "",
             "Tab switches between MENU and LIST focus.",
             "n / p  or  [ / ]  pages through results.",
             "[Favs] opens your saved items and files.",
             "[Help] shows all shortcuts.",
         ]
-        center_y = top_y + 3
+        if self.search_history:
+            lines += ["", "Recent searches:"]
+            for q in self.search_history[:5]:
+                lines.append(f"  - {q}")
+        center_y = top_y + 2
         for i, line in enumerate(lines):
             y = center_y + i
             if y >= h - 4:
@@ -1702,7 +1795,8 @@ class RetroWaveIA:
                     abs_num = (self.page - 1) * ROWS_PER_PAGE + i + 1
                     idx = f"{abs_num:02d}"
                     raw_title = (r.title or "")
-                    title = (raw_title[:39] + "…") if len(raw_title) > 40 else raw_title
+                    max_title = max(20, left_w - 22)
+                    title = (raw_title[:max_title - 1] + "…") if len(raw_title) > max_title else raw_title
                     year = f" ({r.year})" if r.year else ""
                     star = "*" if self.is_fav_item(r.identifier) else " "
                     line = f"{marker} {idx} {star} │ {title}{year}"
@@ -1820,13 +1914,17 @@ class RetroWaveIA:
                     f"  ID:      {sel_item.identifier}",
                     "",
                 ]
+                if sel_item.description:
+                    details.append("Description:")
+                    desc = sel_item.description
+                    wrap_w = max(10, right_w - 2)
+                    while desc:
+                        details.append(f"  {desc[:wrap_w]}")
+                        desc = desc[wrap_w:]
+                    details.append("")
             details += [
-                "Next: Enter or [Open] to view files",
-                "",
-                "MENU:",
-                "  Search -> Filter -> Open",
-                "  [Fav] saves this item",
-                "",
+                "Enter or [Open] to view files",
+                f"Sort: {self._sort_label()}",
                 f"Query: {self.query_built or '(none)'}",
             ]
         elif self.mode == "FILES":
@@ -1975,18 +2073,37 @@ class RetroWaveIA:
 
         if self.mode in ("RESULTS", "SEARCH"):
             if action == "search":
-                s = self.prompt("Search: ", self.query_text)
+                s = self.prompt("Search: ", self.query_text, history=self.search_history)
                 if s is not None:
                     self.query_text = s
                     self.show_welcome = False
                     self.do_search(reset_page=True)
                 return
+            if action == "history":
+                if not self.search_history:
+                    self.status = "No search history yet."
+                    return
+                pick = self.prompt_list("Search History", self.search_history)
+                if pick:
+                    self.query_text = pick
+                    self.show_welcome = False
+                    self.do_search(reset_page=True)
+                return
             if action == "filter":
                 self.cycle_filter()
+                if self.query_text:
+                    self.do_search(reset_page=True)
+                return
+            if action == "sort":
+                self.cycle_sort()
+                if self.query_text:
+                    self.do_search(reset_page=True)
                 return
             if action == "title":
                 self.title_only = not self.title_only
                 self.status = "Search mode: title" if self.title_only else "Search mode: broad"
+                if self.query_text:
+                    self.do_search(reset_page=True)
                 return
             if action == "next_page":
                 self.next_page()
@@ -2014,6 +2131,12 @@ class RetroWaveIA:
                     self.file_kw = s.strip()
                     self.sel_f = 0
                     self.status = "Keyword updated"
+                return
+
+            if action == "video_only":
+                self.video_only = not self.video_only
+                self.sel_f = 0
+                self.status = "Video only: ON" if self.video_only else "Video only: OFF (showing all files)"
                 return
 
             if action == "bucket":
@@ -2225,20 +2348,45 @@ class RetroWaveIA:
                     continue
 
             if ch in (ord('/'), ord('s'), ord('S')):
-                s = self.prompt("Search: ", self.query_text)
+                s = self.prompt("Search: ", self.query_text, history=self.search_history)
                 if s is not None:
                     self.query_text = s
                     self.show_welcome = False
                     self.do_search(reset_page=True)
                 continue
 
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                if self.mode == "FILES":
+                    self.mode = "RESULTS"
+                    self.focus = "LIST"
+                    self.status = "Back to results"
+                elif self.mode == "FAVS":
+                    self.mode = "FILES" if self.files else "RESULTS"
+                    self.focus = "LIST"
+                    self.status = "Back"
+                elif self.mode == "HELP":
+                    self.mode = "FILES" if self.files else "RESULTS"
+                    self.focus = "LIST"
+                    self.status = "Back"
+                elif self.mode == "PREVIEW_DL":
+                    self.mode = "FILES"
+                    self.focus = "LIST"
+                    self.status = "Canceled."
+                continue
+
             if self.focus == "LIST":
                 if self.mode in ("RESULTS", "SEARCH"):
-                    if ch == curses.KEY_UP and self.results:
+                    if ch in (curses.KEY_UP, ord('k')) and self.results:
                         self.sel_r = max(0, self.sel_r - 1)
                         continue
-                    if ch == curses.KEY_DOWN and self.results:
+                    if ch in (curses.KEY_DOWN, ord('j')) and self.results:
                         self.sel_r = min(len(self.results) - 1, self.sel_r + 1)
+                        continue
+                    if ch in (ord('g'), curses.KEY_HOME) and self.results:
+                        self.sel_r = 0
+                        continue
+                    if ch in (ord('G'), curses.KEY_END) and self.results:
+                        self.sel_r = len(self.results) - 1
                         continue
                     if ch in (10, 13, curses.KEY_ENTER):
                         self.show_welcome = False
@@ -2250,22 +2398,39 @@ class RetroWaveIA:
                     if ch in (ord('p'), ord('['), curses.KEY_PPAGE):
                         self.prev_page()
                         continue
+                    if ch == ord('#') and self.total_results > 0:
+                        total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+                        val = self.prompt(f"Go to page (1-{total_pages}): ", "")
+                        if val is not None and val.strip().isdigit():
+                            target = int(val.strip())
+                            if 1 <= target <= total_pages:
+                                self.page = target
+                                self.do_search(reset_page=False)
+                            else:
+                                self.status = f"Page must be 1-{total_pages}."
+                        continue
 
                 if self.mode == "FILES":
                     visible = self.get_visible_files()
-                    if ch == curses.KEY_UP and visible:
+                    if ch in (curses.KEY_UP, ord('k')) and visible:
                         self.sel_f = max(0, self.sel_f - 1)
                         continue
-                    if ch == curses.KEY_DOWN and visible:
+                    if ch in (curses.KEY_DOWN, ord('j')) and visible:
                         self.sel_f = min(len(visible) - 1, self.sel_f + 1)
+                        continue
+                    if ch in (ord('g'), curses.KEY_HOME) and visible:
+                        self.sel_f = 0
+                        continue
+                    if ch in (ord('G'), curses.KEY_END) and visible:
+                        self.sel_f = len(visible) - 1
                         continue
                     if ch in (10, 13, curses.KEY_ENTER):
                         self.set_preview_for_selected()
                         continue
-                    if ch in (curses.KEY_BACKSPACE, 127, 8):
-                        self.mode = "RESULTS"
-                        self.focus = "LIST"
-                        self.status = "Back to results"
+                    if ch == ord('v'):
+                        self.video_only = not self.video_only
+                        self.sel_f = 0
+                        self.status = "Video only: ON" if self.video_only else "Video only: OFF (showing all files)"
                         continue
 
                 if self.mode == "FAVS":
@@ -2276,11 +2441,17 @@ class RetroWaveIA:
                     else:
                         folders = self.favs.get("folders") or {}
                         favs_len = sum(len(folders.get(b) or []) for b in ("TV", "Movies", "Other"))
-                    if ch == curses.KEY_UP and favs_len:
+                    if ch in (curses.KEY_UP, ord('k')) and favs_len:
                         self.favs_idx = max(0, self.favs_idx - 1)
                         continue
-                    if ch == curses.KEY_DOWN and favs_len:
+                    if ch in (curses.KEY_DOWN, ord('j')) and favs_len:
                         self.favs_idx = min(favs_len - 1, self.favs_idx + 1)
+                        continue
+                    if ch in (ord('g'), curses.KEY_HOME) and favs_len:
+                        self.favs_idx = 0
+                        continue
+                    if ch in (ord('G'), curses.KEY_END) and favs_len:
+                        self.favs_idx = favs_len - 1
                         continue
                     if ch in (10, 13, curses.KEY_ENTER):
                         self.activate_menu_action("primary")
