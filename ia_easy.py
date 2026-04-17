@@ -100,10 +100,9 @@ def main() -> int:
     print("- Press Enter on any prompt to cancel/back out.")
     print("- Search is limited to mediatype:movies by default.\n")
 
-    default_dest = os.environ.get("XDG_DOWNLOAD_DIR") or os.path.expanduser("~/Downloads")
-    dest = prompt(f"Download folder (default: {default_dest}): ")
+    dest = prompt("Download folder (default: /mnt/ssd/media): ")
     if not dest:
-        dest = default_dest
+        dest = "/mnt/ssd/media"
     else:
         dest = os.path.expanduser(dest)
 
