@@ -18,9 +18,8 @@ from ia_common import (
     safe_path_under,
 )
 
-# MEDIA_ROOT is configurable via the IA_MEDIA_ROOT env var. Default lives under
-# the user's home directory so the tool runs without machine-specific tweaks.
-MEDIA_ROOT = os.environ.get("IA_MEDIA_ROOT") or os.path.expanduser("~/Media")
+# MEDIA_ROOT is configurable via the IA_MEDIA_ROOT env var.
+MEDIA_ROOT = os.environ.get("IA_MEDIA_ROOT") or "/mnt/ssd/media"
 STAGING_ROOT = os.path.join(MEDIA_ROOT, ".ia_staging")
 
 BUCKET_TV = os.path.join(MEDIA_ROOT, "TV")
