@@ -52,6 +52,10 @@ IA_NO_CHANGE_TIMESTAMP = True
 
 LARGE_VIDEO_BYTES = 500 * 1024 * 1024
 
+PENDING_PATH = os.path.expanduser("~/.ia_minotaur_pending.json")
+# Kill the download subprocess if no bytes arrive for this long.
+STALL_TIMEOUT_S = 120
+
 
 def log_line(msg: str) -> None:
     try:
@@ -470,6 +474,53 @@ class RetroWaveIA:
                     self.search_history = [str(x) for x in hist if str(x).strip()][:MAX_HISTORY]
         except Exception:
             pass
+
+    # ---------- pending download persistence ----------
+    def _save_pending(
+        self,
+        identifier: str,
+        item_title: str,
+        files: "List[IAFile]",
+        preview_prefix: str,
+        glob_pat: str,
+        completed_names: "List[str]",
+    ) -> None:
+        try:
+            data = {
+                "identifier": identifier,
+                "item_title": item_title,
+                "files": [{"name": f.name, "size": int(f.size or 0), "fmt": f.fmt} for f in files],
+                "preview_prefix": preview_prefix,
+                "glob_pat": glob_pat,
+                "completed_names": completed_names,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            tmp = PENDING_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp, PENDING_PATH)
+            log_line(f"PENDING_SAVED: {identifier} ({len(files)} files, {len(completed_names)} done)")
+        except Exception as e:
+            log_line(f"PENDING_SAVE_ERR: {e}")
+
+    def _clear_pending(self) -> None:
+        try:
+            if os.path.exists(PENDING_PATH):
+                os.remove(PENDING_PATH)
+        except Exception:
+            pass
+
+    def _load_pending(self) -> "Optional[Dict[str, Any]]":
+        try:
+            if not os.path.exists(PENDING_PATH):
+                return None
+            with open(PENDING_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict) or not data.get("identifier"):
+                return None
+            return data
+        except Exception:
+            return None
 
     def is_fav_item(self, identifier: str) -> bool:
         ident = (identifier or "").strip()
@@ -1281,6 +1332,8 @@ class RetroWaveIA:
         start_t = time.time()
         last_t = start_t
         last_bytes = 0
+        last_progress_t = start_t
+        last_progress_bytes = 0
         self.dl_cancel_requested = False
 
         self.dl_current_name = filename
@@ -1299,6 +1352,16 @@ class RetroWaveIA:
             self.dl_current_written = written
 
             now = time.time()
+            if written > last_progress_bytes:
+                last_progress_t = now
+                last_progress_bytes = written
+            elif rc is None and now - last_progress_t > STALL_TIMEOUT_S:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                return False, f"Download stalled — no progress for {STALL_TIMEOUT_S}s. Try again."
+
             dt = now - last_t
             if dt >= 0.5:
                 delta = max(0, written - last_bytes)
@@ -1315,7 +1378,7 @@ class RetroWaveIA:
             if ch in (ord("c"), ord("C")):
                 self.dl_cancel_requested = True
                 try:
-                    p.terminate()
+                    p.kill()
                 except Exception:
                     pass
 
@@ -1364,6 +1427,8 @@ class RetroWaveIA:
         start_t = time.time()
         last_t = start_t
         last_bytes = 0
+        last_progress_t = start_t
+        last_progress_bytes = 0
         self.dl_cancel_requested = False
 
         self.dl_current_name = f"--glob {glob_pat}"
@@ -1383,6 +1448,16 @@ class RetroWaveIA:
             self.dl_current_written = written
 
             now = time.time()
+            if written > last_progress_bytes:
+                last_progress_t = now
+                last_progress_bytes = written
+            elif rc is None and now - last_progress_t > STALL_TIMEOUT_S:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                return False, f"Download stalled — no progress for {STALL_TIMEOUT_S}s. Try again."
+
             dt = now - last_t
             if dt >= 0.5:
                 delta = max(0, written - last_bytes)
@@ -1399,7 +1474,7 @@ class RetroWaveIA:
             if ch in (ord("c"), ord("C")):
                 self.dl_cancel_requested = True
                 try:
-                    p.terminate()
+                    p.kill()
                 except Exception:
                     pass
 
@@ -1428,6 +1503,118 @@ class RetroWaveIA:
                 return True, ""
 
             time.sleep(0.1)
+
+    def resume_pending_download(self) -> None:
+        pending = self._load_pending()
+        if not pending:
+            self.status = "No pending download to resume."
+            return
+
+        identifier = pending.get("identifier", "")
+        item_title = pending.get("item_title", identifier)
+        if not identifier:
+            self.status = "Pending download state is invalid — cleared."
+            self._clear_pending()
+            return
+
+        files_data = pending.get("files") or []
+        completed_names: set = set(pending.get("completed_names") or [])
+        glob_pat = pending.get("glob_pat", "")
+        preview_prefix = pending.get("preview_prefix", "")
+
+        all_files = [
+            IAFile(name=str(fd["name"]), size=int(fd.get("size") or 0), fmt=str(fd.get("fmt") or ""))
+            for fd in files_data
+            if fd.get("name")
+        ]
+        remaining = [f for f in all_files if f.name not in completed_names]
+
+        if not remaining:
+            self.status = "All files from the pending download are already complete."
+            self._clear_pending()
+            return
+
+        n = len(remaining)
+        total_bytes = sum(int(f.size or 0) for f in remaining)
+        confirm = self.prompt(
+            f"Resume {n} file(s) ({human_size(total_bytes)}) for \"{item_title}\"? Enter=yes Esc=no: ", ""
+        )
+        if confirm is None:
+            self.status = "Resume canceled."
+            return
+
+        stub_item = SearchResult(identifier=identifier, title=item_title, year="", creator="")
+
+        existing = [i for i, r in enumerate(self.results) if r.identifier == identifier]
+        if existing:
+            self.sel_r = existing[0]
+        else:
+            self.results.insert(0, stub_item)
+            self.sel_r = 0
+
+        self.mode = "DOWNLOADING"
+        self.focus = "MENU"
+        os.makedirs(STAGING_ROOT, exist_ok=True)
+
+        if glob_pat:
+            # Glob/prefix download: re-run the same glob. Files already staged at full size
+            # will be overwritten, but this ensures consistency.
+            self.status = f"Resuming glob: {glob_pat}"
+            self.render()
+            ok2, err = self._download_glob_with_progress(identifier, glob_pat, total_bytes)
+            if not ok2:
+                self._save_pending(identifier, item_title, all_files, preview_prefix, glob_pat,
+                                   list(completed_names))
+                self.mode = "FILES"
+                self.focus = "LIST"
+                self.status = f"{err}  (press R to retry)"
+                self.download_log.insert(0, f"Resume error: {err}")
+                self.download_log = self.download_log[:8]
+                return
+
+            new_completed = list(completed_names)
+            for f in remaining:
+                ok_sz, msg_sz = self._verify_expected_size(identifier, f.name, int(f.size or 0))
+                if not ok_sz:
+                    self._save_pending(identifier, item_title, all_files, preview_prefix, glob_pat, new_completed)
+                    self.mode = "FILES"
+                    self.focus = "LIST"
+                    self.status = f"{msg_sz}  (press R to retry)"
+                    self.download_log.insert(0, f"Resume error: {msg_sz}")
+                    self.download_log = self.download_log[:8]
+                    return
+                msg = self.choose_bucket_and_path(identifier, f.name, item_title)
+                new_completed.append(f.name)
+                self.download_log.insert(0, msg)
+                self.download_log = self.download_log[:8]
+                self.status = msg
+                self.render()
+        else:
+            # Sequential download: only download files not yet completed.
+            new_completed = list(completed_names)
+            for idx, f in enumerate(remaining):
+                self.status = f"Resuming {idx+1}/{n}: {f.name}"
+                self.render()
+                ok2, err = self._download_one_with_progress(identifier, f.name, int(f.size or 0))
+                if not ok2:
+                    self._save_pending(identifier, item_title, all_files, preview_prefix, "", new_completed)
+                    self.mode = "FILES"
+                    self.focus = "LIST"
+                    self.status = f"{err}  (press R to retry)"
+                    self.download_log.insert(0, f"Resume error: {err}")
+                    self.download_log = self.download_log[:8]
+                    return
+                msg = self.choose_bucket_and_path(identifier, f.name, item_title)
+                new_completed.append(f.name)
+                self.download_log.insert(0, msg)
+                self.download_log = self.download_log[:8]
+                self.status = msg
+                self.render()
+
+        self._clear_pending()
+        self.mode = "FILES"
+        self.focus = "LIST"
+        self.status = f"Resume complete. {n} file(s) downloaded."
 
     def perform_download_plan(self) -> None:
         if not self.preview_item:
@@ -1513,38 +1700,45 @@ class RetroWaveIA:
 
                 ok2, err = self._download_glob_with_progress(item.identifier, glob_pat, int(total_expected))
                 if not ok2:
+                    self._save_pending(item.identifier, item.title, queue,
+                                       self.preview_prefix, glob_pat, [])
                     self.mode = "FILES"
                     self.focus = "LIST"
                     self.preview_item = None
                     self.preview_file = None
                     self.preview_files = []
                     self.preview_prefix = ""
-                    self.status = err
+                    self.status = f"{err}  (press R to resume)"
                     self.download_log.insert(0, f"Error: {err}")
                     self.download_log = self.download_log[:8]
                     return
 
                 # Import each expected file (now that the glob run finished).
+                completed_names: List[str] = []
                 for f in queue:
                     ok_sz, msg_sz = self._verify_expected_size(item.identifier, f.name, int(f.size or 0))
                     if not ok_sz:
+                        self._save_pending(item.identifier, item.title, queue,
+                                           self.preview_prefix, glob_pat, completed_names)
                         self.mode = "FILES"
                         self.focus = "LIST"
                         self.preview_item = None
                         self.preview_file = None
                         self.preview_files = []
                         self.preview_prefix = ""
-                        self.status = msg_sz
+                        self.status = f"{msg_sz}  (press R to resume)"
                         self.download_log.insert(0, f"Error: {msg_sz}")
                         self.download_log = self.download_log[:8]
                         return
 
                     msg = self.choose_bucket_and_path(item.identifier, f.name, item.title)
+                    completed_names.append(f.name)
                     self.download_log.insert(0, msg)
                     self.download_log = self.download_log[:8]
                     self.status = msg
                     self.render()
 
+                self._clear_pending()
                 self.mode = "FILES"
                 self.focus = "LIST"
                 self.preview_item = None
@@ -1555,6 +1749,7 @@ class RetroWaveIA:
                 return
 
             # Full item (visible set). Sequential download keeps progress accurate per-file and imports cleanly.
+            seq_completed: List[str] = []
             for idx, f in enumerate(queue):
                 self.dl_current_name = f.name
                 self.dl_current_total = int(f.size or 0)
@@ -1565,23 +1760,27 @@ class RetroWaveIA:
 
                 ok2, err = self._download_one_with_progress(item.identifier, f.name, int(f.size or 0))
                 if not ok2:
+                    self._save_pending(item.identifier, item.title, queue,
+                                       self.preview_prefix, "", seq_completed)
                     self.mode = "FILES"
                     self.focus = "LIST"
                     self.preview_item = None
                     self.preview_file = None
                     self.preview_files = []
                     self.preview_prefix = ""
-                    self.status = err
+                    self.status = f"{err}  (press R to resume)"
                     self.download_log.insert(0, f"Error: {err}")
                     self.download_log = self.download_log[:8]
                     return
 
                 msg = self.choose_bucket_and_path(item.identifier, f.name, item.title)
+                seq_completed.append(f.name)
                 self.download_log.insert(0, msg)
                 self.download_log = self.download_log[:8]
                 self.status = msg
                 self.render()
 
+            self._clear_pending()
             self.mode = "FILES"
             self.focus = "LIST"
             self.preview_item = None
@@ -1640,6 +1839,8 @@ class RetroWaveIA:
             "DOWNLOADS:",
             "  No download starts without a confirmation step.",
             "  Press c to cancel while downloading.",
+            "  Press r from any screen to resume a canceled/stalled download.",
+            "  Downloads stalled for 2 min are killed automatically and can be resumed.",
             "  Files go to staging first, then move to TV / Movies / Music / Other.",
             "  Blocked unless metadata indicates an open license (CC / PD).",
             f"  {'--no-change-timestamp enabled (mtimes set to now).' if IA_NO_CHANGE_TIMESTAMP else 'Source mtimes preserved.'}",
@@ -2311,6 +2512,13 @@ class RetroWaveIA:
             self.show_welcome = False
             self.do_search(reset_page=False)
 
+        pending = self._load_pending()
+        if pending:
+            ptitle = pending.get("item_title") or pending.get("identifier") or "unknown"
+            n_remaining = len([f for f in (pending.get("files") or [])
+                               if f.get("name") not in set(pending.get("completed_names") or [])])
+            self.status = f"Pending: \"{ptitle}\" ({n_remaining} file(s) left) — press R to resume"
+
         while not self.exit_requested:
             self.render()
             ch = self.stdscr.getch()
@@ -2353,6 +2561,10 @@ class RetroWaveIA:
                     self.query_text = s
                     self.show_welcome = False
                     self.do_search(reset_page=True)
+                continue
+
+            if ch in (ord('r'), ord('R')) and self.mode not in ("DOWNLOADING", "PREVIEW_DL"):
+                self.resume_pending_download()
                 continue
 
             if ch in (curses.KEY_BACKSPACE, 127, 8):
