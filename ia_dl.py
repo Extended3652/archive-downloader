@@ -1,39 +1,47 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import os
 import re
 import sys
 from typing import List, Optional
 
-from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, human_size, run
+from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, compact_count, default_media_root, human_size, run
+import ia_api
+from ia_organize import build_query, license_status_from_fields
+
+
+class BadFileRegex(ValueError):
+    """Raised when a user-provided filename regex cannot be compiled."""
 
 def sanitize_query(q: str) -> str:
     q = q.strip()
     q = re.sub(r"\s+", " ", q)
     return q
 
-def ia_search(query: str, rows: int) -> List[SearchResult]:
-    # Use ia CLI search and JSON output for robust parsing.
-    # Query example: title:"Test Copy" AND mediatype:movies
-    cmd = ["ia", "search", query, "--rows", str(rows), "--json"]
-    p = run(cmd)
-    results = []
-    for line in p.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        identifier = str(obj.get("identifier", "")).strip()
-        title = str(obj.get("title", "")).strip()
-        year = str(obj.get("year", "")).strip()
-        creator = str(obj.get("creator", "")).strip()
-        if identifier:
-            results.append(SearchResult(identifier=identifier, title=title or "(no title)", year=year or "", creator=creator))
+def curl_runner(cmd, timeout=60):
+    p = run(cmd, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def ia_search(query: str, rows: int, *, page: int = 1, sort: str = "") -> List[SearchResult]:
+    results, _total, err = ia_api.ia_search_via_curl(query, rows, page, sort, runner=curl_runner)
+    if err:
+        raise IACommandError(["curl", "https://archive.org/advancedsearch.php"], 1, err)
     return results
+
+
+def search_result_line(r: SearchResult) -> str:
+    y = f" ({r.year})" if r.year else ""
+    bits = []
+    if r.mediatype:
+        bits.append(r.mediatype)
+    if r.downloads:
+        bits.append(f"{compact_count(r.downloads)} dl")
+    status, _why = license_status_from_fields(r.licenseurl, r.rights)
+    if status != "unknown":
+        bits.append(f"lic:{status}")
+    suffix = f"\t{' | '.join(bits)}" if bits else ""
+    return f"{r.identifier}\t{r.title}{y}{suffix}"
 
 def choose_result(results: List[SearchResult]) -> Optional[SearchResult]:
     if not results:
@@ -52,27 +60,13 @@ def choose_result(results: List[SearchResult]) -> Optional[SearchResult]:
         print("Invalid selection.")
 
 def ia_list_files(identifier: str) -> List[IAFile]:
-    # ia metadata ITEM --json gives a JSON blob with files.
-    cmd = ["ia", "metadata", identifier, "--json"]
-    p = run(cmd)
-    try:
-        meta = json.loads(p.stdout)
-    except json.JSONDecodeError:
-        print("Could not parse metadata JSON.", file=sys.stderr)
-        sys.exit(1)
+    def runner(cmd, timeout=60):
+        p = run(cmd, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
 
-    files = []
-    for f in meta.get("files", []) or []:
-        name = str(f.get("name", "")).strip()
-        if not name:
-            continue
-        size_raw = f.get("size")
-        try:
-            size = int(size_raw) if size_raw is not None else 0
-        except (TypeError, ValueError):
-            size = 0
-        fmt = str(f.get("format", "")).strip()
-        files.append(IAFile(name=name, size=size, fmt=fmt))
+    files, _meta, err = ia_api.ia_files(identifier, runner=runner)
+    if err:
+        raise IACommandError(["ia", "metadata", identifier], 1, err)
     return files
 
 def filter_files(files: List[IAFile], exts: Optional[List[str]], regex: Optional[str]) -> List[IAFile]:
@@ -92,8 +86,7 @@ def filter_files(files: List[IAFile], exts: Optional[List[str]], regex: Optional
         try:
             rx = re.compile(regex, re.IGNORECASE)
         except re.error as e:
-            print(f"Bad regex: {e}", file=sys.stderr)
-            sys.exit(2)
+            raise BadFileRegex(str(e)) from e
         out = [f for f in out if rx.search(f.name)]
     return out
 
@@ -142,7 +135,7 @@ def positive_int(s: str) -> int:
         raise argparse.ArgumentTypeError("must be >= 1")
     return v
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         prog="ia_dl",
         description="Helper CLI for searching and downloading from Internet Archive using the 'ia' tool."
@@ -152,6 +145,20 @@ def main() -> int:
     sp = sub.add_parser("search", help="Search items and print results.")
     sp.add_argument("query", help='Search query. Example: \'title:"Test Copy" AND mediatype:movies\'')
     sp.add_argument("--rows", type=positive_int, default=20, help="Max results (default 20).")
+    sp.add_argument("--page", type=positive_int, default=1, help="Search results page (default 1).")
+    sp.add_argument(
+        "--filter",
+        choices=["movies", "audio", "texts", "software", "any"],
+        default="any",
+        help="Media type filter for simple queries (default any). Advanced queries pass through unchanged.",
+    )
+    sp.add_argument("--title-only", action="store_true", help="Search title field only for simple queries.")
+    sp.add_argument(
+        "--sort",
+        choices=["relevance", "date-desc", "date-asc", "title", "downloads"],
+        default="relevance",
+        help="Sort order (default relevance).",
+    )
 
     lp = sub.add_parser("list", help="List files for an item identifier.")
     lp.add_argument("identifier", help="Internet Archive identifier.")
@@ -162,29 +169,40 @@ def main() -> int:
     dp.add_argument("identifier", nargs="?", help="Identifier. If omitted, you can use --search to find one.")
     dp.add_argument("--search", help='Search query to pick an identifier interactively.')
     dp.add_argument("--rows", type=positive_int, default=20, help="Max search results (default 20).")
-    dp.add_argument("--dest", default="/mnt/ssd/media", help="Destination directory (default /mnt/ssd/media).")
+    default_dest = default_media_root()
+    dp.add_argument("--dest", default=default_dest, help=f"Destination directory (default {default_dest}).")
     dp.add_argument("--ext", action="append", help="Filter by extension (repeatable), e.g. --ext mp4")
     dp.add_argument("--regex", help="Filter by filename regex (case-insensitive).")
     dp.add_argument("--biggest", action="store_true", help="Auto-pick biggest matching file (no prompt).")
     dp.add_argument("--glob", help="Download using ia --glob (advanced), e.g. '*.mp4'")
     dp.add_argument("--file", help="Download one exact file by name (advanced).")
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.cmd == "search":
-        q = sanitize_query(args.query)
-        results = ia_search(q, args.rows)
+        sort_map = {
+            "relevance": "",
+            "date-desc": "date desc",
+            "date-asc": "date asc",
+            "title": "titleSorter asc",
+            "downloads": "downloads desc",
+        }
+        q = build_query(sanitize_query(args.query), args.filter, args.title_only)
+        results = ia_search(q, args.rows, page=args.page, sort=sort_map[args.sort])
         if not results:
             print("No results.")
             return 1
         for r in results:
-            y = f" ({r.year})" if r.year else ""
-            print(f"{r.identifier}\t{r.title}{y}")
+            print(search_result_line(r))
         return 0
 
     if args.cmd == "list":
         files = ia_list_files(args.identifier)
-        files = filter_files(files, args.ext, args.regex)
+        try:
+            files = filter_files(files, args.ext, args.regex)
+        except BadFileRegex as e:
+            print(f"Bad regex: {e}", file=sys.stderr)
+            return 2
         print_files(files)
         return 0
 
@@ -192,7 +210,7 @@ def main() -> int:
         identifier = args.identifier
 
         if args.search:
-            q = sanitize_query(args.search)
+            q = build_query(sanitize_query(args.search), "any", False)
             results = ia_search(q, args.rows)
             if not results:
                 print("No search results.")
@@ -213,7 +231,11 @@ def main() -> int:
             return 0
 
         files = ia_list_files(identifier)
-        files = filter_files(files, args.ext, args.regex)
+        try:
+            files = filter_files(files, args.ext, args.regex)
+        except BadFileRegex as e:
+            print(f"Bad regex: {e}", file=sys.stderr)
+            return 2
 
         # Default behavior: if no filters, show all files.
         if not files:

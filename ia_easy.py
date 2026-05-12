@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import os
 import re
@@ -10,6 +11,7 @@ from ia_common import (
     IAFile,
     IANotInstalled,
     SearchResult,
+    default_media_root,
     human_size,
     is_video_file,
     run,
@@ -100,9 +102,10 @@ def main() -> int:
     print("- Press Enter on any prompt to cancel/back out.")
     print("- Search is limited to mediatype:movies by default.\n")
 
-    dest = prompt("Download folder (default: /mnt/ssd/media): ")
+    default_dest = default_media_root()
+    dest = prompt(f"Download folder (default: {default_dest}): ")
     if not dest:
-        dest = "/mnt/ssd/media"
+        dest = default_dest
     else:
         dest = os.path.expanduser(dest)
 
@@ -171,9 +174,19 @@ def main() -> int:
             print("\nBye.")
             return 0
 
+
+def cli_main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ia_easy",
+        description="Interactive Internet Archive movie downloader.",
+    )
+    parser.parse_args(argv)
+    return main()
+
+
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(cli_main(sys.argv[1:]))
     except IANotInstalled:
         print("\nError: 'ia' command not found.")
         print("Install with: pip3 install --user internetarchive\n")

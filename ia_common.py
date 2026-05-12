@@ -8,6 +8,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import List, Optional
 
+import ia_config
+
 
 # ---- shared dataclasses (unify on `fmt`; ia_dl previously used `format`) ----
 @dataclass
@@ -17,6 +19,13 @@ class SearchResult:
     year: str = ""
     creator: str = ""
     description: str = ""
+    mediatype: str = ""
+    downloads: int = 0
+    date: str = ""
+    publicdate: str = ""
+    collection: str = ""
+    licenseurl: str = ""
+    rights: str = ""
 
 
 @dataclass
@@ -27,6 +36,7 @@ class IAFile:
 
 
 # ---- shared constants ----
+DEFAULT_MEDIA_ROOT = ia_config.DEFAULT_MEDIA_ROOT
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
 VIDEO_FORMAT_HINTS = (
     "h.264",
@@ -56,6 +66,11 @@ class IANotInstalled(IACommandError):
 
 
 # ---- shared functions ----
+def default_media_root() -> str:
+    """Return the configured media root shared by all command wrappers."""
+    return ia_config.load_config()["media_root"]
+
+
 def run(cmd: List[str], *, check: bool = True, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
     """Run a subprocess and return its CompletedProcess.
 
@@ -94,6 +109,26 @@ def human_size(n) -> str:
     if i == 0:
         return f"{int(f)}{units[i]}"
     return f"{f:.2f}{units[i]}"
+
+
+def compact_count(n) -> str:
+    """Format a count compactly for list columns (e.g. 1.2K, 3.4M)."""
+    try:
+        value = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value < 1000:
+        return f"{sign}{value}"
+    units = [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")]
+    for factor, suffix in units:
+        if value >= factor:
+            scaled = value / factor
+            if scaled >= 10:
+                return f"{sign}{scaled:.0f}{suffix}"
+            return f"{sign}{scaled:.1f}{suffix}"
+    return f"{sign}{value}"
 
 
 def is_video_file(name: str, fmt: str = "") -> bool:

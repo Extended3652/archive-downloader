@@ -1,8 +1,8 @@
 """Pytest bootstrap.
 
 Sets IA_MEDIA_ROOT before any test module imports ia_minotaur, so the
-module-level constants resolve to a temp location instead of the user's
-real ~/Media.
+module-level constants resolve to a temp location instead of the real
+media root.
 """
 import os
 import sys

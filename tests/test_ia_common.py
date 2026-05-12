@@ -6,15 +6,36 @@ import tempfile
 import pytest
 
 from ia_common import (
+    DEFAULT_MEDIA_ROOT,
     IACommandError,
     IAFile,
     IANotInstalled,
     SearchResult,
+    compact_count,
+    default_media_root,
     human_size,
     is_video_file,
     run,
     safe_path_under,
 )
+
+
+# ---------------------------------------------------------------- human_size
+class TestDefaultMediaRoot:
+    def test_default_without_env(self, monkeypatch):
+        monkeypatch.delenv("IA_MEDIA_ROOT", raising=False)
+        monkeypatch.setenv("IA_CONFIG_PATH", "/__missing_archive_downloader_config__.json")
+        assert default_media_root() == DEFAULT_MEDIA_ROOT
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("IA_CONFIG_PATH", "/__missing_archive_downloader_config__.json")
+        monkeypatch.setenv("IA_MEDIA_ROOT", "/tmp/custom-media")
+        assert default_media_root() == "/tmp/custom-media"
+
+    def test_env_override_expands_user(self, monkeypatch):
+        monkeypatch.setenv("IA_CONFIG_PATH", "/__missing_archive_downloader_config__.json")
+        monkeypatch.setenv("IA_MEDIA_ROOT", "~/custom-media")
+        assert default_media_root() == os.path.expanduser("~/custom-media")
 
 
 # ---------------------------------------------------------------- human_size
@@ -61,6 +82,21 @@ class TestHumanSize:
         # never leave the B unit. Document current behavior.
         assert human_size(-1) == "-1B"
         assert human_size(-2048) == "-2048B"
+
+
+class TestCompactCount:
+    def test_small_count(self):
+        assert compact_count(999) == "999"
+
+    def test_thousands(self):
+        assert compact_count(1200) == "1.2K"
+        assert compact_count(12000) == "12K"
+
+    def test_millions(self):
+        assert compact_count(1_250_000) == "1.2M"
+
+    def test_invalid(self):
+        assert compact_count("bad") == "?"
 
 
 # ------------------------------------------------------------- is_video_file
@@ -178,6 +214,8 @@ class TestDataclassDefaults:
         sr = SearchResult(identifier="x", title="y")
         assert sr.year == ""
         assert sr.creator == ""
+        assert sr.mediatype == ""
+        assert sr.downloads == 0
 
     def test_iafile_defaults(self):
         f = IAFile(name="a.mp4", size=100)
