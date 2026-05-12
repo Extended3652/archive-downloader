@@ -110,11 +110,32 @@ class TestRetroWaveIAState:
         app.video_only = False
         app.sel_f = 3
         app.focus = "MENU"
+        app.prompt_list = lambda _title, _options, default_idx=0: "Set keyword..."
         app.prompt = lambda _label, _default="": "mp4"
+        app.save_current_file_view_state = lambda: None
 
         app.activate_menu_action("keyword")
 
         assert app.file_kw == "mp4"
+        assert app.sel_f == 0
+        assert app.focus == "LIST"
+
+    def test_keyword_action_can_clear_without_text_prompt(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "FILES"
+        app.files = []
+        app.file_kw = "mp4"
+        app.video_only = True
+        app.sel_f = 2
+        app.focus = "MENU"
+        app.prompt_list = lambda _title, _options, default_idx=0: "Clear keyword"
+        app.prompt = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not prompt for text"))
+        app.save_current_file_view_state = lambda: None
+
+        app.activate_menu_action("keyword")
+
+        assert app.file_kw == ""
+        assert app.video_only is True
         assert app.sel_f == 0
         assert app.focus == "LIST"
 
@@ -126,7 +147,7 @@ class TestRetroWaveIAState:
         hint = app.hint_bar()
 
         assert "d marked/selected" in hint
-        assert "f keyword" in hint
+        assert "f filter" in hint
         assert "? help" in hint
 
     def test_action_palette_groups_file_actions(self):
@@ -137,7 +158,7 @@ class TestRetroWaveIAState:
 
         assert "Open / preview selected file" in labels
         assert "Download / marked files" in labels
-        assert "Filter / keyword" in labels
+        assert "Filter / file filter menu" in labels
         assert "Select / toggle file mark" in labels
         assert "Select / mark all visible files" in labels
         assert "Select / invert visible marks" in labels

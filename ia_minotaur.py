@@ -697,7 +697,7 @@ class RetroWaveIA:
                 ("Folder", "folder"),
                 ("Item", "item"),
                 (f"Video only: {'On' if self.video_only else 'Off'}", "video_only"),
-                ("Keyword", "keyword"),
+                (f"Filter: {self.file_kw or ('Video' if self.video_only else 'All')}", "keyword"),
                 (f"Save to: {self.last_bucket}", "bucket"),
                 (fav_file_label, "fav_file"),
                 (f"Theme: {theme}", "theme"),
@@ -728,10 +728,27 @@ class RetroWaveIA:
         if not items:
             return y
 
+        selected = max(0, min(getattr(self, "menu_idx", 0), len(items) - 1))
+        start = 0
+        if self.focus == "MENU":
+            used = 3 if selected > 0 else 0
+            for i in range(selected, -1, -1):
+                pill_len = len(f" {items[i][0]} ")
+                if used + pill_len >= w - 5:
+                    start = i + 1
+                    break
+                used += pill_len
+
         x = 0
-        for i, (label, _action) in enumerate(items):
+        if start > 0 and w > 4:
+            self.safe_addstr(y, x, "‹ ", curses.color_pair(3) | curses.A_BOLD)
+            x += 2
+
+        hidden_right = 0
+        for i, (label, _action) in enumerate(items[start:], start=start):
             pill = f" {label} "
             if x + len(pill) >= w - 1:
+                hidden_right = len(items) - i
                 break
 
             is_sel = (self.focus == "MENU" and i == self.menu_idx)
@@ -742,8 +759,22 @@ class RetroWaveIA:
             self.safe_addstr(y, x, pill, attr)
             x += len(pill)
 
+        if hidden_right and x < w - 7:
+            more = f" +{hidden_right} › "
+            self.safe_addstr(y, x, more[: max(0, w - 1 - x)], curses.color_pair(3) | curses.A_BOLD)
+            x += len(more)
+
         if x < w - 1:
             self.safe_addstr(y, x, " " * (w - 1 - x), curses.color_pair(6) | curses.A_DIM)
+
+        if self.focus == "MENU" and y + 1 < self.stdscr.getmaxyx()[0] - 1:
+            label, _action = items[selected]
+            parts = [f"MENU: {label}", "Enter run", "Left/Right choose", "Tab list", "a all actions"]
+            if start > 0 or hidden_right:
+                parts.append(f"{start + hidden_right} hidden")
+            line = "  |  ".join(parts)
+            self.safe_addstr(y + 1, 0, line[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(2) | curses.A_BOLD)
+            return y + 2
 
         return y + 1
 
@@ -766,7 +797,7 @@ class RetroWaveIA:
         if self.mode in ("RESULTS", "SEARCH"):
             return "Enter/o open  |  / search  |  l local filter  |  a actions  |  n/p page  |  ? help  |  q quit"
         if self.mode == "FILES":
-            return "Space mark  |  A all  |  I invert  |  U clear  |  d marked/selected  |  f keyword  |  ? help"
+            return "Space mark  |  A all  |  I invert  |  U clear  |  d marked/selected  |  f filter  |  ? help"
         if self.mode == "FAVS":
             return "Enter/o open  |  a actions  |  Tab menu/list  |  Backspace back  |  ? help  |  q quit"
         if self.mode == "PREVIEW_DL":
@@ -1014,12 +1045,12 @@ class RetroWaveIA:
                 ("Download / retry failed files retry failed", "retry_failed"),
                 ("Download / folder prefix folder", "folder"),
                 ("Download / all visible files all", "item"),
-                ("Filter / keyword", "keyword"),
+                ("Filter / file filter menu", "keyword"),
                 ("Filter / video only", "video_only"),
                 ("Download / save bucket folder", "bucket"),
                 ("Filter / rights license", "license_gate"),
                 ("Alias / movie video", "video_only"),
-                ("Alias / audio keyword", "keyword"),
+                ("Alias / audio keyword filter", "keyword"),
                 ("Alias / all", "item"),
                 ("Alias / clear", "clear_file_marks"),
                 ("Alias / queue", "download"),
@@ -1340,19 +1371,52 @@ class RetroWaveIA:
             return "▶"
         return "○"
 
+    def choose_file_filter_action(self) -> None:
+        options = [
+            "Set keyword...",
+            "Clear keyword",
+            f"Video only: {'Off' if self.video_only else 'On'}",
+            "Show all files",
+        ]
+        default_idx = 1 if self.file_kw else 0
+        pick = self.prompt_list("File filter", options, default_idx=default_idx)
+        if not pick:
+            self.status = "File filter unchanged."
+            self.focus = "LIST"
+            return
+
+        if pick == "Set keyword...":
+            s = self.prompt("Keyword (blank clears): ", self.file_kw)
+            if s is None:
+                self.status = "Keyword unchanged."
+            else:
+                self.file_kw = s.strip()
+                self.sel_f = 0
+                self.status = "Keyword cleared." if not self.file_kw else f"Keyword: {self.file_kw}"
+                self.save_current_file_view_state()
+        elif pick == "Clear keyword":
+            self.file_kw = ""
+            self.sel_f = 0
+            self.status = "Keyword cleared."
+            self.save_current_file_view_state()
+        elif pick.startswith("Video only:"):
+            self.video_only = not self.video_only
+            self.sel_f = 0
+            self.status = "Video only: ON" if self.video_only else "Video only: OFF (showing all files)"
+            self.save_current_file_view_state()
+        elif pick == "Show all files":
+            self.file_kw = ""
+            self.video_only = False
+            self.sel_f = 0
+            self.status = "Showing all files."
+            self.save_current_file_view_state()
+        self.focus = "LIST"
+
     def handle_files_hotkey(self, ch: int) -> bool:
         if self.mode != "FILES":
             return False
         if ch in (ord('f'), ord('F')):
-            s = self.prompt("Keyword (blank clears): ", self.file_kw)
-            if s is not None:
-                self.file_kw = s.strip()
-                self.sel_f = 0
-                self.status = "Keyword updated"
-                self.save_current_file_view_state()
-            else:
-                self.status = "Keyword unchanged."
-            self.focus = "LIST"
+            self.choose_file_filter_action()
             return True
         if ch == ord(' '):
             self.toggle_current_file_mark()
@@ -2481,6 +2545,7 @@ class RetroWaveIA:
             "  Space      Mark/unmark file (in FILES mode)",
             "  A / I / U  Mark all visible / invert visible / clear marks",
             "  d          Preview marked files, or selected file if none marked",
+            "  f          File filter menu: keyword, clear keyword, video-only, show all",
             "  v          Toggle video-only filter (in FILES mode)",
             "  Backspace  Go back (works in FILES, FAVS, HELP, PREVIEW)",
             "  q          Quit",
@@ -2559,7 +2624,7 @@ class RetroWaveIA:
         elif self.mode == "FILES":
             lines += [
                 "Files:      Space mark   A all   I invert   U clear   d marked/selected",
-                "Filters:    f keyword   v video-only   blank keyword clears",
+                "Filters:    f filter menu   v video-only   keyword blank clears",
             ]
         elif self.mode == "FAVS":
             lines += [
@@ -2785,9 +2850,9 @@ class RetroWaveIA:
                 max_rows = max(0, max_rows - 1)
             if not visible:
                 if self.file_kw:
-                    msg = f"No files match \"{self.file_kw}\"  |  f change keyword  |  U clear marks  |  v show all"
+                    msg = f"No files match \"{self.file_kw}\"  |  f filter menu  |  U clear marks  |  v show all"
                 elif self.video_only:
-                    msg = "No video files visible  |  v show all  |  f keyword  |  Backspace results"
+                    msg = "No video files visible  |  v show all  |  f filter menu  |  Backspace results"
                 else:
                     msg = "No files found for this item  |  Backspace results  |  / search"
                 self.safe_addstr(list_top, 0, msg.ljust(max(0, left_w - 1)), curses.color_pair(6))
@@ -3216,15 +3281,7 @@ class RetroWaveIA:
             visible = self.get_visible_files()
 
             if action == "keyword":
-                s = self.prompt("Keyword (blank clears): ", self.file_kw)
-                if s is not None:
-                    self.file_kw = s.strip()
-                    self.sel_f = 0
-                    self.status = "Keyword updated"
-                    self.save_current_file_view_state()
-                else:
-                    self.status = "Keyword unchanged."
-                self.focus = "LIST"
+                self.choose_file_filter_action()
                 return
 
             if action == "toggle_file_mark":
