@@ -4,6 +4,7 @@ We only test functions that can run without a real curses terminal and
 without touching the user's media root. conftest.py sets IA_MEDIA_ROOT
 to a temp path before this module is imported.
 """
+import io
 import os
 
 import ia_minotaur
@@ -794,3 +795,71 @@ class TestChooseBucketAndPath:
         assert os.path.exists(staged)
         assert app.status == "Resume complete. 1 file(s) handled."
         assert not pending_path.exists()
+
+    def test_download_auto_retries_after_stall(self, monkeypatch, tmp_path):
+        self.set_roots(monkeypatch, tmp_path)
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "STAGING_ROOT", ia_minotaur.STAGING_ROOT)
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "open_process_log", lambda: io.StringIO())
+        monkeypatch.setattr(ia_minotaur, "STALL_RETRY_DELAY_S", 0)
+
+        class FakeScreen:
+            def nodelay(self, _flag):
+                pass
+
+            def getch(self):
+                return -1
+
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.stdscr = FakeScreen()
+        app.render = lambda: None
+        app.status = ""
+
+        calls = []
+
+        def fake_run(*_args, **_kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                return False, "Download stalled — no progress for 120s. Try again."
+            path = ia_minotaur.staging_file_path("item1", "file.mp4")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as fh:
+                fh.write(b"abcd")
+            return True, ""
+
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "run_download_with_progress", fake_run)
+
+        ok, msg = app._download_one_with_progress("item1", "file.mp4", 4)
+
+        assert (ok, msg) == (True, "")
+        assert len(calls) == 2
+
+    def test_download_treats_complete_staged_file_as_success_after_stall(self, monkeypatch, tmp_path):
+        self.set_roots(monkeypatch, tmp_path)
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "STAGING_ROOT", ia_minotaur.STAGING_ROOT)
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "open_process_log", lambda: io.StringIO())
+        monkeypatch.setattr(ia_minotaur, "STALL_RETRY_DELAY_S", 0)
+        self.stage_file("item1", "file.mp4", b"abcd")
+
+        class FakeScreen:
+            def nodelay(self, _flag):
+                pass
+
+            def getch(self):
+                return -1
+
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.stdscr = FakeScreen()
+        app.render = lambda: None
+        app.status = ""
+        calls = []
+
+        def fake_run(*_args, **_kwargs):
+            calls.append(1)
+            return False, "Download stalled — no progress for 120s. Try again."
+
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "run_download_with_progress", fake_run)
+
+        ok, msg = app._download_one_with_progress("item1", "file.mp4", 4)
+
+        assert (ok, msg) == (True, "")
+        assert len(calls) == 1

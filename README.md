@@ -100,6 +100,8 @@ $IA_MEDIA_ROOT/
 
 Destination paths are validated against the media root before any file is moved, so user-entered folder names containing `..` are rejected.
 
+If a Minotaur file download stalls, the stalled `ia` process is killed and retried automatically up to two times. Completed staged files are imported without redownloading; after the retry limit, pending state is saved so `R` can resume later.
+
 ## Running tests
 
 ```

@@ -75,6 +75,8 @@ LARGE_VIDEO_BYTES = 500 * 1024 * 1024
 
 # Kill the download subprocess if no bytes arrive for this long.
 STALL_TIMEOUT_S = 120
+STALL_AUTO_RETRIES = 2
+STALL_RETRY_DELAY_S = 8
 BULK_CONFIRM_FILE_THRESHOLD = 10
 BULK_CONFIRM_BYTES_THRESHOLD = 5 * 1024 * 1024 * 1024
 
@@ -1987,6 +1989,22 @@ class RetroWaveIA:
             return False
         return os.path.exists(path) and ia_downloads.safe_getsize(path) == int(expected_size)
 
+    def _is_stall_error(self, msg: str) -> bool:
+        return "download stalled" in (msg or "").lower()
+
+    def _wait_before_stall_retry(self, attempt_num: int, max_attempts: int) -> bool:
+        for remaining in range(STALL_RETRY_DELAY_S, 0, -1):
+            self.status = f"Download stalled. Auto-retry {attempt_num}/{max_attempts} in {remaining}s. Press c to cancel."
+            self.render()
+            try:
+                if self.stdscr.getch() in (ord("c"), ord("C")):
+                    self.dl_cancel_requested = True
+                    return False
+            except Exception:
+                pass
+            time.sleep(1)
+        return True
+
     def _download_one_with_progress(self, identifier: str, filename: str, expected_size: int) -> Tuple[bool, str]:
         path, err = safe_staging_file_path(identifier, filename)
         if err or not path:
@@ -2025,20 +2043,45 @@ class RetroWaveIA:
                     self.status = f"{filename}  {human_size(progress.written)} downloaded  (c cancels)"
                 self.render()
 
-            ok, msg = ia_downloads.run_download_with_progress(
-                cmd,
-                target=filename,
-                expected_total=int(expected_size or 0),
-                read_written=lambda: ia_downloads.safe_getsize(path),
-                log_fh=log_fh,
-                stall_timeout_s=STALL_TIMEOUT_S,
-                is_cancel_requested=check_cancel,
-                on_progress=update_progress,
-                log_path=LOG_PATH,
-            )
-            if not ok:
+            max_stall_retries = STALL_AUTO_RETRIES
+            attempt = 0
+            while True:
+                if attempt > 0:
+                    self.status = f"Retrying stalled download {attempt}/{max_stall_retries}: {filename}"
+                    self.render()
+                    log_line(f"DL_STALL_RETRY: {filename} attempt {attempt}/{max_stall_retries}")
+
+                ok, msg = ia_downloads.run_download_with_progress(
+                    cmd,
+                    target=filename,
+                    expected_total=int(expected_size or 0),
+                    read_written=lambda: ia_downloads.safe_getsize(path),
+                    log_fh=log_fh,
+                    stall_timeout_s=STALL_TIMEOUT_S,
+                    is_cancel_requested=check_cancel,
+                    on_progress=update_progress,
+                    log_path=LOG_PATH,
+                )
+                if ok:
+                    break
+
                 if msg.startswith("download failed:"):
                     log_line(f"DL_POPEN_ERR: {msg}")
+                    return False, msg
+
+                if self._is_stall_error(msg):
+                    if self._staged_file_complete(identifier, filename, int(expected_size or 0)):
+                        log_line(f"DL_STALL_COMPLETE: {filename}")
+                        break
+                    if self.dl_cancel_requested:
+                        return False, "Canceled."
+                    if attempt < max_stall_retries:
+                        attempt += 1
+                        if not self._wait_before_stall_retry(attempt, max_stall_retries):
+                            return False, "Canceled."
+                        continue
+                    return False, f"{msg} Auto-retry limit reached."
+
                 return False, msg
 
             ok_sz, msg_sz = self._verify_expected_size(identifier, filename, int(expected_size or 0))
@@ -2578,7 +2621,7 @@ class RetroWaveIA:
             "  No download starts without a confirmation step.",
             "  Press c to cancel while downloading.",
             "  Press R from any screen to resume a canceled/stalled download.",
-            "  Downloads stalled for 2 min are killed automatically and can be resumed.",
+            "  Downloads stalled for 2 min auto-retry twice, then save resume state.",
             "  Files go to staging first, then move to TV / Movies / Music / Other.",
             "  Unclear rights show a warning; [License gate] can block them.",
             f"  {'--no-change-timestamp enabled (mtimes set to now).' if IA_NO_CHANGE_TIMESTAMP else 'Source mtimes preserved.'}",
