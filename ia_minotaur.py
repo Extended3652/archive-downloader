@@ -3,7 +3,9 @@ import argparse
 import curses
 import os
 import re
+import shlex
 import shutil
+import threading
 import sys
 import textwrap
 import time
@@ -16,6 +18,8 @@ from ia_common import (
     VIDEO_FORMAT_HINTS,
     compact_count,
     human_size,
+    is_archive_torrent_format,
+    is_dvd_iso_file,
     is_video_file,
     safe_path_under,
 )
@@ -35,19 +39,29 @@ from ia_paths import (
     staging_file_path,
 )
 import ia_api
+import ia_audit
 import ia_config
 import ia_downloads
+import ia_dvd
+import ia_minotaur_events
+import yt_api
+import yt_downloads
 from ia_organize import (
+    archive_query_preset_labels,
     auto_clean_movie_folder_name,
+    build_archive_preset_query,
     build_collection_search_query,
     build_field_query,
     build_query_attempts,
+    build_sideways_searches,
     build_within_collection_query,
     build_query,
     detect_sxxeyy,
+    infer_bucket,
     is_openly_licensed,
     license_status_from_fields,
     normalize_collection_identifier,
+    replace_mediatype_filter,
     sanitize_folder,
 )
 import ia_state
@@ -79,6 +93,83 @@ STALL_AUTO_RETRIES = 2
 STALL_RETRY_DELAY_S = 8
 BULK_CONFIRM_FILE_THRESHOLD = 10
 BULK_CONFIRM_BYTES_THRESHOLD = 5 * 1024 * 1024 * 1024
+MAX_STATUS_ERROR_CHARS = 180
+MAX_DETAIL_ERROR_CHARS = 600
+MOUSE_WHEEL_LINES = 4
+
+
+def is_enter_key(ch: int) -> bool:
+    return ch in (10, 13, curses.KEY_ENTER)
+
+
+def is_backspace_key(ch: int) -> bool:
+    return ch in (curses.KEY_BACKSPACE, 127, 8)
+
+
+def mouse_wheel_direction(button_state: int) -> int:
+    """Return -1 for wheel up, 1 for wheel down, or 0 for non-wheel events."""
+    up_masks = (
+        getattr(curses, "BUTTON4_PRESSED", 0),
+        getattr(curses, "BUTTON4_CLICKED", 0),
+        getattr(curses, "BUTTON4_RELEASED", 0),
+    )
+    down_masks = (
+        getattr(curses, "BUTTON5_PRESSED", 0),
+        getattr(curses, "BUTTON5_CLICKED", 0),
+        getattr(curses, "BUTTON5_RELEASED", 0),
+    )
+    if any(mask and button_state & mask for mask in up_masks):
+        return -1
+    if any(mask and button_state & mask for mask in down_masks):
+        return 1
+    return 0
+
+
+def scroll_index(index: int, direction: int, total: int, *, lines: int = MOUSE_WHEEL_LINES) -> int:
+    if total <= 0 or direction == 0:
+        return max(0, index)
+    step = max(1, int(lines))
+    return max(0, min(total - 1, index + (direction * step)))
+
+
+def normalize_save_bucket(value: str, default: str = "Other") -> str:
+    bucket = str(value or "").strip().lower()
+    if bucket == "tv":
+        return "TV"
+    if bucket == "movies":
+        return "Movies"
+    if bucket == "music":
+        return "Music"
+    if bucket == "other":
+        return "Other"
+    return default if default in ("TV", "Movies", "Music", "Other") else "Other"
+
+
+def compact_error_text(text: str, *, max_chars: int = MAX_DETAIL_ERROR_CHARS) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "Unknown error"
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    traceback_marker = "Traceback (most recent call last):"
+    if traceback_marker in raw:
+        prefix = raw.split(traceback_marker, 1)[0].strip()
+        for line in reversed(lines):
+            if (
+                traceback_marker in line
+                or line.startswith("File ")
+                or line.startswith("^")
+                or line.startswith("During handling ")
+                or line.startswith("The above exception ")
+            ):
+                continue
+            raw = f"{prefix} {line}".strip() if prefix else line
+            break
+
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if len(raw) > max_chars:
+        return raw[: max(0, max_chars - 3)].rstrip() + "..."
+    return raw
 
 
 def shaded_progress_bar(written: int, total: int, width: int) -> str:
@@ -105,6 +196,16 @@ def shaded_progress_bar(written: int, total: int, width: int) -> str:
 
     empty = max(0, width - filled - len(partial))
     return ("█" * filled) + partial + ("░" * empty)
+
+
+def display_size(n: Any, *, unknown: str = "unknown") -> str:
+    try:
+        value = int(n)
+    except (TypeError, ValueError):
+        return unknown
+    if value <= 0:
+        return unknown
+    return human_size(value)
 
 
 def log_line(msg: str) -> None:
@@ -137,6 +238,9 @@ def environment_checks() -> List[Tuple[str, bool, str]]:
     curl_ok, curl_msg = ia_api.curl_version(runner=run_cmd)
     checks.append(("curl", curl_ok, curl_msg))
 
+    yt_ok, yt_msg = yt_api.yt_dlp_version(APP_CONFIG["yt_dlp_path"], runner=run_cmd)
+    checks.append(("yt-dlp", yt_ok, yt_msg))
+
     for label, path in (
         ("media root", MEDIA_ROOT),
         ("staging dir", STAGING_ROOT),
@@ -155,6 +259,10 @@ def environment_checks() -> List[Tuple[str, bool, str]]:
     ):
         path_ok, path_msg = check_writable_dir(path)
         checks.append((label, path_ok, path_msg))
+
+    for binary in ("lsdvd", "HandBrakeCLI"):
+        found = shutil.which(binary)
+        checks.append((binary, True, found or f"optional for DVD ISO scanning; {binary} not found on PATH"))
 
     return checks
 
@@ -181,6 +289,14 @@ def ia_files(identifier: str) -> Tuple[List[IAFile], Optional[Dict[str, Any]], s
     return ia_api.ia_files(identifier, runner=run_cmd)
 
 
+def yt_search(query: str, rows: int = 10) -> Tuple[List[SearchResult], int, str]:
+    return yt_api.yt_search(query, rows, yt_dlp_path=APP_CONFIG["yt_dlp_path"], runner=run_cmd)
+
+
+def yt_metadata_url(url: str) -> Tuple[Optional[SearchResult], str]:
+    return yt_api.yt_metadata_url(url, yt_dlp_path=APP_CONFIG["yt_dlp_path"], runner=run_cmd)
+
+
 class RetroWaveIA:
     def __init__(self, stdscr):
         self.stdscr = stdscr
@@ -199,8 +315,27 @@ class RetroWaveIA:
         self.total_results: int = 0
         self.search_history: List[str] = []
         self.result_filter = ""
+        self.last_search_text = ""
+        self.search_source = "ia"
+        self.last_search_used_label = ""
+        self.last_search_attempts: List[Tuple[str, str]] = []
+        self._search_load_lock = threading.RLock()
+        self._search_load_token: int = 0
+        self._search_load_loading: bool = False
+        self._search_load_result: Optional[Dict[str, Any]] = None
+        self._search_load_thread: Optional[threading.Thread] = None
 
         self.results: List[SearchResult] = []
+        self._search_cache_lock = threading.RLock()
+        self._all_results_cache: List[SearchResult] = []
+        self._all_results_pages: List[Optional[List[SearchResult]]] = []
+        self._all_results_cache_key: str = ""
+        self._all_results_loaded_pages: int = 0
+        self._all_results_total_pages: int = 0
+        self._all_results_loading: bool = False
+        self._all_results_loader_error: str = ""
+        self._all_results_loader_token: int = 0
+        self._all_results_loader_thread: Optional[threading.Thread] = None
         self.sel_r = 0
 
         self.files: List[IAFile] = []
@@ -208,7 +343,13 @@ class RetroWaveIA:
         self.file_kw = ""
         self.video_only = False
         self.selected_file_names: Set[str] = set()
+        self.selected_file_order: List[str] = []
         self.file_view_state: Dict[str, Dict[str, Any]] = {}
+        self._file_load_lock = threading.RLock()
+        self._file_load_token: int = 0
+        self._file_load_loading: bool = False
+        self._file_load_result: Optional[Dict[str, Any]] = None
+        self._file_load_thread: Optional[threading.Thread] = None
 
         self.last_bucket = str(APP_CONFIG["default_bucket"])  # TV/Movies/Music/Other
         self.download_log: List[str] = []
@@ -236,6 +377,7 @@ class RetroWaveIA:
         self.preview_msg: str = ""
         self.preview_existing: List[str] = []
         self.preview_destinations: List[str] = []
+        self.last_error_detail: str = ""
 
         self.dl_current_name: str = ""
         self.dl_current_written: int = 0
@@ -245,6 +387,7 @@ class RetroWaveIA:
         self.dl_overall_written: int = 0
         self.dl_overall_total: int = 0
         self.dl_cancel_requested: bool = False
+        self.dl_complete_notice: str = ""
 
         if not self.ia_present:
             self.mode = "ERROR"
@@ -261,13 +404,11 @@ class RetroWaveIA:
         ia_state.save_session(
             SESSION_PATH,
             {
-                "query_text": self.query_text,
-                "filter": self.filter,
-                "title_only": self.title_only,
-                "page": self.page,
-                "sort_by": self.sort_by,
+                "filter": getattr(self, "filter", "any"),
+                "title_only": getattr(self, "title_only", False),
+                "sort_by": getattr(self, "sort_by", ""),
                 "enforce_license_gate": getattr(self, "enforce_license_gate", False),
-                "search_history": self.search_history[:MAX_HISTORY],
+                "search_history": getattr(self, "search_history", [])[:MAX_HISTORY],
             },
         )
 
@@ -276,11 +417,9 @@ class RetroWaveIA:
             data = ia_state.load_session(SESSION_PATH)
             if not data:
                 return
-            self.query_text = str(data.get("query_text") or "")
             if data.get("filter") in FILTERS:
                 self.filter = data["filter"]
             self.title_only = bool(data.get("title_only", False))
-            self.page = max(1, int(data.get("page") or 1))
             sort_val = str(data.get("sort_by") or "")
             if any(v == sort_val for _, v in SORT_OPTIONS):
                 self.sort_by = sort_val
@@ -488,6 +627,7 @@ class RetroWaveIA:
 
     def draw_top_status(self, y: int, w: int) -> int:
         search_mode = "Title" if self.title_only else "Broad"
+        source_label = self.search_source_label()
 
         header = "Search Results"
         if self.mode == "FILES":
@@ -514,12 +654,12 @@ class RetroWaveIA:
             page_info = f"Page: {self.page}{local}"
         sort_info = f"  |  Sort: {self._sort_label()}" if self.sort_by else ""
         focus_info = f"Focus: {self.focus}"
-        line1 = f"{header}  |  {focus_info}  |  Filter: {self.filter}  |  Search: {search_mode}{sort_info}  |  {page_info}"
+        line1 = f"{header}  |  {focus_info}  |  Source: {source_label}  |  Filter: {self.filter}  |  Search: {search_mode}{sort_info}  |  {page_info}"
         self.safe_addstr(y, 0, line1[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(3)); y += 1
 
         breadcrumb = self.breadcrumb()
         if self.query_built and self.mode in ("RESULTS", "SEARCH"):
-            line2 = f"{breadcrumb}  |  Query: {self.query_built[:60]}   Root: {MEDIA_ROOT}"
+            line2 = f"{breadcrumb}  |  Query: {self.query_built[:45]}  |  Root: {MEDIA_ROOT}  |  Staging: {STAGING_ROOT}"
         else:
             line2 = f"{breadcrumb}  |  Root: {MEDIA_ROOT}   Staging: {STAGING_ROOT}"
         self.safe_addstr(y, 0, line2[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(3)); y += 1
@@ -546,12 +686,36 @@ class RetroWaveIA:
         return " > ".join(crumbs)
 
     def _sort_label(self) -> str:
+        sort_by = getattr(self, "sort_by", "")
         for label, val in SORT_OPTIONS:
-            if val == self.sort_by:
+            if val == sort_by:
                 return label
         return "relevance"
 
+    def search_source_label(self) -> str:
+        source = str(getattr(self, "search_source", "ia") or "ia").lower()
+        if source == "youtube_url":
+            return "YouTube URL"
+        if source.startswith("youtube"):
+            return "YouTube"
+        if source == "all":
+            return "All"
+        return "IA"
+
+    def search_source_badge(self) -> str:
+        source = str(getattr(self, "search_source", "ia") or "ia").lower()
+        if source.startswith("youtube"):
+            return "[YT]"
+        if source == "all":
+            return "[ALL]"
+        return "[IA]"
+
+    def result_source_badge(self, r: Optional[SearchResult]) -> str:
+        return "[YT]" if self.is_youtube_result(r) else "[IA]"
+
     def result_license_label(self, r: SearchResult) -> str:
+        if self.is_youtube_result(r):
+            return "yt"
         status, _why = license_status_from_fields(r.licenseurl, r.rights)
         return {
             "open": "lic:open",
@@ -560,7 +724,26 @@ class RetroWaveIA:
             "unknown": "?",
         }.get(status, "?")
 
+    def is_youtube_result(self, r: Optional[SearchResult]) -> bool:
+        return bool(r and getattr(r, "source", "ia") == "youtube")
+
+    def youtube_file_for_result(self, r: SearchResult) -> IAFile:
+        return IAFile(
+            name=yt_downloads.display_filename(r.title, r.video_id or r.identifier),
+            size=0,
+            fmt="YouTube video",
+        )
+
     def result_meta_summary(self, r: SearchResult) -> str:
+        if self.is_youtube_result(r):
+            parts = []
+            if r.uploader or r.creator:
+                parts.append(r.uploader or r.creator)
+            if r.duration:
+                parts.append(f"{int(r.duration)}s")
+            if r.upload_date:
+                parts.append(r.upload_date)
+            return " | ".join(parts)
         parts = []
         if r.year:
             parts.append(str(r.year))
@@ -568,20 +751,82 @@ class RetroWaveIA:
             parts.append(str(r.mediatype))
         if r.downloads:
             parts.append(f"{compact_count(r.downloads)} dl")
+        if r.formats and is_archive_torrent_format(r.formats):
+            parts.append("torrent")
         lic = self.result_license_label(r)
         if lic != "?":
             parts.append(lic)
         return " | ".join(parts)
 
+    def youtube_result_details_lines(self, item: SearchResult) -> List[str]:
+        lines = [
+            "Selected:",
+            "  Source: [YT] YouTube",
+            f"  Title:   {item.title or '(no title)'}",
+        ]
+        if item.uploader or item.creator:
+            lines.append(f"  Channel: {item.uploader or item.creator}")
+        if item.duration:
+            lines.append(f"  Duration: {int(item.duration)}s")
+        if item.upload_date or item.date:
+            lines.append(f"  Upload date: {item.upload_date or item.date}")
+        if item.video_id:
+            lines.append(f"  Video ID: {item.video_id}")
+        if item.webpage_url:
+            lines.append(f"  URL: {item.webpage_url}")
+        lines += [
+            "",
+            "Enter or [Open] to preview/download",
+            "Single-video download via yt-dlp",
+            f"Query: {self.query_built or '(none)'}",
+        ]
+        return lines
+
+    def result_row_attr(self, r: SearchResult, selected: bool) -> int:
+        if selected:
+            attr = curses.color_pair(7) if self.focus == "LIST" else curses.color_pair(6)
+            if self.focus == "LIST":
+                attr |= curses.A_BOLD
+            return attr
+        if self.is_youtube_result(r):
+            return curses.color_pair(3) | curses.A_BOLD
+        return curses.color_pair(6)
+
+    def show_audit_summary(self) -> None:
+        try:
+            report = ia_audit.analyze_library(MEDIA_ROOT, probe=False, max_probe=0)
+        except Exception as e:
+            self.status = f"Audit summary failed: {e}"
+            return
+
+        summary = report.get("summary") or {}
+        self.status = (
+            "Audit: weird {weird_filenames} | dup movies {duplicate_movies} | dup eps {duplicate_episodes} | "
+            "metadata {metadata_issues} | rename {rename_suggestions} | cleanup {cleanup_candidates}. "
+            "Run ia-audit for details."
+        ).format(
+            weird_filenames=int(summary.get("weird_filenames") or 0),
+            duplicate_movies=int(summary.get("duplicate_movies") or 0),
+            duplicate_episodes=int(summary.get("duplicate_episodes") or 0),
+            metadata_issues=int(summary.get("metadata_issues") or 0),
+            rename_suggestions=int(summary.get("rename_suggestions") or 0),
+            cleanup_candidates=int(summary.get("cleanup_candidates") or 0),
+        )
+
     def result_filter_blob(self, r: SearchResult) -> str:
         status, _why = license_status_from_fields(r.licenseurl, r.rights)
         values = [
+            getattr(r, "source", ""),
+            getattr(r, "webpage_url", ""),
+            getattr(r, "video_id", ""),
+            getattr(r, "uploader", ""),
             r.identifier,
             r.title,
             r.year,
             r.creator,
             r.description,
             r.mediatype,
+            r.formats,
             str(r.downloads or ""),
             r.date,
             r.publicdate,
@@ -592,12 +837,188 @@ class RetroWaveIA:
         ]
         return " ".join(str(v or "") for v in values).lower()
 
+    def _search_cache_key(self) -> str:
+        query = (getattr(self, "query_built", "") or getattr(self, "query_text", "")).strip()
+        return "\0".join(
+            [
+                query,
+                str(getattr(self, "filter", "")),
+                str(getattr(self, "sort_by", "")),
+                "1" if bool(getattr(self, "title_only", False)) else "0",
+            ]
+        )
+
+    def _ensure_search_cache_state(self) -> None:
+        if not hasattr(self, "_search_cache_lock") or getattr(self, "_search_cache_lock", None) is None:
+            self._search_cache_lock = threading.RLock()
+        if not hasattr(self, "_all_results_cache"):
+            self._all_results_cache = []
+        if not hasattr(self, "_all_results_pages"):
+            self._all_results_pages = []
+        if not hasattr(self, "_all_results_cache_key"):
+            self._all_results_cache_key = ""
+        if not hasattr(self, "_all_results_loaded_pages"):
+            self._all_results_loaded_pages = 0
+        if not hasattr(self, "_all_results_total_pages"):
+            self._all_results_total_pages = 0
+        if not hasattr(self, "_all_results_loading"):
+            self._all_results_loading = False
+        if not hasattr(self, "_all_results_loader_error"):
+            self._all_results_loader_error = ""
+        if not hasattr(self, "_all_results_loader_token"):
+            self._all_results_loader_token = 0
+        if not hasattr(self, "_all_results_loader_thread"):
+            self._all_results_loader_thread = None
+
+    def _ensure_search_load_state(self) -> None:
+        if not hasattr(self, "_search_load_lock") or getattr(self, "_search_load_lock", None) is None:
+            self._search_load_lock = threading.RLock()
+        if not hasattr(self, "_search_load_token"):
+            self._search_load_token = 0
+        if not hasattr(self, "_search_load_loading"):
+            self._search_load_loading = False
+        if not hasattr(self, "_search_load_result"):
+            self._search_load_result = None
+        if not hasattr(self, "_search_load_thread"):
+            self._search_load_thread = None
+
+    def cancel_search_load(self) -> None:
+        self._ensure_search_load_state()
+        with self._search_load_lock:
+            self._search_load_token += 1
+            self._search_load_loading = False
+            self._search_load_result = None
+
+    def cancel_result_prefetch(self) -> None:
+        self._ensure_search_cache_state()
+        with self._search_cache_lock:
+            self._all_results_loader_token += 1
+            self._all_results_loading = False
+            self._all_results_loader_error = ""
+
+    def _reset_search_cache(self) -> None:
+        self._ensure_search_cache_state()
+        with self._search_cache_lock:
+            self._all_results_cache = []
+            self._all_results_pages = []
+            self._all_results_cache_key = ""
+            self._all_results_loaded_pages = 0
+            self._all_results_total_pages = 0
+            self._all_results_loading = False
+            self._all_results_loader_error = ""
+            self._all_results_loader_thread = None
+
+    def _prime_search_cache(self, key: str, page_num: int, page_results: List[SearchResult], total_pages: int) -> None:
+        self._ensure_search_cache_state()
+        with self._search_cache_lock:
+            previous_key = self._all_results_cache_key
+            self._all_results_cache_key = key
+            if total_pages <= 0:
+                total_pages = 1
+            if len(self._all_results_pages) != total_pages or previous_key != key:
+                self._all_results_pages = [None] * total_pages
+            if 1 <= page_num <= total_pages:
+                self._all_results_pages[page_num - 1] = list(page_results)
+            self._all_results_cache = [r for page in self._all_results_pages if page for r in page]
+            self._all_results_loaded_pages = sum(1 for page in self._all_results_pages if page)
+            self._all_results_total_pages = max(0, total_pages)
+            self._all_results_loader_error = ""
+
+    def _start_search_prefetch(self, query: str, total_pages: int, sort_by: str, current_page: int) -> None:
+        self._ensure_search_cache_state()
+        if total_pages <= 1:
+            with self._search_cache_lock:
+                self._all_results_loading = False
+            return
+
+        key = self._search_cache_key()
+        with self._search_cache_lock:
+            if (
+                self._all_results_loading
+                and self._all_results_cache_key == key
+                and self._all_results_loader_thread is not None
+                and self._all_results_loader_thread.is_alive()
+            ):
+                return
+
+            self._all_results_loader_token += 1
+            token = self._all_results_loader_token
+            self._all_results_loading = True
+            self._all_results_loader_error = ""
+
+        def worker() -> None:
+            for page in range(1, total_pages + 1):
+                if page == current_page:
+                    continue
+                with self._search_cache_lock:
+                    if token != self._all_results_loader_token or self._all_results_cache_key != key:
+                        return
+                page_results, _page_total, err = ia_search_via_curl(query, rows=ROWS_PER_PAGE, page=page, sort=sort_by)
+                if err:
+                    with self._search_cache_lock:
+                        if token == self._all_results_loader_token and self._all_results_cache_key == key:
+                            self._all_results_loading = False
+                            self._all_results_loader_error = err
+                    return
+                with self._search_cache_lock:
+                    if token != self._all_results_loader_token or self._all_results_cache_key != key:
+                        return
+                    if len(self._all_results_pages) != total_pages:
+                        self._all_results_pages = [None] * total_pages
+                    self._all_results_pages[page - 1] = list(page_results)
+                    self._all_results_cache = [r for page_list in self._all_results_pages if page_list for r in page_list]
+                    self._all_results_loaded_pages = sum(1 for page_list in self._all_results_pages if page_list)
+            with self._search_cache_lock:
+                if token == self._all_results_loader_token and self._all_results_cache_key == key:
+                    self._all_results_cache = [r for page_list in self._all_results_pages if page_list for r in page_list]
+                    self._all_results_loaded_pages = sum(1 for page_list in self._all_results_pages if page_list)
+                    self._all_results_loading = False
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with self._search_cache_lock:
+            self._all_results_loader_thread = thread
+        thread.start()
+
+    def _ensure_all_search_results_loaded(self) -> None:
+        self._ensure_search_cache_state()
+        query = (getattr(self, "query_built", "") or getattr(self, "query_text", "")).strip()
+        if not query:
+            return
+
+        key = self._search_cache_key()
+        current_page = max(1, int(getattr(self, "page", 1) or 1))
+        with self._search_cache_lock:
+            cached_key = self._all_results_cache_key
+            loading = self._all_results_loading
+            loaded_pages = self._all_results_loaded_pages
+            total_pages = self._all_results_total_pages
+
+        if cached_key != key:
+            page_results = list(getattr(self, "results", []))
+            total = int(getattr(self, "total_results", 0) or len(page_results))
+            total_pages = max(1, (total + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+            self._prime_search_cache(key, current_page, page_results, total_pages)
+            self._start_search_prefetch(query, total_pages, getattr(self, "sort_by", ""), current_page)
+            return
+
+        if not loading and total_pages > loaded_pages:
+            self._start_search_prefetch(query, total_pages, getattr(self, "sort_by", ""), current_page)
+
+    def _load_all_search_results(self) -> List[SearchResult]:
+        self._ensure_search_cache_state()
+        with self._search_cache_lock:
+            if self._all_results_cache_key == self._search_cache_key() and self._all_results_cache:
+                return list(self._all_results_cache)
+        return list(getattr(self, "results", []) or [])
+
     def get_visible_results(self) -> List[SearchResult]:
         needle = self.result_filter.strip().lower()
+        results = getattr(self, "results", [])
         if not needle:
-            return list(self.results)
+            return list(results)
         terms = [t for t in needle.split() if t]
-        return [r for r in self.results if all(t in self.result_filter_blob(r) for t in terms)]
+        scope = self._load_all_search_results()
+        return [r for r in scope if all(t in self.result_filter_blob(r) for t in terms)]
 
     def selected_result(self) -> Optional[SearchResult]:
         visible = self.get_visible_results()
@@ -607,11 +1028,97 @@ class RetroWaveIA:
             self.sel_r = max(0, len(visible) - 1)
         return visible[self.sel_r]
 
+    def _find_result_location(self, identifier: str) -> Optional[Tuple[int, int]]:
+        self._ensure_search_cache_state()
+        ident = (identifier or "").strip()
+        if not ident:
+            return None
+        with self._search_cache_lock:
+            pages = list(getattr(self, "_all_results_pages", []) or [])
+        for page_idx, page_results in enumerate(pages):
+            if not page_results:
+                continue
+            for row_idx, r in enumerate(page_results):
+                if (r.identifier or "").strip() == ident:
+                    return page_idx + 1, row_idx
+        for row_idx, r in enumerate(getattr(self, "results", []) or []):
+            if (r.identifier or "").strip() == ident:
+                return max(1, int(getattr(self, "page", 1) or 1)), row_idx
+        return None
+
+    def _sync_page_to_result(self, item: SearchResult) -> None:
+        location = self._find_result_location(item.identifier)
+        if not location:
+            return
+        page_num, _row_idx = location
+        if not getattr(self, "result_filter", ""):
+            return
+        if page_num == getattr(self, "page", 1):
+            return
+        with self._search_cache_lock:
+            pages = list(getattr(self, "_all_results_pages", []) or [])
+            page_results = list(pages[page_num - 1]) if 1 <= page_num <= len(pages) and pages[page_num - 1] else []
+        if not page_results:
+            return
+        self.page = page_num
+        self.results = page_results
+
+    def set_error_status(self, msg: str, *, detail: str = "") -> None:
+        raw_status = str(msg or "Unknown error").strip()
+        raw_detail = str(detail or raw_status).strip()
+        self.status = compact_error_text(raw_status, max_chars=MAX_STATUS_ERROR_CHARS)
+        self.last_error_detail = compact_error_text(raw_detail, max_chars=MAX_DETAIL_ERROR_CHARS)
+        if raw_detail and raw_detail != self.last_error_detail:
+            log_line(f"TUI_ERROR_RAW: {raw_detail}")
+        log_line(f"TUI_ERROR: {self.last_error_detail}")
+
     def set_result_filter(self, value: str) -> None:
         self.result_filter = (value or "").strip()
         self.sel_r = 0
+        if self.result_filter:
+            self._ensure_all_search_results_loaded()
+        else:
+            self.cancel_result_prefetch()
         n = len(self.get_visible_results())
-        self.status = f"Local result filter: {self.result_filter or '(none)'} ({n} visible)"
+        progress = self.local_filter_progress_label()
+        suffix = f"; {progress}" if progress else ""
+        self.status = f"Local result filter: {self.result_filter or '(none)'} ({n} visible{suffix})"
+        self._save_session()
+
+    def clear_result_filter(self) -> None:
+        if not self.result_filter:
+            self.status = "Local result filter already clear."
+            return
+        self.result_filter = ""
+        self.sel_r = 0
+        self.cancel_result_prefetch()
+        self._save_session()
+        n = len(self.get_visible_results())
+        self.status = f"Local result filter cleared. ({n} visible)"
+
+    def edit_result_filter(self) -> None:
+        s = self.prompt("Local result filter (blank clears): ", self.result_filter)
+        if s is not None:
+            self.set_result_filter(s)
+
+    def local_filter_progress_label(self) -> str:
+        if not getattr(self, "result_filter", ""):
+            return ""
+        with self._search_cache_lock:
+            loading = bool(getattr(self, "_all_results_loading", False))
+            loaded_pages = int(getattr(self, "_all_results_loaded_pages", 0) or 0)
+            total_pages = int(getattr(self, "_all_results_total_pages", 0) or 0)
+            loaded_items = len(getattr(self, "_all_results_cache", []) or [])
+            loader_error = str(getattr(self, "_all_results_loader_error", "") or "")
+        if loader_error:
+            return f"scan paused: {loader_error}"
+        if loading and total_pages > 0:
+            return f"scanning {loaded_pages}/{total_pages} pages ({loaded_items} loaded)"
+        if total_pages > 0 and loaded_pages >= total_pages and loaded_items:
+            return f"scan complete ({loaded_items} loaded)"
+        if loaded_items:
+            return f"{loaded_items} loaded"
+        return ""
 
     def collection_choices_from_results(self, limit: int = 12) -> List[str]:
         counts: Dict[str, int] = {}
@@ -623,6 +1130,39 @@ class RetroWaveIA:
         ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0].lower()))
         return [f"{coll} ({count})" for coll, count in ordered[:limit]]
 
+    def results_state_chips(self) -> List[str]:
+        chips: List[str] = []
+        if bool(getattr(self, "_search_load_loading", False)):
+            chips.append("Searching...")
+        if self.query_text:
+            chips.append(f"Query: {self.query_text}")
+        if self.filter:
+            chips.append(f"Media: {self.filter}")
+        if self.title_only:
+            chips.append("Title only: On")
+        if self.result_filter:
+            chips.append(f"Local: {self.result_filter}")
+        if self.sort_by:
+            chips.append(f"Sort: {self._sort_label()}")
+        total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE) if self.total_results else 1
+        if self.total_results > 0:
+            chips.append(f"Page: {self.page}/{total_pages}")
+        with self._search_cache_lock:
+            if self._all_results_loading:
+                chips.append(self.local_filter_progress_label() or "Scanning local scope...")
+            elif self.result_filter and self._all_results_loaded_pages and self._all_results_total_pages and self._all_results_loaded_pages < self._all_results_total_pages:
+                chips.append(self.local_filter_progress_label())
+        return chips
+
+    def effective_search_total(self, page: int, results: List[SearchResult], reported_total: int) -> int:
+        page_num = max(1, int(page or 1))
+        visible_count = len(results or [])
+        reported = int(reported_total or 0)
+        if 0 < visible_count < ROWS_PER_PAGE:
+            terminal_total = ((page_num - 1) * ROWS_PER_PAGE) + visible_count
+            return min(reported, terminal_total) if reported > 0 else terminal_total
+        return reported or visible_count
+
     def _collection_from_choice(self, choice: str) -> str:
         return re.sub(r"\s+\(\d+\)\s*$", "", choice or "").strip()
 
@@ -630,23 +1170,77 @@ class RetroWaveIA:
         self.query_text = query_text
         self.query_built = built_query or ""
         self.show_welcome = False
-        self.do_search(reset_page=True, built_query=built_query)
+        self.start_search_async(reset_page=True, built_query=built_query)
+
+    def open_search_tools(self) -> None:
+        options = [
+            ("New search", "search"),
+            ("Combined IA + YouTube", "combined_search"),
+            ("YouTube search", "youtube_search"),
+            ("YouTube URL", "youtube_url"),
+            ("Search history", "history"),
+            ("Search presets", "search_preset"),
+            ("Field search", "field_search"),
+            ("Collection search", "collection_search"),
+            ("Within collection", "within_collection"),
+            ("Result collections", "collection_facets"),
+            ("Media filter", "filter"),
+            ("Sort order", "sort"),
+            ("Toggle title-only", "title"),
+            ("Local loaded-result filter", "result_filter"),
+        ]
+        pick = self.prompt_list("Search tools", [label for label, _action in options])
+        if not pick:
+            self.status = "Search tools canceled."
+            return
+        for label, action in options:
+            if label == pick:
+                self.activate_menu_action(action)
+                return
+
+    def choose_search_source(self) -> None:
+        options = [
+            ("IA search", "search"),
+            ("Combined IA + YouTube", "combined_search"),
+            ("YouTube search", "youtube_search"),
+            ("YouTube direct URL", "youtube_url"),
+        ]
+        pick = self.prompt_list("Source", [label for label, _action in options])
+        if not pick:
+            self.status = "Source unchanged."
+            return
+        for label, action in options:
+            if label == pick:
+                self.activate_menu_action(action)
+                return
 
     def jump_to_result_number(self, target: int) -> None:
         if target < 1:
             self.status = "Result number must be >= 1."
             return
-        if self.total_results > 0:
-            total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
-            target_page = ((target - 1) // ROWS_PER_PAGE) + 1
-            if target_page > total_pages:
-                self.status = f"Result must be 1-{self.total_results}."
+        visible = self.get_visible_results()
+        if self.result_filter:
+            if target > len(visible):
+                self.status = f"Result must be 1-{len(visible)}."
                 return
-            self.page = target_page
-            self.do_search(reset_page=False)
-            self.sel_r = min(max(0, (target - 1) % ROWS_PER_PAGE), max(0, len(self.get_visible_results()) - 1))
+            self.sel_r = target - 1
             self.focus = "LIST"
             self.status = f"Selected result {target}."
+            return
+        reported_total = int(getattr(self, "total_results", 0) or 0)
+        effective_total = self.effective_search_total(getattr(self, "page", 1), self.results, reported_total)
+        if reported_total > 0 and effective_total > 0:
+            self.total_results = effective_total
+            total_pages = max(1, (effective_total + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+            target_page = ((target - 1) // ROWS_PER_PAGE) + 1
+            if target_page > total_pages:
+                self.status = f"Result must be 1-{effective_total}."
+                return
+            self.page = target_page
+            self.sel_r = min(max(0, (target - 1) % ROWS_PER_PAGE), max(0, len(self.get_visible_results()) - 1))
+            self.focus = "LIST"
+            self.start_search_async(reset_page=False)
+            self.status = f"Loading result {target}..."
             return
         visible = self.get_visible_results()
         if target > len(visible):
@@ -659,31 +1253,50 @@ class RetroWaveIA:
         theme = getattr(self, "theme_name", "Retro")
         if self.mode in ("RESULTS", "SEARCH"):
             selected = self.selected_result()
-            fav_label = (
-                "Unfav" if (selected and self.is_fav_item(selected.identifier))
-                else "Fav"
-            )
+            if self.is_youtube_result(selected) or str(getattr(self, "search_source", "ia")).startswith("youtube"):
+                return [
+                    ("Actions", "actions"),
+                    ("IA Search", "search"),
+                    ("YT Search", "youtube_search"),
+                    ("Source", "source_switch"),
+                    ("YT URL", "youtube_url"),
+                    ("Open", "open"),
+                    ("Favs", "favs"),
+                    ("Help", "help"),
+                    ("Quit", "quit"),
+                ]
+            fav_label = "Fav Item"
+            if selected and self.is_fav_item(selected.identifier):
+                fav_label = "Unfav Item"
             return [
                 ("Actions", "actions"),
-                ("Search", "search"),
-                ("Collections", "collection_search"),
-                ("In Collection", "within_collection"),
-                (f"Filter: {self.filter}", "filter"),
-                (f"Local: {self.result_filter or 'Off'}", "result_filter"),
+                ("IA Search", "search"),
+                ("YT Search", "youtube_search"),
+                ("Source", "source_switch"),
+                (f"Local: {getattr(self, 'result_filter', '') or 'Off'}", "result_filter"),
+                ("Clear Local", "clear_result_filter"),
+                ("Tools", "search_tools"),
+                (f"Filter: {getattr(self, 'filter', 'any')}", "filter"),
                 (f"Sort: {self._sort_label()}", "sort"),
-                (f"Title only: {'On' if self.title_only else 'Off'}", "title"),
-                (f"License gate: {'On' if self.enforce_license_gate else 'Off'}", "license_gate"),
                 ("Prev", "prev_page"),
                 ("Next", "next_page"),
                 ("Open", "open"),
-                ("History", "history"),
                 (fav_label, "fav_item"),
-                (f"Theme: {theme}", "theme"),
                 ("Favs", "favs"),
                 ("Help", "help"),
                 ("Quit", "quit"),
             ]
         if self.mode == "FILES":
+            loading_files = bool(getattr(self, "_file_load_loading", False))
+            if loading_files:
+                return [
+                    ("Actions", "actions"),
+                    ("Back", "back"),
+                    ("Opening...", "noop"),
+                    ("Favs", "favs"),
+                    ("Help", "help"),
+                    ("Quit", "quit"),
+                ]
             item = self.selected_result()
             visible = self.get_visible_files()
             sel = visible[self.sel_f] if (visible and 0 <= self.sel_f < len(visible)) else None
@@ -698,7 +1311,7 @@ class RetroWaveIA:
                 ("Download", "download"),
                 ("Folder", "folder"),
                 ("Item", "item"),
-                (f"Video only: {'On' if self.video_only else 'Off'}", "video_only"),
+                (f"Video: {'On' if self.video_only else 'Off'}", "video_only"),
                 (f"Filter: {self.file_kw or ('Video' if self.video_only else 'All')}", "keyword"),
                 (f"Save to: {self.last_bucket}", "bucket"),
                 (fav_file_label, "fav_file"),
@@ -748,15 +1361,15 @@ class RetroWaveIA:
 
         hidden_right = 0
         for i, (label, _action) in enumerate(items[start:], start=start):
-            pill = f" {label} "
+            is_sel = (self.focus == "MENU" and i == self.menu_idx)
+            pill = f" > {label} < " if is_sel else f" {label} "
             if x + len(pill) >= w - 1:
                 hidden_right = len(items) - i
                 break
 
-            is_sel = (self.focus == "MENU" and i == self.menu_idx)
             attr = curses.color_pair(6) | curses.A_DIM
             if is_sel:
-                attr = curses.color_pair(3) | curses.A_BOLD
+                attr = curses.color_pair(1) | curses.A_BOLD
 
             self.safe_addstr(y, x, pill, attr)
             x += len(pill)
@@ -771,7 +1384,7 @@ class RetroWaveIA:
 
         if self.focus == "MENU" and y + 1 < self.stdscr.getmaxyx()[0] - 1:
             label, _action = items[selected]
-            parts = [f"MENU: {label}", "Enter run", "Left/Right choose", "Tab list", "a all actions"]
+            parts = [f"MENU FOCUS: > {label} <", "Enter run", "Left/Right choose", "Tab list"]
             if start > 0 or hidden_right:
                 parts.append(f"{start + hidden_right} hidden")
             line = "  |  ".join(parts)
@@ -782,14 +1395,18 @@ class RetroWaveIA:
 
     def command_footer(self) -> str:
         if self.mode in ("RESULTS", "SEARCH"):
-            return "Search /   Open Enter/o   Mark Fav   Download -   Details r   Actions a   Theme T"
+            if getattr(self, "show_welcome", False) and not getattr(self, "results", []):
+                return "IA / or Search   YT menu   Source menu   Help ?   Quit q"
+            if str(getattr(self, "search_source", "ia")).startswith("youtube"):
+                return "Open Enter/o   IA /   YT menu   Source menu   Help ?   Quit q"
+            return "Open Enter/o   IA /   Local l/f   Page [/]   Actions a   Help ?   Quit q"
         if self.mode == "FILES":
-            return "Search /   Open Enter   Mark Space/A/I/U   Download d   Details r   Actions a   Theme T"
+            return "Preview Enter/p   Mark Space/m   Download d   Filter f/F   Help ?   Quit q"
         if self.mode == "PREVIEW_DL":
-            return "Search /   Open -   Mark -   Download Enter   Details ?   Actions a   Theme T"
+            return "Confirm Enter   Cancel Esc/Backspace   Help ?   Quit q"
         if self.mode == "FAVS":
-            return "Search /   Open Enter/o   Mark Remove   Download -   Details ?   Actions a   Theme T"
-        return "Search /   Open Enter   Mark -   Download -   Details ?   Actions a   Theme T"
+            return "Open Enter/o   Tab switch   Remove Del   Help ?   Quit q"
+        return "j/k navigate   Enter select   a actions   ? help   q quit"
 
     def hint_bar(self, include_overlay_state: bool = True) -> str:
         if include_overlay_state and self.help_overlay:
@@ -797,20 +1414,33 @@ class RetroWaveIA:
         if self.mode == "DOWNLOADING":
             return "c cancel  |  q quit after cancel  |  progress updates live"
         if self.mode in ("RESULTS", "SEARCH"):
-            return "Enter/o open  |  / search  |  l local filter  |  a actions  |  n/p page  |  ? help  |  q quit"
+            return "Enter/o open  |  / search  |  l/f local filter  |  L/F clear local  |  a actions  |  n/p page  |  ? help  |  q quit"
         if self.mode == "FILES":
-            return "Space mark  |  A all  |  I invert  |  U clear  |  d marked/selected  |  f filter  |  ? help"
+            return "Enter/p preview  |  o folder  |  Space mark+next  |  m range  |  d marked  |  D all visible  |  f filter  |  ? help"
         if self.mode == "FAVS":
-            return "Enter/o open  |  a actions  |  Tab menu/list  |  Backspace back  |  ? help  |  q quit"
+            return "Enter/o open  |  Tab tab  |  Backspace back  |  ? help  |  q quit"
         if self.mode == "PREVIEW_DL":
-            return "Enter confirm  |  Backspace/Esc cancel  |  ? help  |  q quit"
+            return "Enter confirm  |  Esc/Backspace cancel  |  ? help  |  q quit"
         return "j/k navigate  |  Enter select  |  a actions  |  Tab menu/list  |  Backspace back  |  ? help  |  q quit"
+
+    def footer_status_text(self) -> str:
+        status = str(getattr(self, "status", "") or "")
+        if (
+            getattr(self, "mode", "") in ("RESULTS", "SEARCH")
+            and getattr(self, "result_filter", "")
+            and status.startswith("Local result filter:")
+        ):
+            visible_count = len(self.get_visible_results())
+            progress = self.local_filter_progress_label()
+            suffix = f"; {progress}" if progress else ""
+            return f"Local result filter: {self.result_filter} ({visible_count} visible{suffix})"
+        return status
 
     def draw_footer(self, h: int, w: int) -> None:
         if h < 4 or w < 2:
             return
 
-        status = (self.status or "")[: max(0, w - 1)]
+        status = self.footer_status_text()[: max(0, w - 1)]
         self.safe_addstr(h - 3, 0, status.ljust(max(0, w - 1)), curses.color_pair(6))
         keybar = self.command_footer()
         self.safe_addstr(h - 2, 0, keybar[: max(0, w - 1)].ljust(max(0, w - 1)), curses.color_pair(2) | curses.A_BOLD)
@@ -826,67 +1456,83 @@ class RetroWaveIA:
         pos = len(buf)
         hist_idx = -1
         saved_buf = ""
-        curses.curs_set(1)
-        while True:
-            text = "".join(buf)
-            bar = f"{label}{text}"
-            hint = ""
-            if history:
-                hint = "  (Up/Down for history)"
-            self.safe_addstr(y, 0, " " * max(0, w - 1), curses.color_pair(8))
-            self.safe_addstr(y, 0, (bar + hint)[: max(0, w - 1)], curses.color_pair(8))
+        self.stdscr.nodelay(False)
+        try:
             try:
-                self.stdscr.move(y, min(w - 2, len(label) + pos))
-            except curses.error:
+                self.stdscr.timeout(-1)
+            except Exception:
                 pass
-            self.stdscr.refresh()
+            try:
+                curses.curs_set(1)
+            except Exception:
+                pass
+            while True:
+                text = "".join(buf)
+                bar = f"{label}{text}"
+                hint = ""
+                if history:
+                    hint = "  (Up/Down for history)"
+                self.safe_addstr(y, 0, " " * max(0, w - 1), curses.color_pair(8))
+                self.safe_addstr(y, 0, (bar + hint)[: max(0, w - 1)], curses.color_pair(8))
+                try:
+                    self.stdscr.move(y, min(w - 2, len(label) + pos))
+                except curses.error:
+                    pass
+                self.stdscr.refresh()
 
-            ch = self.stdscr.getch()
-            if ch in (10, 13):
+                ch = self.stdscr.getch()
+                if is_enter_key(ch):
+                    return "".join(buf).strip()
+                if ch in (27,):
+                    return None
+                if ch == curses.KEY_UP and history:
+                    if hist_idx == -1:
+                        saved_buf = "".join(buf)
+                    if hist_idx < len(history) - 1:
+                        hist_idx += 1
+                        buf = list(history[hist_idx])
+                        pos = len(buf)
+                elif ch == curses.KEY_DOWN and history:
+                    if hist_idx > 0:
+                        hist_idx -= 1
+                        buf = list(history[hist_idx])
+                        pos = len(buf)
+                    elif hist_idx == 0:
+                        hist_idx = -1
+                        buf = list(saved_buf)
+                        pos = len(buf)
+                elif ch == curses.KEY_LEFT:
+                    pos = max(0, pos - 1)
+                elif ch == curses.KEY_RIGHT:
+                    pos = min(len(buf), pos + 1)
+                elif ch == curses.KEY_HOME or ch == 1:   # Ctrl+A
+                    pos = 0
+                elif ch == curses.KEY_END or ch == 5:    # Ctrl+E
+                    pos = len(buf)
+                elif ch == 21:                           # Ctrl+U — clear whole line
+                    buf = []
+                    pos = 0
+                elif ch == 11:                           # Ctrl+K — clear to end
+                    buf = buf[:pos]
+                elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                    if pos > 0:
+                        buf.pop(pos - 1)
+                        pos -= 1
+                elif ch == curses.KEY_DC:               # Delete forward
+                    if pos < len(buf):
+                        buf.pop(pos)
+                elif 32 <= ch <= 126:
+                    buf.insert(pos, chr(ch))
+                    pos += 1
+        finally:
+            try:
+                self.stdscr.timeout(100)
+            except Exception:
+                pass
+            try:
                 curses.curs_set(0)
-                return "".join(buf).strip()
-            if ch in (27,):
-                curses.curs_set(0)
-                return None
-            if ch == curses.KEY_UP and history:
-                if hist_idx == -1:
-                    saved_buf = "".join(buf)
-                if hist_idx < len(history) - 1:
-                    hist_idx += 1
-                    buf = list(history[hist_idx])
-                    pos = len(buf)
-            elif ch == curses.KEY_DOWN and history:
-                if hist_idx > 0:
-                    hist_idx -= 1
-                    buf = list(history[hist_idx])
-                    pos = len(buf)
-                elif hist_idx == 0:
-                    hist_idx = -1
-                    buf = list(saved_buf)
-                    pos = len(buf)
-            elif ch == curses.KEY_LEFT:
-                pos = max(0, pos - 1)
-            elif ch == curses.KEY_RIGHT:
-                pos = min(len(buf), pos + 1)
-            elif ch == curses.KEY_HOME or ch == 1:   # Ctrl+A
-                pos = 0
-            elif ch == curses.KEY_END or ch == 5:    # Ctrl+E
-                pos = len(buf)
-            elif ch == 21:                           # Ctrl+U — clear whole line
-                buf = []
-                pos = 0
-            elif ch == 11:                           # Ctrl+K — clear to end
-                buf = buf[:pos]
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                if pos > 0:
-                    buf.pop(pos - 1)
-                    pos -= 1
-            elif ch == curses.KEY_DC:               # Delete forward
-                if pos < len(buf):
-                    buf.pop(pos)
-            elif 32 <= ch <= 126:
-                buf.insert(pos, chr(ch))
-                pos += 1
+            except Exception:
+                pass
 
     def prompt_list(self, title: str, options: List[str], default_idx: int = 0) -> Optional[str]:
         if not options:
@@ -900,73 +1546,137 @@ class RetroWaveIA:
 
         idx = max(0, min(default_idx, len(options) - 1))
         start = 0
-        query = ""
+        query_buf: List[str] = []
+        query_pos = 0
 
         self.stdscr.nodelay(False)
-        while True:
-            visible_options = self.filter_options(options, query)
-            if not visible_options:
-                visible_options = options
-                query = ""
-            if idx >= len(visible_options):
-                idx = max(0, len(visible_options) - 1)
+        try:
+            try:
+                self.stdscr.timeout(-1)
+            except Exception:
+                pass
+            try:
+                curses.curs_set(1)
+            except Exception:
+                pass
+            while True:
+                query = "".join(query_buf)
+                visible_options = self.filter_options(options, query)
+                if idx >= len(visible_options):
+                    idx = max(0, len(visible_options) - 1)
+                if not visible_options:
+                    idx = 0
 
-            for y in range(top, top + box_h):
-                self.safe_addstr(y, left, " " * max(0, box_w), curses.color_pair(6))
+                for y in range(top, top + box_h):
+                    self.safe_addstr(y, left, " " * max(0, box_w), curses.color_pair(6))
 
-            self.safe_addstr(top, left, "┌" + "─" * (box_w - 2) + "┐", curses.color_pair(2))
-            self.safe_addstr(top + box_h - 1, left, "└" + "─" * (box_w - 2) + "┘", curses.color_pair(2))
-            for y in range(top + 1, top + box_h - 1):
-                self.safe_addstr(y, left, "│", curses.color_pair(2))
-                self.safe_addstr(y, left + box_w - 1, "│", curses.color_pair(2))
+                self.safe_addstr(top, left, "┌" + "─" * (box_w - 2) + "┐", curses.color_pair(2))
+                self.safe_addstr(top + box_h - 1, left, "└" + "─" * (box_w - 2) + "┘", curses.color_pair(2))
+                for y in range(top + 1, top + box_h - 1):
+                    self.safe_addstr(y, left, "│", curses.color_pair(2))
+                    self.safe_addstr(y, left + box_w - 1, "│", curses.color_pair(2))
 
-            t = f" {title} "
-            self.safe_addstr(top, left + 2, t[: max(0, box_w - 4)], curses.color_pair(1) | curses.A_BOLD)
-            if query:
-                q = f" find: {query} "
+                t = f" {title} "
+                self.safe_addstr(top, left + 2, t[: max(0, box_w - 4)], curses.color_pair(1) | curses.A_BOLD)
+                q = f" find: {query}"
                 self.safe_addstr(top + 1, left + 2, q[: max(0, box_w - 4)], curses.color_pair(3))
 
-            body_top = top + 2
-            body_bottom = top + box_h - 2
-            max_rows = max(1, body_bottom - body_top)
+                body_top = top + 2
+                body_bottom = top + box_h - 2
+                max_rows = max(1, body_bottom - body_top)
 
-            if idx < start:
-                start = idx
-            if idx >= start + max_rows:
-                start = idx - max_rows + 1
+                if visible_options and idx < start:
+                    start = idx
+                if visible_options and idx >= start + max_rows:
+                    start = idx - max_rows + 1
+                if not visible_options:
+                    start = 0
 
-            for i in range(start, min(len(visible_options), start + max_rows)):
-                row_y = body_top + (i - start)
-                s = visible_options[i]
-                line = f" {i+1:02d}. {s}"
-                line = line[: max(0, box_w - 2)].ljust(max(0, box_w - 2))
-                if i == idx:
-                    self.safe_addstr(row_y, left + 1, line, curses.color_pair(9) | curses.A_BOLD)
+                if visible_options:
+                    for i in range(start, min(len(visible_options), start + max_rows)):
+                        row_y = body_top + (i - start)
+                        s = visible_options[i]
+                        line = f" {i+1:02d}. {s}"
+                        line = line[: max(0, box_w - 2)].ljust(max(0, box_w - 2))
+                        if i == idx:
+                            self.safe_addstr(row_y, left + 1, line, curses.color_pair(9) | curses.A_BOLD)
+                        else:
+                            self.safe_addstr(row_y, left + 1, line, curses.color_pair(6))
                 else:
-                    self.safe_addstr(row_y, left + 1, line, curses.color_pair(6))
+                    empty = " No matches"
+                    self.safe_addstr(body_top, left + 1, empty[: max(0, box_w - 2)].ljust(max(0, box_w - 2)), curses.color_pair(6))
 
-            hint = "Type to filter  Up/Down choose  Enter select  Backspace edit  Esc cancel"
-            self.safe_addstr(top + box_h - 1, left + 2, hint[: max(0, box_w - 4)], curses.color_pair(3))
+                hint = "Type to filter  Up/Down choose  Enter select  Backspace edit  Ctrl+U clear  Esc cancel"
+                self.safe_addstr(top + box_h - 1, left + 2, hint[: max(0, box_w - 4)], curses.color_pair(3))
 
-            self.stdscr.refresh()
-            ch = self.stdscr.getch()
+                try:
+                    self.stdscr.move(top + 1, min(left + box_w - 2, left + 2 + len(" find: ") + query_pos))
+                except curses.error:
+                    pass
+                self.stdscr.refresh()
+                ch = self.stdscr.getch()
 
-            if ch in (27,):
-                return None
-            if ch in (10, 13, curses.KEY_ENTER):
-                return visible_options[idx]
-            if ch == curses.KEY_UP:
-                idx = max(0, idx - 1)
-            if ch == curses.KEY_DOWN:
-                idx = min(len(visible_options) - 1, idx + 1)
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                query = query[:-1]
-                idx = 0
-                start = 0
-            elif 32 <= ch <= 126:
-                query += chr(ch)
-                idx = 0
-                start = 0
+                if ch in (27,):
+                    return None
+                if is_enter_key(ch):
+                    if not visible_options:
+                        continue
+                    return visible_options[idx]
+                if ch == curses.KEY_UP and visible_options:
+                    idx = max(0, idx - 1)
+                elif ch == curses.KEY_DOWN and visible_options:
+                    idx = min(len(visible_options) - 1, idx + 1)
+                elif ch == curses.KEY_LEFT:
+                    query_pos = max(0, query_pos - 1)
+                elif ch == curses.KEY_RIGHT:
+                    query_pos = min(len(query_buf), query_pos + 1)
+                elif ch == curses.KEY_HOME or ch == 1:   # Ctrl+A
+                    query_pos = 0
+                elif ch == curses.KEY_END or ch == 5:    # Ctrl+E
+                    query_pos = len(query_buf)
+                elif ch == 21:                           # Ctrl+U — clear whole line
+                    query_buf = []
+                    query_pos = 0
+                    idx = 0
+                    start = 0
+                elif ch == 23:                           # Ctrl+W — delete previous word
+                    while query_pos > 0 and query_buf[query_pos - 1].isspace():
+                        query_buf.pop(query_pos - 1)
+                        query_pos -= 1
+                    while query_pos > 0 and not query_buf[query_pos - 1].isspace():
+                        query_buf.pop(query_pos - 1)
+                        query_pos -= 1
+                    idx = 0
+                    start = 0
+                elif ch == 11:                           # Ctrl+K — clear to end
+                    del query_buf[query_pos:]
+                    idx = 0
+                    start = 0
+                elif is_backspace_key(ch):
+                    if query_pos > 0:
+                        query_buf.pop(query_pos - 1)
+                        query_pos -= 1
+                        idx = 0
+                        start = 0
+                elif ch == curses.KEY_DC:               # Delete forward
+                    if query_pos < len(query_buf):
+                        query_buf.pop(query_pos)
+                        idx = 0
+                        start = 0
+                elif 32 <= ch <= 126:
+                    query_buf.insert(query_pos, chr(ch))
+                    query_pos += 1
+                    idx = 0
+                    start = 0
+        finally:
+            try:
+                self.stdscr.timeout(100)
+            except Exception:
+                pass
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
 
     def filter_options(self, options: List[str], query: str) -> List[str]:
         needle = (query or "").strip().lower()
@@ -1014,59 +1724,94 @@ class RetroWaveIA:
                 seen.add(s)
         return deduped[:12]
 
+    def results_action_specs(self) -> List[Tuple[str, str, str]]:
+        try:
+            selected = self.selected_result()
+        except AttributeError:
+            selected = None
+        if self.is_youtube_result(selected) or str(getattr(self, "search_source", "ia")).startswith("youtube"):
+            return [
+                ("Open / selected YouTube video", "open", "Enter/o"),
+                ("Open / result details", "details", "r"),
+                ("Search / new IA query (/ find archive)", "search", "/ or s"),
+                ("Search / combined IA + YouTube", "combined_search", None),
+                ("Search / YouTube via yt-dlp", "youtube_search", None),
+                ("Search / source chooser", "source_switch", None),
+                ("Search / YouTube direct URL", "youtube_url", None),
+                ("App / favorites (saved items files folders)", "favs", None),
+                ("App / theme (retro minimal high contrast)", "theme", "T"),
+                ("App / help (? shortcuts)", "help", "?"),
+                ("App / quit (exit)", "quit", "q"),
+            ]
+        return [
+            ("Open / selected result (open enter item files)", "open", "Enter/o"),
+            ("Open / result details (metadata rights description)", "details", "r"),
+            ("Search / new query (/ find archive)", "search", "/ or s"),
+            ("Search / combined IA + YouTube", "combined_search", None),
+            ("Search / YouTube via yt-dlp", "youtube_search", None),
+            ("Search / source chooser", "source_switch", None),
+            ("Search / YouTube direct URL", "youtube_url", None),
+            ("Search / tools (history fields collections local filter)", "search_tools", "a"),
+            ("Local / clear filter", "clear_result_filter", "L/F"),
+            ("Search / collections (mediatype collection)", "collection_search", None),
+            ("Search / fields (title creator subject date collection)", "field_search", None),
+            ("Search / inside collection (collection identifier)", "within_collection", None),
+            ("Search / result collections (facet narrow)", "collection_facets", None),
+            ("Filter / media type (movies audio texts software any)", "filter", None),
+            ("Filter / local result refine (loaded results)", "result_filter", "l/f"),
+            ("Filter / title-only mode (title exact)", "title", None),
+            ("Filter / license gate (rights license block)", "license_gate", None),
+            ("Sort / result order (date downloads title relevance)", "sort", None),
+            ("App / audit summary (library health counts)", "audit", "y"),
+            ("App / favorite selected item", "fav_item", None),
+            ("Page / previous (prev older [)", "prev_page", "p/["),
+            ("Page / next (next more ])", "next_page", "n/]"),
+            ("App / favorites (saved items files folders)", "favs", None),
+            ("App / theme (retro minimal high contrast)", "theme", "T"),
+            ("App / help (? shortcuts)", "help", "?"),
+            ("App / quit (exit)", "quit", "q"),
+        ]
+
+    def files_action_specs(self) -> List[Tuple[str, str, Optional[str]]]:
+        return [
+            ("Open / preview selected file", "preview", "Enter/p"),
+            ("Select / toggle file mark", "toggle_file_mark", "Space"),
+            ("Select / mark file range", "mark_file_range", "m"),
+            ("Select / mark all visible files", "mark_all_visible", "A"),
+            ("Select / invert visible marks", "invert_visible_marks", "I"),
+            ("Select / clear marked files", "clear_file_marks", "U"),
+            ("Download / marked files", "download", "d"),
+            ("Download / retry failed files retry failed", "retry_failed", "R"),
+            ("Download / folder prefix folder", "folder", "o"),
+            ("Download / all visible files all", "item", "D"),
+            ("Filter / file filter menu", "keyword", "f/F"),
+            ("Filter / video only", "video_only", "v"),
+            ("Download / save bucket folder", "bucket", None),
+            ("App / audit summary (library health counts)", "audit", "y"),
+            ("Filter / rights license", "license_gate", None),
+            ("Alias / movie video", "video_only", "v"),
+            ("Alias / audio keyword filter", "keyword", "f/F"),
+            ("Alias / all", "item", None),
+            ("Alias / clear", "clear_file_marks", "U"),
+            ("Alias / queue", "download", None),
+            ("App / theme retro minimal high contrast", "theme", "T"),
+            ("App / favorites", "favs", None),
+            ("App / back", "back", "Backspace"),
+            ("App / help", "help", "?"),
+            ("App / quit", "quit", "q"),
+        ]
+
     def action_palette_options(self) -> List[Tuple[str, str]]:
         if self.mode in ("RESULTS", "SEARCH"):
-            return [
-                ("Open / selected result (open enter item files)", "open"),
-                ("Open / result details (metadata rights description)", "details"),
-                ("Search / new query (/ find archive)", "search"),
-                ("Search / collections (mediatype collection)", "collection_search"),
-                ("Search / fields (title creator subject date collection)", "field_search"),
-                ("Search / inside collection (collection identifier)", "within_collection"),
-                ("Search / result collections (facet narrow)", "collection_facets"),
-                ("Filter / media type (movies audio texts software any)", "filter"),
-                ("Filter / local result page (local refine narrow)", "result_filter"),
-                ("Filter / title-only mode (title exact)", "title"),
-                ("Filter / license gate (rights license block)", "license_gate"),
-                ("Sort / result order (date downloads title relevance)", "sort"),
-                ("Page / previous (prev older [)", "prev_page"),
-                ("Page / next (next more ])", "next_page"),
-                ("App / favorites (saved items files folders)", "favs"),
-                ("App / theme (retro minimal high contrast)", "theme"),
-                ("App / help (? shortcuts)", "help"),
-                ("App / quit (exit)", "quit"),
-            ]
+            return [(label, action) for label, action, _hint in self.results_action_specs()]
         if self.mode == "FILES":
-            return [
-                ("Open / preview selected file", "preview"),
-                ("Select / toggle file mark", "toggle_file_mark"),
-                ("Select / mark all visible files", "mark_all_visible"),
-                ("Select / invert visible marks", "invert_visible_marks"),
-                ("Select / clear marked files", "clear_file_marks"),
-                ("Download / marked files", "download"),
-                ("Download / retry failed files retry failed", "retry_failed"),
-                ("Download / folder prefix folder", "folder"),
-                ("Download / all visible files all", "item"),
-                ("Filter / file filter menu", "keyword"),
-                ("Filter / video only", "video_only"),
-                ("Download / save bucket folder", "bucket"),
-                ("Filter / rights license", "license_gate"),
-                ("Alias / movie video", "video_only"),
-                ("Alias / audio keyword filter", "keyword"),
-                ("Alias / all", "item"),
-                ("Alias / clear", "clear_file_marks"),
-                ("Alias / queue", "download"),
-                ("App / theme retro minimal high contrast", "theme"),
-                ("App / favorites", "favs"),
-                ("App / back", "back"),
-                ("App / help", "help"),
-                ("App / quit", "quit"),
-            ]
+            return [(label, action) for label, action, _hint in self.files_action_specs()]
         if self.mode == "FAVS":
             return [
                 ("Open / selected favorite", "primary"),
                 ("Filter / favorites tab", "tab"),
                 ("App / remove favorite", "remove"),
+                ("App / audit summary (library health counts)", "audit"),
                 ("App / theme retro minimal high contrast", "theme"),
                 ("App / back", "back"),
                 ("App / help", "help"),
@@ -1120,6 +1865,13 @@ class RetroWaveIA:
             self.status = f"Filter unchanged: {self.filter}"
             return False
         self.filter = pick
+        self.query_text = replace_mediatype_filter(getattr(self, "query_text", ""), self.filter)
+        built_query = getattr(self, "query_built", "")
+        if built_query:
+            rewritten = replace_mediatype_filter(built_query, self.filter)
+            self.query_built = rewritten if rewritten != built_query else ""
+        else:
+            self.query_built = ""
         self.status = f"Filter set to: {self.filter}"
         return True
 
@@ -1151,6 +1903,8 @@ class RetroWaveIA:
         self.search_history = self.search_history[:MAX_HISTORY]
 
     def do_search(self, reset_page: bool = True, built_query: Optional[str] = None) -> None:
+        self.cancel_file_load()
+        self.search_source = "ia"
         if reset_page:
             self.page = 1
         attempts = [("custom", built_query)] if built_query is not None else build_query_attempts(self.query_text, self.filter, self.title_only)
@@ -1160,13 +1914,18 @@ class RetroWaveIA:
             self.status = "Select [Search] in the menu to search."
             return
 
+        previous_query_text = getattr(self, "last_search_text", "")
+        preserve_local_filter = built_query is None and bool(previous_query_text) and previous_query_text == self.query_text
+        self.last_search_text = self.query_text
         self._add_to_history(self.query_text)
         self._save_session()
         self.status = "Searching..."
         self.render()
 
+        self.last_search_attempts = list(attempts)
         used_label = ""
         last_err = ""
+        previous_cache_key = self._search_cache_key()
         self.results = []
         self.total_results = 0
         for label, query in attempts:
@@ -1183,10 +1942,20 @@ class RetroWaveIA:
             self.status = last_err
             return
 
+        self.total_results = self.effective_search_total(self.page, self.results, self.total_results)
+        current_key = self._search_cache_key()
+        if current_key != previous_cache_key:
+            self._reset_search_cache()
+        total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE) if self.total_results else 1
+        self._prime_search_cache(current_key, self.page, self.results, total_pages)
+
         self.sel_r = 0
-        self.result_filter = ""
+        if not preserve_local_filter:
+            self.result_filter = ""
         self.mode = "RESULTS"
         self.focus = "LIST"
+        self.last_search_text = self.query_text
+        self.last_search_used_label = used_label or ""
         search_hint = "" if used_label in ("", "title", "custom", "advanced") else f" ({used_label} match)"
         if self.total_results > 0:
             total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
@@ -1194,23 +1963,384 @@ class RetroWaveIA:
         else:
             self.status = f"Page {self.page} — {len(self.results)} results{search_hint}. Arrows to select, Enter to open."
 
+    def start_search_async(self, reset_page: bool = True, built_query: Optional[str] = None) -> None:
+        self._ensure_search_load_state()
+        self.cancel_file_load()
+        self.search_source = "ia"
+        if reset_page:
+            self.page = 1
+        attempts = [("custom", built_query)] if built_query is not None else build_query_attempts(self.query_text, self.filter, self.title_only)
+        attempts = [(label, query) for label, query in attempts if query]
+        if not attempts:
+            self.query_built = ""
+            self.status = "Select [Search] in the menu to search."
+            return
+
+        previous_query_text = getattr(self, "last_search_text", "")
+        preserve_local_filter = built_query is None and bool(previous_query_text) and previous_query_text == self.query_text
+        self.last_search_text = self.query_text
+        self.query_built = attempts[0][1]
+        self._add_to_history(self.query_text)
+        self._save_session()
+        self.show_welcome = False
+        self.status = "Searching... press Esc to cancel waiting."
+        self.last_search_attempts = list(attempts)
+        previous_cache_key = self._search_cache_key()
+
+        with self._search_load_lock:
+            self._search_load_token += 1
+            token = self._search_load_token
+            self._search_load_loading = True
+            self._search_load_result = {
+                "pending": True,
+                "source": "ia",
+                "previous_cache_key": previous_cache_key,
+                "preserve_local_filter": preserve_local_filter,
+                "page": self.page,
+            }
+
+        page = self.page
+        sort_by = self.sort_by
+
+        def worker() -> None:
+            used_label = ""
+            last_err = ""
+            final_results: List[SearchResult] = []
+            final_total = 0
+            final_query = ""
+            for label, query in attempts:
+                results, total, err = ia_search_via_curl(query, rows=ROWS_PER_PAGE, page=page, sort=sort_by)
+                if err:
+                    last_err = err
+                    break
+                used_label = label
+                final_query = query
+                final_results = results
+                final_total = total
+                if results or total:
+                    break
+            result: Dict[str, Any] = {
+                "source": "ia",
+                "err": last_err,
+                "results": final_results,
+                "total": final_total,
+                "query": final_query,
+                "used_label": used_label,
+                "attempts": list(attempts),
+                "previous_cache_key": previous_cache_key,
+                "preserve_local_filter": preserve_local_filter,
+                "page": page,
+            }
+            with self._search_load_lock:
+                if token == self._search_load_token:
+                    self._search_load_result = result
+                    self._search_load_loading = False
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with self._search_load_lock:
+            self._search_load_thread = thread
+        thread.start()
+
+    def start_combined_search_async(self, query_text: str) -> None:
+        self._ensure_search_load_state()
+        self.cancel_file_load()
+        terms = str(query_text or "").strip()
+        if not terms:
+            self.status = "Combined search canceled."
+            return
+
+        self.search_source = "all"
+        self.page = 1
+        self.query_text = terms
+        self.query_built = terms
+        self.show_welcome = False
+        self._add_to_history(terms)
+        self._save_session()
+        self.status = "Searching IA + YouTube... press Esc to cancel waiting."
+
+        attempts = [(label, query) for label, query in build_query_attempts(terms, self.filter, self.title_only) if query]
+        previous_cache_key = self._search_cache_key()
+
+        with self._search_load_lock:
+            self._search_load_token += 1
+            token = self._search_load_token
+            self._search_load_loading = True
+            self._search_load_result = {"pending": True, "source": "all"}
+
+        sort_by = self.sort_by
+
+        def worker() -> None:
+            ia_results: List[SearchResult] = []
+            ia_total = 0
+            ia_query = ""
+            ia_label = ""
+            ia_err = ""
+            for label, query in attempts:
+                results, total, err = ia_search_via_curl(query, rows=ROWS_PER_PAGE, page=1, sort=sort_by)
+                if err:
+                    ia_err = err
+                    break
+                ia_label = label
+                ia_query = query
+                ia_results = results
+                ia_total = total
+                if results or total:
+                    break
+
+            yt_results, _yt_total, yt_err = yt_search(terms, rows=10)
+            merged = list(ia_results) + list(yt_results)
+            err = ""
+            if not merged and ia_err and yt_err:
+                err = f"IA: {ia_err}; YouTube: {yt_err}"
+
+            result: Dict[str, Any] = {
+                "source": "all",
+                "err": err,
+                "results": merged,
+                "total": len(merged),
+                "query": ia_query or terms,
+                "used_label": "combined",
+                "attempts": list(attempts) + [("youtube", f"ytsearch10:{terms}")],
+                "previous_cache_key": previous_cache_key,
+                "page": 1,
+                "ia_count": len(ia_results),
+                "yt_count": len(yt_results),
+                "ia_total": ia_total,
+                "ia_err": ia_err,
+                "yt_err": yt_err,
+            }
+            with self._search_load_lock:
+                if token == self._search_load_token:
+                    self._search_load_result = result
+                    self._search_load_loading = False
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with self._search_load_lock:
+            self._search_load_thread = thread
+        thread.start()
+
+    def start_youtube_search_async(self, query_text: str) -> None:
+        self._ensure_search_load_state()
+        self.cancel_file_load()
+        self.search_source = "youtube"
+        self.page = 1
+        self.query_text = query_text
+        self.query_built = f"ytsearch10:{query_text}"
+        self.show_welcome = False
+        self._add_to_history(query_text)
+        self._save_session()
+        self.status = "Searching YouTube... press Esc to cancel waiting."
+
+        with self._search_load_lock:
+            self._search_load_token += 1
+            token = self._search_load_token
+            self._search_load_loading = True
+            self._search_load_result = {"pending": True, "source": "youtube"}
+
+        def worker() -> None:
+            results, total, err = yt_search(query_text, rows=10)
+            with self._search_load_lock:
+                if token == self._search_load_token:
+                    self._search_load_result = {
+                        "source": "youtube",
+                        "err": err,
+                        "results": results,
+                        "total": total,
+                        "query": self.query_built,
+                        "used_label": "youtube",
+                        "attempts": [("youtube", self.query_built)],
+                    }
+                    self._search_load_loading = False
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with self._search_load_lock:
+            self._search_load_thread = thread
+        thread.start()
+
+    def start_youtube_url_async(self, url: str) -> None:
+        self._ensure_search_load_state()
+        self.cancel_file_load()
+        self.search_source = "youtube_url"
+        self.page = 1
+        self.query_text = url
+        self.query_built = url
+        self.show_welcome = False
+        self._add_to_history(url)
+        self._save_session()
+        self.status = "Fetching YouTube metadata... press Esc to cancel waiting."
+
+        with self._search_load_lock:
+            self._search_load_token += 1
+            token = self._search_load_token
+            self._search_load_loading = True
+            self._search_load_result = {"pending": True, "source": "youtube_url"}
+
+        def worker() -> None:
+            result, err = yt_metadata_url(url)
+            results = [result] if result else []
+            with self._search_load_lock:
+                if token == self._search_load_token:
+                    self._search_load_result = {
+                        "source": "youtube_url",
+                        "err": err,
+                        "results": results,
+                        "total": len(results),
+                        "query": url,
+                        "used_label": "youtube-url",
+                        "attempts": [("youtube-url", url)],
+                    }
+                    self._search_load_loading = False
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with self._search_load_lock:
+            self._search_load_thread = thread
+        thread.start()
+
+    def finish_search_load_if_ready(self) -> bool:
+        self._ensure_search_load_state()
+        with self._search_load_lock:
+            if self._search_load_loading:
+                return False
+            result = self._search_load_result
+            self._search_load_result = None
+        if not result or result.get("pending"):
+            return False
+
+        err = str(result.get("err") or "")
+        source = str(result.get("source") or "ia")
+        if err:
+            label = "YouTube search" if source == "youtube" else "YouTube URL metadata" if source == "youtube_url" else "Search"
+            self.set_error_status(err, detail=f"{label} failed: {err}")
+            return True
+
+        self.results = list(result.get("results") or [])
+        self.total_results = int(result.get("total") or len(self.results))
+        self.total_results = self.effective_search_total(int(result.get("page") or self.page or 1), self.results, self.total_results)
+        self.query_built = str(result.get("query") or self.query_built)
+        self.last_search_attempts = list(result.get("attempts") or [])
+        self.last_search_used_label = str(result.get("used_label") or "")
+        self.sel_r = 0
+        self.mode = "RESULTS"
+        self.focus = "LIST"
+        self._reset_search_cache()
+        if source == "ia":
+            if not bool(result.get("preserve_local_filter")):
+                self.result_filter = ""
+            current_key = self._search_cache_key()
+            total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE) if self.total_results else 1
+            self._prime_search_cache(current_key, int(result.get("page") or self.page or 1), self.results, total_pages)
+            search_hint = "" if self.last_search_used_label in ("", "title", "custom", "advanced") else f" ({self.last_search_used_label} match)"
+            if self.total_results > 0:
+                self.status = f"Page {self.page}/{total_pages} — {self.total_results} total results{search_hint}. Arrows to select, Enter to open."
+            else:
+                self.status = f"Page {self.page} — {len(self.results)} results{search_hint}. Arrows to select, Enter to open."
+        elif source == "youtube":
+            self.result_filter = ""
+            self.status = f"YouTube — {len(self.results)} result(s). [YT] rows open as single-video downloads."
+        elif source == "all":
+            self.result_filter = ""
+            ia_count = int(result.get("ia_count") or 0)
+            yt_count = int(result.get("yt_count") or 0)
+            bits = []
+            ia_err = str(result.get("ia_err") or "")
+            yt_err = str(result.get("yt_err") or "")
+            if ia_err and yt_count:
+                bits.append("IA failed")
+            if yt_err and ia_count:
+                bits.append("YouTube failed")
+            suffix = f" ({'; '.join(bits)})" if bits else ""
+            self.status = f"Combined — {len(self.results)} result(s): IA {ia_count}, YouTube {yt_count}.{suffix}"
+        else:
+            self.result_filter = ""
+            self.status = "YouTube URL loaded. Open the [YT] row to preview/download."
+        return True
+
+    def do_youtube_search(self, query_text: str) -> None:
+        self.cancel_file_load()
+        self.search_source = "youtube"
+        self.page = 1
+        self.query_text = query_text
+        self.query_built = f"ytsearch10:{query_text}"
+        self.show_welcome = False
+        self._add_to_history(query_text)
+        self._save_session()
+        self.status = "Searching YouTube..."
+        self.render()
+
+        results, total, err = yt_search(query_text, rows=10)
+        if err:
+            self.set_error_status(err, detail=f"YouTube search failed: {err}")
+            return
+
+        self._reset_search_cache()
+        self.results = results
+        self.total_results = total
+        self.sel_r = 0
+        self.result_filter = ""
+        self.mode = "RESULTS"
+        self.focus = "LIST"
+        self.last_search_text = query_text
+        self.last_search_used_label = "youtube"
+        self.last_search_attempts = [("youtube", self.query_built)]
+        self.status = f"YouTube — {len(results)} result(s). [YT] rows open as single-video downloads."
+
+    def do_youtube_url(self, url: str) -> None:
+        self.cancel_file_load()
+        self.search_source = "youtube_url"
+        self.page = 1
+        self.query_text = url
+        self.query_built = url
+        self.show_welcome = False
+        self._add_to_history(url)
+        self._save_session()
+        self.status = "Fetching YouTube metadata..."
+        self.render()
+
+        result, err = yt_metadata_url(url)
+        if err or not result:
+            self.set_error_status(err or "YouTube metadata failed", detail=f"YouTube URL metadata failed: {err}")
+            return
+
+        self._reset_search_cache()
+        self.results = [result]
+        self.total_results = 1
+        self.sel_r = 0
+        self.result_filter = ""
+        self.mode = "RESULTS"
+        self.focus = "LIST"
+        self.last_search_text = url
+        self.last_search_used_label = "youtube-url"
+        self.last_search_attempts = [("youtube-url", url)]
+        self.status = "YouTube URL loaded. Open the [YT] row to preview/download."
+
     def next_page(self) -> None:
+        source = str(getattr(self, "search_source", "ia"))
+        if source.startswith("youtube") or source == "all":
+            self.status = "This search source loads one page at a time."
+            return
         if not self.query_text:
             self.status = "No search yet. Choose [Search]."
             return
+        effective_total = self.effective_search_total(self.page, self.results, self.total_results)
+        if effective_total > 0:
+            self.total_results = effective_total
+            total_pages = max(1, (effective_total + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+            if self.page >= total_pages:
+                self.status = "Already on last page."
+                return
         saved_focus = self.focus
         saved_menu_idx = self.menu_idx
-        saved_page = self.page
         self.page += 1
-        self.do_search(reset_page=False)
-        if not self.results:
-            self.page = saved_page
-            self.status = "No more results (rolled back to previous page)."
+        self.start_search_async(reset_page=False)
         # Keep menu focus so the user can immediately paginate again.
         self.focus = saved_focus
         self.menu_idx = saved_menu_idx
 
     def prev_page(self) -> None:
+        source = str(getattr(self, "search_source", "ia"))
+        if source.startswith("youtube") or source == "all":
+            self.status = "Already on first page for this search source."
+            return
         if not self.query_text:
             self.status = "No search yet. Choose [Search]."
             return
@@ -1219,36 +2349,154 @@ class RetroWaveIA:
             return
         saved_focus = self.focus
         saved_menu_idx = self.menu_idx
-        saved_page = self.page
         self.page -= 1
-        self.do_search(reset_page=False)
-        if not self.results:
-            self.page = saved_page
-            self.status = "No results on that page (rolled back)."
+        self.start_search_async(reset_page=False)
         # Keep menu focus so the user can immediately paginate again.
         self.focus = saved_focus
         self.menu_idx = saved_menu_idx
 
-    def load_files(self) -> None:
+    def _ensure_file_load_state(self) -> None:
+        if not hasattr(self, "_file_load_lock") or getattr(self, "_file_load_lock", None) is None:
+            self._file_load_lock = threading.RLock()
+        if not hasattr(self, "_file_load_token"):
+            self._file_load_token = 0
+        if not hasattr(self, "_file_load_loading"):
+            self._file_load_loading = False
+        if not hasattr(self, "_file_load_result"):
+            self._file_load_result = None
+        if not hasattr(self, "_file_load_thread"):
+            self._file_load_thread = None
+
+    def cancel_file_load(self) -> None:
+        self._ensure_file_load_state()
+        with self._file_load_lock:
+            self._file_load_token += 1
+            self._file_load_loading = False
+            self._file_load_result = None
+
+    def _start_file_load(self, item: SearchResult) -> None:
+        self._ensure_file_load_state()
+        ident = item.identifier
+        title = item.title
+        with self._file_load_lock:
+            if self._file_load_loading:
+                current = self._file_load_result or {}
+                if current.get("identifier") == ident:
+                    self.status = f"Still loading files for {ident}..."
+                    return
+            self._file_load_token += 1
+            token = self._file_load_token
+            self._file_load_loading = True
+            self._file_load_result = {"identifier": ident, "title": title, "pending": True}
+
+        self.cur_meta = None
+        self.files = []
+        self.sel_f = 0
+        self.preview_item = item
+        self.mode = "FILES"
+        self.focus = "LIST"
+        self.status = f"Loading file list for {ident}..."
+
+        def worker() -> None:
+            try:
+                files, meta, err = ia_files(ident)
+                result: Dict[str, Any] = {
+                    "identifier": ident,
+                    "title": title,
+                    "files": files,
+                    "meta": meta,
+                    "err": err,
+                    "exc": "",
+                }
+            except Exception as e:
+                result = {
+                    "identifier": ident,
+                    "title": title,
+                    "files": [],
+                    "meta": None,
+                    "err": f"File load failed for {ident}: {e}",
+                    "exc": repr(e),
+                }
+            with self._file_load_lock:
+                if token != self._file_load_token:
+                    return
+                self._file_load_result = result
+                self._file_load_loading = False
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with self._file_load_lock:
+            self._file_load_thread = thread
+        thread.start()
+
+    def finish_file_load_if_ready(self) -> bool:
+        self._ensure_file_load_state()
+        with self._file_load_lock:
+            if self._file_load_loading or not self._file_load_result:
+                return False
+            result = self._file_load_result
+            self._file_load_result = None
+
+        ident = str(result.get("identifier") or "")
+        err = str(result.get("err") or "")
+        if err:
+            detail = str(result.get("exc") or f"File load failed for {ident}: {err}")
+            self.set_error_status(err, detail=detail)
+            self.mode = "FILES"
+            self.focus = "LIST"
+            return True
+
+        self.last_error_detail = ""
+        self.cur_meta = result.get("meta")
+        self.files = list(result.get("files") or [])
+        self.restore_file_view_state(ident)
+        self.mode = "FILES"
+        self.focus = "LIST"
+        self.status = "Use arrows to choose a file, then [Preview], [Folder], [Item], or [Download]."
+        return True
+
+    def load_files(self, async_load: bool = False) -> None:
         self.save_current_file_view_state()
         item = self.selected_result()
         if not item:
             self.status = "No results to open."
             return
+        self._sync_page_to_result(item)
+        if self.is_youtube_result(item):
+            self.cancel_file_load()
+            self.cur_meta = {"source": "youtube", "webpage_url": item.webpage_url, "id": item.video_id}
+            self.files = [self.youtube_file_for_result(item)]
+            self.restore_file_view_state(item.identifier)
+            self.mode = "FILES"
+            self.focus = "LIST"
+            self.preview_item = item
+            self.status = "YouTube video ready. Preview then confirm to download with yt-dlp."
+            return
+        if async_load:
+            self._start_file_load(item)
+            return
         self.status = f"Loading files for {item.identifier}..."
         self.render()
 
-        files, meta, err = ia_files(item.identifier)
+        try:
+            files, meta, err = ia_files(item.identifier)
+        except Exception as e:
+            self.set_error_status(f"File load failed for {item.identifier}: {e}", detail=repr(e))
+            return
         if err:
-            self.status = err
+            self.set_error_status(err, detail=f"File load failed for {item.identifier}: {err}")
             return
 
+        self.last_error_detail = ""
         self.cur_meta = meta
         self.files = files
         self.restore_file_view_state(item.identifier)
         self.mode = "FILES"
         self.focus = "LIST"
         self.status = "Use arrows to choose a file, then [Preview], [Folder], [Item], or [Download]."
+
+    def open_selected_result(self) -> None:
+        self.show_welcome = False
+        self.load_files(async_load=True)
 
     def save_current_file_view_state(self) -> None:
         if self.mode != "FILES":
@@ -1261,11 +2509,13 @@ class RetroWaveIA:
             return
         if not item:
             return
+        ordered_selected = self._ordered_selected_file_names()
         self.file_view_state[item.identifier] = {
             "file_kw": self.file_kw,
             "video_only": self.video_only,
             "sel_f": self.sel_f,
-            "selected_file_names": sorted(self.selected_file_names),
+            "selected_file_names": ordered_selected,
+            "selected_file_order": ordered_selected,
         }
 
     def restore_file_view_state(self, identifier: str) -> None:
@@ -1274,11 +2524,53 @@ class RetroWaveIA:
         self.video_only = bool(state.get("video_only", False))
         self.sel_f = max(0, int(state.get("sel_f") or 0))
         valid_names = {f.name for f in self.files}
-        self.selected_file_names = {
+        ordered = [
             str(name)
-            for name in (state.get("selected_file_names") or [])
+            for name in (state.get("selected_file_order") or state.get("selected_file_names") or [])
             if str(name) in valid_names
-        }
+        ]
+        ordered = list(dict.fromkeys(ordered))
+        self.selected_file_order = ordered
+        self.selected_file_names = set(ordered)
+
+    def _ensure_selection_state(self) -> None:
+        if not hasattr(self, "selected_file_names") or self.selected_file_names is None:
+            self.selected_file_names = set()
+        if not hasattr(self, "selected_file_order") or self.selected_file_order is None:
+            self.selected_file_order = []
+
+    def _ordered_selected_file_names(self) -> List[str]:
+        self._ensure_selection_state()
+        ordered: List[str] = []
+        seen = set()
+        for name in self.selected_file_order:
+            if name in self.selected_file_names and name not in seen:
+                ordered.append(name)
+                seen.add(name)
+        if ordered:
+            return ordered
+        return [f.name for f in self.files if f.name in self.selected_file_names]
+
+    def _mark_file_name(self, name: str) -> bool:
+        self._ensure_selection_state()
+        if name in self.selected_file_names:
+            return False
+        self.selected_file_names.add(name)
+        self.selected_file_order.append(name)
+        return True
+
+    def _unmark_file_name(self, name: str) -> bool:
+        self._ensure_selection_state()
+        if name not in self.selected_file_names:
+            return False
+        self.selected_file_names.remove(name)
+        self.selected_file_order = [n for n in self.selected_file_order if n != name]
+        return True
+
+    def _clear_selection(self) -> None:
+        self._ensure_selection_state()
+        self.selected_file_names.clear()
+        self.selected_file_order.clear()
 
     def get_visible_files(self) -> List[IAFile]:
         files = list(self.files)
@@ -1291,9 +2583,11 @@ class RetroWaveIA:
         return files
 
     def get_marked_visible_files(self) -> List[IAFile]:
-        if not self.selected_file_names:
+        ordered_names = self._ordered_selected_file_names()
+        if not ordered_names:
             return []
-        return [f for f in self.files if f.name in self.selected_file_names]
+        visible_by_name = {f.name: f for f in self.files}
+        return [visible_by_name[name] for name in ordered_names if name in visible_by_name]
 
     def toggle_current_file_mark(self) -> None:
         visible = self.get_visible_files()
@@ -1302,16 +2596,26 @@ class RetroWaveIA:
             return
         name = visible[self.sel_f].name
         if name in self.selected_file_names:
-            self.selected_file_names.remove(name)
+            self._unmark_file_name(name)
             self.status = f"Unmarked: {name}"
         else:
-            self.selected_file_names.add(name)
+            self._mark_file_name(name)
             self.status = f"Marked: {name}"
         self.save_current_file_view_state()
 
+    def mark_current_file_and_advance(self) -> None:
+        visible = self.get_visible_files()
+        if not visible or not (0 <= self.sel_f < len(visible)):
+            self.status = "No file selected."
+            return
+        self.toggle_current_file_mark()
+        if visible and self.sel_f < len(visible) - 1:
+            self.sel_f += 1
+            self.save_current_file_view_state()
+
     def clear_file_marks(self) -> None:
         n = len(self.selected_file_names)
-        self.selected_file_names.clear()
+        self._clear_selection()
         self.save_current_file_view_state()
         self.status = f"Cleared {n} marked file(s)." if n else "No marked files."
 
@@ -1321,7 +2625,8 @@ class RetroWaveIA:
             self.status = "No visible files to mark."
             return
         before = len(self.selected_file_names)
-        self.selected_file_names.update(f.name for f in visible)
+        for f in visible:
+            self._mark_file_name(f.name)
         added = len(self.selected_file_names) - before
         self.save_current_file_view_state()
         self.status = f"Marked {added} new file(s); {len(self.selected_file_names)} total."
@@ -1333,14 +2638,51 @@ class RetroWaveIA:
             return
         for f in visible:
             if f.name in self.selected_file_names:
-                self.selected_file_names.remove(f.name)
+                self._unmark_file_name(f.name)
             else:
-                self.selected_file_names.add(f.name)
+                self._mark_file_name(f.name)
         self.save_current_file_view_state()
         self.status = f"Inverted visible marks; {len(self.selected_file_names)} marked."
 
+    def mark_file_range(self) -> None:
+        visible = self.get_visible_files()
+        if not visible:
+            self.status = "No visible files to mark."
+            return
+        if not (0 <= self.sel_f < len(visible)):
+            self.status = "No file selected."
+            return
+
+        start_idx = self.sel_f
+        current_num = start_idx + 1
+        raw = self.prompt("Mark through file # (blank cancels): ", str(current_num))
+        if raw is None:
+            self.status = "Range mark canceled."
+            return
+
+        raw = raw.strip()
+        if not raw.isdigit():
+            self.status = "Enter a file number."
+            return
+
+        end_num = int(raw)
+        if not (1 <= end_num <= len(visible)):
+            self.status = f"File number must be 1-{len(visible)}."
+            return
+
+        end_idx = end_num - 1
+        lo, hi = sorted((start_idx, end_idx))
+        before = len(self.selected_file_names)
+        for f in visible[lo : hi + 1]:
+            self._mark_file_name(f.name)
+        added = len(self.selected_file_names) - before
+        self.save_current_file_view_state()
+        self.status = f"Marked {hi - lo + 1} file(s) from {lo + 1} to {hi + 1}; {len(self.selected_file_names)} total ({added} new)."
+
     def file_filter_chips(self) -> List[str]:
         chips = []
+        if bool(getattr(self, "_file_load_loading", False)):
+            chips.append("Opening item")
         if self.file_kw.strip():
             chips.append(f"Keyword: {self.file_kw.strip()}")
         if self.video_only:
@@ -1353,6 +2695,12 @@ class RetroWaveIA:
         item = self.selected_result()
         if not item:
             return "No item selected"
+        if self.is_youtube_result(item):
+            title = item.title or "(no title)"
+            channel = item.uploader or item.creator or "unknown channel"
+            return f"[YT] {title} | {channel} | {item.video_id or item.identifier} | single video"
+        if bool(getattr(self, "_file_load_loading", False)):
+            return f"Opening item | {item.title or '(no title)'} | {item.identifier} | waiting for IA file metadata"
         license_status, _why = self.current_license_status()
         title = item.title or "(no title)"
         total = sum(int(f.size or 0) for f in self.files)
@@ -1421,7 +2769,11 @@ class RetroWaveIA:
             self.choose_file_filter_action()
             return True
         if ch == ord(' '):
-            self.toggle_current_file_mark()
+            self.mark_current_file_and_advance()
+            self.focus = "LIST"
+            return True
+        if ch in (ord('m'), ord('M')):
+            self.mark_file_range()
             self.focus = "LIST"
             return True
         if ch == ord('A'):
@@ -1439,10 +2791,13 @@ class RetroWaveIA:
         if ch in (ord('p'), ord('P')):
             self.set_preview_for_selected()
             return True
-        if ch in (ord('d'), ord('D')):
+        if ch == ord('d'):
             self.set_preview_for_marked()
             return True
-        if ch in (ord('r'), ord('R')):
+        if ch == ord('D'):
+            self.set_preview_for_item()
+            return True
+        if ch == ord('r'):
             visible = self.get_visible_files()
             if visible and 0 <= self.sel_f < len(visible):
                 f = visible[self.sel_f]
@@ -1463,6 +2818,17 @@ class RetroWaveIA:
             return True
         return False
 
+    def handle_results_hotkey(self, ch: int) -> bool:
+        if self.mode not in ("RESULTS", "SEARCH"):
+            return False
+        if ch in (ord('l'), ord('f')):
+            self.edit_result_filter()
+            return True
+        if ch in (ord('L'), ord('F')):
+            self.clear_result_filter()
+            return True
+        return False
+
     def cycle_bucket(self) -> None:
         order = ["TV", "Movies", "Music", "Other"]
         try:
@@ -1478,10 +2844,107 @@ class RetroWaveIA:
             return None
         return self.prompt_list(f"{bucket} favorites", [str(x) for x in opts if str(x).strip()])
 
+    def pick_save_bucket(self, suggested: str, reason: str) -> Optional[str]:
+        buckets = ["TV", "Movies", "Music", "Other"]
+        default_idx = buckets.index(suggested) if suggested in buckets else buckets.index("Movies")
+        title = f"Save destination  Suggested: {suggested} ({reason})"
+        return self.prompt_list(title, buckets, default_idx=default_idx)
+
+    def pick_folder_name(
+        self,
+        bucket: str,
+        default_name: str,
+        prompt_label: str,
+    ) -> Optional[str]:
+        default_name = sanitize_folder(default_name)
+        options: List[str] = []
+        if default_name:
+            options.append(default_name)
+        custom_label = "Type custom..."
+        options.append(custom_label)
+        favorites = self.favs.get("folders", {}).get(bucket, [])
+        if isinstance(favorites, list):
+            for fav in favorites:
+                name = sanitize_folder(str(fav))
+                if name and name not in options:
+                    options.append(name)
+        pick = self.prompt_list(f"{bucket} folder", options, default_idx=0)
+        if pick is None:
+            return None
+        if pick == custom_label:
+            raw = self.prompt(prompt_label, default_name)
+            if raw is None:
+                return None
+            return sanitize_folder(raw)
+        return sanitize_folder(pick)
+
     def movie_filename_for_folder(self, movie_folder: str, source_filename: str) -> str:
         movie = sanitize_folder(movie_folder)
         ext = os.path.splitext(os.path.basename(source_filename or ""))[1] or ".mp4"
         return f"{movie}{ext}"
+
+    def sanitize_import_filename(self, name: str, fallback: str) -> str:
+        candidate = os.path.basename((name or "").strip())
+        if not candidate or candidate in (".", ".."):
+            candidate = os.path.basename((fallback or "").strip())
+        candidate = candidate.replace("/", "").replace("\\", "").strip()
+        if not candidate or candidate in (".", ".."):
+            candidate = "download"
+        return candidate
+
+    def choose_import_filename(self, default_name: str, source_filename: str) -> Optional[str]:
+        default_name = self.sanitize_import_filename(default_name, source_filename)
+        raw = self.prompt("Filename (Enter accepts, Esc leaves in staging): ", default_name)
+        if raw is None:
+            return None
+        return self.sanitize_import_filename(raw, default_name)
+
+    def choose_import_foldername(self, default_name: str) -> Optional[str]:
+        default_name = sanitize_folder(default_name)
+        raw = self.prompt("Folder name (Enter accepts, Esc leaves in staging): ", default_name)
+        if raw is None:
+            return None
+        return sanitize_folder(raw)
+
+    def editable_import_folder_dir(self, final_path: str) -> str:
+        dirname = os.path.dirname(final_path)
+        parent = os.path.dirname(dirname)
+        if (
+            os.path.basename(dirname).lower().startswith("season ")
+            and safe_path_under(BUCKET_TV, parent)
+            and os.path.basename(parent)
+        ):
+            return parent
+        return dirname
+
+    def confirm_final_import_path(self, final_path: str, source_filename: str) -> Optional[str]:
+        while True:
+            choice = self.prompt_list(
+                f"Final path: {final_path}",
+                ["Accept", "Edit folder", "Edit filename", "Cancel"],
+                default_idx=0,
+            )
+            if choice is None or choice == "Cancel":
+                return None
+            if choice == "Accept":
+                return final_path
+
+            dirname = os.path.dirname(final_path)
+            if choice == "Edit folder":
+                editable_dir = self.editable_import_folder_dir(final_path)
+                parent = os.path.dirname(editable_dir)
+                current_folder = os.path.basename(editable_dir)
+                new_folder = self.choose_import_foldername(current_folder)
+                if new_folder is None:
+                    return None
+                suffix = os.path.relpath(final_path, editable_dir)
+                final_path = os.path.join(parent, new_folder, suffix)
+            else:
+                current_name = os.path.basename(final_path)
+                new_name = self.choose_import_filename(current_name, source_filename)
+                if new_name is None:
+                    return None
+                final_path = os.path.join(dirname, new_name)
 
     def choose_bucket_and_path(
         self,
@@ -1497,6 +2960,9 @@ class RetroWaveIA:
         if not os.path.exists(staging_path):
             return f"Downloaded, but staging file not found: {staging_path}"
 
+        if is_dvd_iso_file(filename):
+            return self.scan_staged_dvd_iso(staging_path)
+
         if batch:
             final_path = self.batch_destination_path(batch, filename, item_title)
             if not safe_path_under(MEDIA_ROOT, final_path):
@@ -1510,12 +2976,6 @@ class RetroWaveIA:
             shutil.move(staging_path, final_path)
             return f"Saved: {final_path}"
 
-        # --- helpers ---
-        def has_year_hint(s: str) -> bool:
-            if not s:
-                return False
-            return bool(re.search(r"\((19|20)\d{2}\)", s) or re.search(r"(19|20)\d{2}", s))
-
         def is_single_large_video(name: str) -> bool:
             try:
                 video_files = [f for f in self.files if is_video_file(f.name, f.fmt)]
@@ -1525,41 +2985,33 @@ class RetroWaveIA:
                 return False
 
         ep = detect_sxxeyy(filename) or detect_sxxeyy(item_title)
+        item = self.selected_result()
+        mediatype = getattr(item, "mediatype", "") if item else ""
+        suggested, reason = infer_bucket(
+            filename,
+            item_title,
+            mediatype=mediatype,
+            is_single_large_video=is_single_large_video(filename),
+            default_bucket="Movies",
+        )
 
-        # Auto-detect a suggested bucket
-        if ep:
-            suggested = "TV"
-        elif has_year_hint(filename) or has_year_hint(item_title) or is_single_large_video(filename):
-            suggested = "Movies"
-        elif self.last_bucket in ("TV", "Movies", "Music", "Other"):
-            suggested = self.last_bucket
-        else:
-            suggested = "Other"
-
-        # Ask user to confirm / choose bucket at download time
-        bucket_raw = self.prompt("Save to (TV/Movies/Music/Other): ", suggested)
-        if bucket_raw is None:
+        bucket = self.pick_save_bucket(suggested, reason)
+        if bucket is None:
             return f"Left in staging: {staging_path}"
-        bucket = bucket_raw.strip().title()
-        if bucket not in ("TV", "Movies", "Music", "Other"):
-            bucket = suggested
         self.last_bucket = bucket
 
         if bucket == "TV":
             show_default = sanitize_folder(item_title)
-            show = self.prompt('Show name (Enter default, or type "*" for favorites): ', show_default)
+            show = self.pick_folder_name("TV", show_default, "Show name: ")
             if show is None:
                 return f"Left in staging: {staging_path}"
-            if show.strip() == "*":
-                pick = self.pick_folder_fav_if_requested("TV")
-                show = pick if pick else show_default
-            show = sanitize_folder(show)
-            self.add_folder_fav("TV", show)
 
             if ep:
                 season, episode = ep
                 episode_override: Optional[int] = None
             else:
+                self.status = f"TV folder set to {show}. Enter season number next."
+                self.render()
                 s = self.prompt("Season number (01..): ", "01")
                 if s is None:
                     return f"Left in staging: {staging_path}"
@@ -1575,57 +3027,68 @@ class RetroWaveIA:
                 except Exception:
                     episode_override = None
 
+            self.add_folder_fav("TV", show)
+
             season_dir = os.path.join(BUCKET_TV, show, f"Season {season:02d}")
-            os.makedirs(season_dir, exist_ok=True)
 
             new_name = filename
             if ep or episode_override is not None:
                 ext = os.path.splitext(filename)[1] or ".mp4"
                 ep_num = ep[1] if ep else (episode_override if episode_override is not None else 1)
                 new_name = f"{show} - S{season:02d}E{ep_num:02d}{ext}"
+            chosen_name = self.choose_import_filename(new_name, filename)
+            if chosen_name is None:
+                return f"Left in staging: {staging_path}"
+            new_name = chosen_name
 
             final_path = os.path.join(season_dir, new_name)
 
         elif bucket == "Movies":
             title_default = auto_clean_movie_folder_name(item_title, filename)
-            movie = self.prompt('Movie folder (Enter default, or type "*" for favorites): ', title_default)
+            movie = self.pick_folder_name("Movies", title_default, "Movie folder: ")
             if movie is None:
                 return f"Left in staging: {staging_path}"
-            if movie.strip() == "*":
-                pick = self.pick_folder_fav_if_requested("Movies")
-                movie = pick if pick else title_default
-            movie = sanitize_folder(movie)
             self.add_folder_fav("Movies", movie)
 
             movie_dir = os.path.join(BUCKET_MOVIES, movie)
-            final_path = os.path.join(movie_dir, self.movie_filename_for_folder(movie, filename))
+            new_name = self.choose_import_filename(self.movie_filename_for_folder(movie, filename), filename)
+            if new_name is None:
+                return f"Left in staging: {staging_path}"
+            final_path = os.path.join(movie_dir, new_name)
 
         elif bucket == "Music":
             artist_default = sanitize_folder(item_title)
-            artist = self.prompt('Artist/album folder (Enter default, or type "*" for favorites): ', artist_default)
+            artist = self.pick_folder_name("Music", artist_default, "Artist/album folder: ")
             if artist is None:
                 return f"Left in staging: {staging_path}"
-            if artist.strip() == "*":
-                pick = self.pick_folder_fav_if_requested("Music")
-                artist = pick if pick else artist_default
-            artist = sanitize_folder(artist)
             self.add_folder_fav("Music", artist)
 
             music_dir = os.path.join(BUCKET_MUSIC, artist)
-            final_path = os.path.join(music_dir, filename)
+            new_name = self.choose_import_filename(os.path.basename(filename), filename)
+            if new_name is None:
+                return f"Left in staging: {staging_path}"
+            final_path = os.path.join(music_dir, new_name)
 
         else:
-            sub = self.prompt('Other subfolder (Enter "Misc", or type "*" for favorites): ', "Misc")
+            sub = self.pick_folder_name("Other", "Misc", "Other subfolder: ")
             if sub is None:
                 return f"Left in staging: {staging_path}"
-            if sub.strip() == "*":
-                pick = self.pick_folder_fav_if_requested("Other")
-                sub = pick if pick else "Misc"
-            sub = sanitize_folder(sub)
             self.add_folder_fav("Other", sub)
 
             other_dir = os.path.join(BUCKET_OTHER, sub)
-            final_path = os.path.join(other_dir, filename)
+            new_name = self.choose_import_filename(os.path.basename(filename), filename)
+            if new_name is None:
+                return f"Left in staging: {staging_path}"
+            final_path = os.path.join(other_dir, new_name)
+
+        if os.path.exists(final_path):
+            base, ext = os.path.splitext(final_path)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            final_path = f"{base}_{stamp}{ext}"
+
+        final_path = self.confirm_final_import_path(final_path, filename)
+        if final_path is None:
+            return f"Left in staging: {staging_path}"
 
         if os.path.exists(final_path):
             base, ext = os.path.splitext(final_path)
@@ -1647,25 +3110,33 @@ class RetroWaveIA:
         use_batch = self.prompt("Use one destination for this queue? Enter=yes, type n=no: ", "")
         if use_batch is None or use_batch.strip().lower().startswith("n"):
             return None
-        bucket_raw = self.prompt("Queue save to (TV/Movies/Music/Other): ", self.last_bucket)
-        if bucket_raw is None:
+        default_bucket = normalize_save_bucket(self.last_bucket, "Movies")
+        bucket = self.pick_save_bucket(default_bucket, "queue default")
+        if bucket is None:
             return None
-        bucket = bucket_raw.strip().title()
-        if bucket not in ("TV", "Movies", "Music", "Other"):
-            bucket = self.last_bucket if self.last_bucket in ("TV", "Movies", "Music", "Other") else "Other"
         self.last_bucket = bucket
         if bucket == "TV":
-            folder = self.prompt("Queue show/folder: ", sanitize_folder(item_title))
+            folder = self.pick_folder_name("TV", sanitize_folder(item_title), "Queue show name: ")
+            if folder is None:
+                return None
             season = self.prompt("Queue season number: ", "01")
-            return {"bucket": bucket, "folder": sanitize_folder(folder or item_title), "season": season or "01"}
+            if season is None:
+                return None
+            return {"bucket": bucket, "folder": folder, "season": season or "01"}
         if bucket == "Movies":
-            folder = self.prompt("Queue movie/folder: ", auto_clean_movie_folder_name(item_title, ""))
-            return {"bucket": bucket, "folder": sanitize_folder(folder or item_title)}
+            folder = self.pick_folder_name("Movies", auto_clean_movie_folder_name(item_title, ""), "Queue movie folder: ")
+            if folder is None:
+                return None
+            return {"bucket": bucket, "folder": folder}
         if bucket == "Music":
-            folder = self.prompt("Queue artist/album folder: ", sanitize_folder(item_title))
-            return {"bucket": bucket, "folder": sanitize_folder(folder or item_title)}
-        folder = self.prompt("Queue other subfolder: ", "Misc")
-        return {"bucket": bucket, "folder": sanitize_folder(folder or "Misc")}
+            folder = self.pick_folder_name("Music", sanitize_folder(item_title), "Queue artist/album folder: ")
+            if folder is None:
+                return None
+            return {"bucket": bucket, "folder": folder}
+        folder = self.pick_folder_name("Other", "Misc", "Queue other subfolder: ")
+        if folder is None:
+            return None
+        return {"bucket": bucket, "folder": folder}
 
     def batch_destination_path(self, batch: Dict[str, str], filename: str, item_title: str) -> str:
         bucket = batch.get("bucket", "Other")
@@ -1706,9 +3177,21 @@ class RetroWaveIA:
         return None
 
     def likely_import_destination(self, filename: str, item_title: str) -> str:
+        if is_dvd_iso_file(filename):
+            return "DVD ISO: stays in staging for scan/manual rip review"
+        preview_item = getattr(self, "preview_item", None)
+        selected_result_fn = getattr(self, "selected_result", None)
+        item = preview_item or (selected_result_fn() if callable(selected_result_fn) else None)
+        mediatype = getattr(item, "mediatype", "") if item else ""
+        bucket, _reason = infer_bucket(
+            filename,
+            item_title,
+            mediatype=mediatype,
+            is_single_large_video=False,
+            default_bucket="Movies",
+        )
         ep = detect_sxxeyy(filename) or detect_sxxeyy(item_title)
-        bucket = getattr(self, "last_bucket", "Other")
-        if ep:
+        if bucket == "TV" and ep:
             show = sanitize_folder(item_title)
             season, episode = ep
             ext = os.path.splitext(filename)[1] or ".mp4"
@@ -1722,6 +3205,48 @@ class RetroWaveIA:
             return os.path.join(BUCKET_TV, sanitize_folder(item_title), filename)
         return os.path.join(BUCKET_OTHER, "Misc", filename)
 
+    def scan_staged_dvd_iso(self, staging_path: str, *, dry_run: bool = False) -> str:
+        try:
+            result = ia_dvd.scan_dvd_iso(staging_path, dry_run=dry_run)
+        except Exception as e:
+            log_line(f"DVD_SCAN_ERR: {staging_path}: {e}")
+            return f"DVD ISO staged, scan failed: {staging_path} ({e})"
+
+        if dry_run:
+            return f"Dry run: would scan DVD ISO: {staging_path}"
+
+        if result.ok:
+            log_line(f"DVD_SCAN_OK: {staging_path} layout={result.layout} logs={result.logs_dir}")
+        else:
+            log_line(f"DVD_SCAN_WARN: {staging_path} layout={result.layout} errors={'; '.join(result.errors)} logs={result.logs_dir}")
+        return (
+            f"DVD ISO staged/scanned for manual review: {staging_path} | "
+            f"{result.layout}: {result.reason} | logs: {result.logs_dir}"
+        )
+
+    def _completed_download_location(self, identifier: str, filename: str, expected_size: int = 0) -> Optional[str]:
+        if self._staged_file_complete(identifier, filename, int(expected_size or 0)):
+            path, err = safe_staging_file_path(identifier, filename)
+            if not err and path:
+                return path
+        return self.find_existing_media_file(filename, int(expected_size or 0))
+
+    def _handle_already_complete(
+        self,
+        identifier: str,
+        f: IAFile,
+        item_title: str,
+        batch: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        existing = self._completed_download_location(identifier, f.name, int(f.size or 0))
+        if not existing:
+            return None
+        if safe_path_under(STAGING_ROOT, existing):
+            log_line(f"DL_SKIP_STAGED_COMPLETE: {existing}")
+            return self.choose_bucket_and_path(identifier, f.name, item_title, batch=batch)
+        log_line(f"DL_SKIP_EXISTING_COMPLETE: {existing}")
+        return f"Skipped existing complete file: {existing}"
+
     def refresh_preview_import_info(self) -> None:
         item = self.preview_item
         if not item:
@@ -1734,7 +3259,7 @@ class RetroWaveIA:
         for f in files[:12]:
             if not f:
                 continue
-            found = self.find_existing_media_file(f.name, int(f.size or 0))
+            found = self._completed_download_location(item.identifier, f.name, int(f.size or 0))
             if found:
                 existing.append(found)
             destinations.append(self.likely_import_destination(f.name, item.title))
@@ -1747,13 +3272,15 @@ class RetroWaveIA:
             for f in queue
         ]
 
-    def set_queue_status(self, filename: str, status: str, detail: str = "") -> None:
+    def set_queue_status(self, filename: str, status: str, detail: str = "", size: Optional[int] = None) -> None:
         for row in self.queue_status:
             if row.get("name") == filename:
                 row["status"] = status
                 row["detail"] = detail
+                if size is not None:
+                    row["size"] = int(size or 0)
                 return
-        self.queue_status.append({"name": filename, "status": status, "detail": detail, "size": 0})
+        self.queue_status.append({"name": filename, "status": status, "detail": detail, "size": int(size or 0)})
 
     def queue_summary(self) -> str:
         counts: Dict[str, int] = {}
@@ -1762,9 +3289,71 @@ class RetroWaveIA:
             counts[status] = counts.get(status, 0) + 1
         if not counts:
             return "Queue: empty"
-        order = ["pending", "downloading", "done", "skipped", "failed", "canceled"]
+        order = ["pending", "downloading", "done", "staged", "skipped", "failed", "canceled"]
         parts = [f"{k}:{counts[k]}" for k in order if k in counts]
         return "Queue: " + " ".join(parts)
+
+    def show_download_complete(self, message: str) -> None:
+        self.dl_complete_notice = message
+        self.mode = "DOWNLOADING"
+        self.focus = "LIST"
+        self.status = message
+        self.render()
+
+    def clear_download_complete(self) -> None:
+        self.dl_complete_notice = ""
+
+    def handle_download_complete_key(self, ch: int) -> bool:
+        if self.mode != "DOWNLOADING" or not self.dl_complete_notice:
+            return False
+        if is_enter_key(ch) or ch in (curses.KEY_BACKSPACE, 127, 8, 27, ord(" ")):
+            self.clear_download_complete()
+            self.mode = "FILES"
+            self.focus = "LIST"
+            self.status = "Back to files"
+            return True
+        return True
+
+    def handle_mouse_event(self) -> bool:
+        try:
+            _mouse_id, _x, _y, _z, button_state = curses.getmouse()
+        except Exception:
+            return False
+
+        direction = mouse_wheel_direction(button_state)
+        if direction == 0:
+            return False
+        return self.scroll_active_list(direction)
+
+    def scroll_active_list(self, direction: int) -> bool:
+        if self.mode in ("RESULTS", "SEARCH"):
+            visible = self.get_visible_results()
+            if not visible:
+                return True
+            self.sel_r = scroll_index(self.sel_r, direction, len(visible))
+            return True
+
+        if self.mode == "FILES":
+            visible = self.get_visible_files()
+            if not visible:
+                return True
+            self.sel_f = scroll_index(self.sel_f, direction, len(visible))
+            return True
+
+        if self.mode == "FAVS":
+            if self.favs_tab == "ITEMS":
+                favs_len = len(self.favs.get("items") or [])
+            elif self.favs_tab == "FILES":
+                favs_len = len(self.favs.get("files") or [])
+            else:
+                folders = self.favs.get("folders") or {}
+                favs_len = sum(len(folders.get(b) or []) for b in ("TV", "Movies", "Music", "Other"))
+            if not favs_len:
+                return True
+            self.favs_idx = scroll_index(self.favs_idx, direction, favs_len)
+            return True
+
+        return False
 
     def queue_row_attr(self, status: str, active: bool = False) -> int:
         status_l = (status or "").lower()
@@ -1772,11 +3361,24 @@ class RetroWaveIA:
             return curses.color_pair(2) | curses.A_BOLD
         if status_l in ("failed", "error", "blocked"):
             return curses.color_pair(5) | curses.A_BOLD
-        if status_l in ("unclear", "warning", "skipped"):
+        if status_l in ("unclear", "warning", "skipped", "staged"):
             return curses.color_pair(3)
         if status_l in ("marked", "pending"):
             return curses.color_pair(1) | curses.A_BOLD
         return curses.color_pair(6)
+
+    def import_queue_status(self, msg: str) -> str:
+        text = str(msg or "")
+        if text.startswith("Left in staging:"):
+            return "staged"
+        if text.startswith("Skipped existing complete file:"):
+            return "skipped"
+        if text.startswith("Refused:") or text.startswith("Downloaded, but staging file not found:"):
+            return "failed"
+        return "done"
+
+    def import_left_in_staging(self, msg: str) -> bool:
+        return self.import_queue_status(msg) == "staged"
 
     def queue_table_rows(self, width: int, limit: int = 8) -> List[Tuple[str, int]]:
         if width <= 0:
@@ -1785,7 +3387,7 @@ class RetroWaveIA:
         name_w = max(8, width - 22)
         for row in self.queue_status[:limit]:
             status = str(row.get("status") or "pending")
-            size = human_size(int(row.get("size") or 0))
+            size = display_size(row.get("size"))
             name = str(row.get("name") or "")
             if len(name) > name_w:
                 name = name[: max(0, name_w - 1)] + "…"
@@ -1819,6 +3421,12 @@ class RetroWaveIA:
         self.focus = "MENU"
         self.menu_idx = 0
         self.status = "Preview retry (no changes)."
+
+    def resume_or_retry_download(self) -> None:
+        if getattr(self, "failed_queue", None):
+            self.retry_failed_downloads()
+            return
+        self.resume_pending_download()
     
     def set_preview_for_selected(self) -> None:
         item = self.selected_result()
@@ -1831,14 +3439,19 @@ class RetroWaveIA:
             return
         f = visible[self.sel_f]
 
-        meta = self.cur_meta or {}
-        ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
+        if self.is_youtube_result(item):
+            ok, why = True, "YouTube single video via yt-dlp."
+        else:
+            meta = self.cur_meta or {}
+            ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
 
         self.preview_item = item
         self.preview_file = f
         self.preview_files = []
         self.preview_prefix = ""
-        if ok:
+        if self.is_youtube_result(item):
+            self.preview_msg = "YouTube single-video download via yt-dlp. You can download after confirmation."
+        elif ok:
             self.preview_msg = "Open license detected in metadata. You can download after confirmation."
         else:
             if self.enforce_license_gate:
@@ -1861,15 +3474,20 @@ class RetroWaveIA:
             self.set_preview_for_selected()
             return
 
-        meta = self.cur_meta or {}
-        ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
+        if self.is_youtube_result(item):
+            ok, why = True, "YouTube single video via yt-dlp."
+        else:
+            meta = self.cur_meta or {}
+            ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
         total = sum(int(f.size or 0) for f in marked)
         self.preview_item = item
         self.preview_file = None
         self.preview_files = list(marked)
         self.preview_prefix = "__SELECTED__"
 
-        if ok:
+        if self.is_youtube_result(item):
+            self.preview_msg = f"YouTube single-video download via yt-dlp ({display_size(total)})."
+        elif ok:
             self.preview_msg = f"Open license detected. Will download {len(marked)} marked files ({human_size(total)})."
         else:
             if self.enforce_license_gate:
@@ -1887,6 +3505,9 @@ class RetroWaveIA:
         item = self.selected_result()
         if not item:
             self.status = "No item selected."
+            return
+        if self.is_youtube_result(item):
+            self.status = "YouTube supports single-video downloads only."
             return
         meta = self.cur_meta or {}
         ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
@@ -1944,6 +3565,9 @@ class RetroWaveIA:
         item = self.selected_result()
         if not item:
             self.status = "No item selected."
+            return
+        if self.is_youtube_result(item):
+            self.set_preview_for_selected()
             return
         meta = self.cur_meta or {}
         ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
@@ -2011,8 +3635,19 @@ class RetroWaveIA:
             return False, err
         os.makedirs(STAGING_ROOT, exist_ok=True)
 
-        cmd = ia_downloads.single_download_cmd(identifier, filename, IA_NO_CHANGE_TIMESTAMP)
-        log_line(f"DL_CMD: {' '.join(cmd)}")
+        item = getattr(self, "preview_item", None)
+        is_youtube = self.is_youtube_result(item)
+        if is_youtube:
+            if not item or not getattr(item, "webpage_url", ""):
+                return False, "YouTube URL is missing."
+            os.makedirs(yt_downloads.youtube_staging_dir(identifier), exist_ok=True)
+            cmd = yt_downloads.single_video_download_cmd(APP_CONFIG["yt_dlp_path"], item.webpage_url, identifier)
+            read_written = lambda: ia_downloads.dir_total_size(yt_downloads.youtube_staging_dir(identifier))
+        else:
+            cmd = ia_downloads.single_download_cmd(identifier, filename, IA_NO_CHANGE_TIMESTAMP)
+            read_written = lambda: ia_downloads.safe_getsize(path)
+        log_line(f"DL_CMD: {shlex.join(cmd)}")
+        ia_minotaur_events.emit_archive_started(f"{identifier} {filename}")
         log_fh = ia_downloads.open_process_log()
         try:
             self.dl_cancel_requested = False
@@ -2039,8 +3674,10 @@ class RetroWaveIA:
                     sp = human_size(int(progress.speed_bps)) + "/s" if progress.speed_bps > 0 else "?/s"
                     eta = f"{int(progress.eta_s)}s" if progress.eta_s > 0 else "?"
                     self.status = f"{filename}  {pct}%  {human_size(progress.written)}/{human_size(progress.total)}  {sp}  ETA {eta}  (c cancels)"
-                else:
+                elif progress.written > 0:
                     self.status = f"{filename}  {human_size(progress.written)} downloaded  (c cancels)"
+                else:
+                    self.status = f"{filename}  downloaded size unknown  (c cancels)"
                 self.render()
 
             max_stall_retries = STALL_AUTO_RETRIES
@@ -2055,7 +3692,7 @@ class RetroWaveIA:
                     cmd,
                     target=filename,
                     expected_total=int(expected_size or 0),
-                    read_written=lambda: ia_downloads.safe_getsize(path),
+                    read_written=read_written,
                     log_fh=log_fh,
                     stall_timeout_s=STALL_TIMEOUT_S,
                     is_cancel_requested=check_cancel,
@@ -2067,6 +3704,7 @@ class RetroWaveIA:
 
                 if msg.startswith("download failed:"):
                     log_line(f"DL_POPEN_ERR: {msg}")
+                    ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg}")
                     return False, msg
 
                 if self._is_stall_error(msg):
@@ -2074,21 +3712,30 @@ class RetroWaveIA:
                         log_line(f"DL_STALL_COMPLETE: {filename}")
                         break
                     if self.dl_cancel_requested:
+                        ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: Canceled.")
                         return False, "Canceled."
                     if attempt < max_stall_retries:
                         attempt += 1
                         if not self._wait_before_stall_retry(attempt, max_stall_retries):
+                            ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: Canceled.")
                             return False, "Canceled."
                         continue
-                    return False, f"{msg} Auto-retry limit reached."
+                    err = f"{msg} Auto-retry limit reached."
+                    ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {err}")
+                    return False, err
 
+                ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg}")
                 return False, msg
 
-            ok_sz, msg_sz = self._verify_expected_size(identifier, filename, int(expected_size or 0))
-            if not ok_sz:
-                return False, msg_sz
+            if not is_youtube:
+                ok_sz, msg_sz = self._verify_expected_size(identifier, filename, int(expected_size or 0))
+                if not ok_sz:
+                    ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg_sz}")
+                    return False, msg_sz
+            ia_minotaur_events.emit_archive_completed(f"{identifier} {filename}")
             return True, ""
         finally:
+            self.stdscr.nodelay(False)
             log_fh.close()
 
     def _download_glob_with_progress(self, identifier: str, glob_pat: str, expected_total: int) -> Tuple[bool, str]:
@@ -2096,7 +3743,8 @@ class RetroWaveIA:
         os.makedirs(ia_downloads.staging_dir_for_identifier(identifier), exist_ok=True)
 
         cmd = ia_downloads.glob_download_cmd(identifier, glob_pat, IA_NO_CHANGE_TIMESTAMP)
-        log_line(f"DL_GLOB_CMD: {' '.join(cmd)}")
+        log_line(f"DL_GLOB_CMD: {shlex.join(cmd)}")
+        ia_minotaur_events.emit_archive_started(f"{identifier} {glob_pat}")
         log_fh = ia_downloads.open_process_log()
         try:
             self.dl_cancel_requested = False
@@ -2125,8 +3773,10 @@ class RetroWaveIA:
                     sp = human_size(int(progress.speed_bps)) + "/s" if progress.speed_bps > 0 else "?/s"
                     eta = f"{int(progress.eta_s)}s" if progress.eta_s > 0 else "?"
                     self.status = f"{identifier}  {pct}%  {human_size(progress.written)}/{human_size(progress.total)}  {sp}  ETA {eta}  (c cancels)"
-                else:
+                elif progress.written > 0:
                     self.status = f"{identifier}  {human_size(progress.written)} downloaded  (c cancels)"
+                else:
+                    self.status = f"{identifier}  downloaded size unknown  (c cancels)"
                 self.render()
 
             ok, msg = ia_downloads.run_download_with_progress(
@@ -2142,8 +3792,13 @@ class RetroWaveIA:
             )
             if not ok and msg.startswith("download failed:"):
                 log_line(f"DL_GLOB_POPEN_ERR: {msg}")
+            if ok:
+                ia_minotaur_events.emit_archive_completed(f"{identifier} {glob_pat}")
+            else:
+                ia_minotaur_events.emit_archive_failed(f"{identifier} {glob_pat}: {msg}")
             return ok, msg
         finally:
+            self.stdscr.nodelay(False)
             log_fh.close()
 
     def resume_pending_download(self) -> None:
@@ -2182,7 +3837,7 @@ class RetroWaveIA:
                 skipped_existing += 1
                 completed_names.add(f.name)
                 completed_names_list.append(f.name)
-                self.download_log.insert(0, f"Skipped existing: {existing}")
+                self.download_log.insert(0, f"Skipped existing complete file: {existing}")
                 self.download_log = self.download_log[:8]
                 continue
             if self._staged_file_complete(identifier, f.name, int(f.size or 0)):
@@ -2222,7 +3877,9 @@ class RetroWaveIA:
 
         for f in staged_ready:
             msg = self.choose_bucket_and_path(identifier, f.name, item_title)
-            new_completed.append(f.name)
+            import_status = self.import_queue_status(msg)
+            if import_status == "done" or import_status == "skipped":
+                new_completed.append(f.name)
             self.download_log.insert(0, msg)
             self.download_log = self.download_log[:8]
             self.status = msg
@@ -2244,7 +3901,9 @@ class RetroWaveIA:
                     self.download_log = self.download_log[:8]
                     return
                 msg = self.choose_bucket_and_path(identifier, f.name, item_title)
-                new_completed.append(f.name)
+                import_status = self.import_queue_status(msg)
+                if import_status == "done" or import_status == "skipped":
+                    new_completed.append(f.name)
                 self.download_log.insert(0, msg)
                 self.download_log = self.download_log[:8]
                 self.status = msg
@@ -2272,8 +3931,12 @@ class RetroWaveIA:
             self.focus = "LIST"
             return
 
-        meta = self.cur_meta or {}
-        ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
+        is_youtube_plan = self.is_youtube_result(self.preview_item)
+        if is_youtube_plan:
+            ok, why = True, "YouTube single video via yt-dlp."
+        else:
+            meta = self.cur_meta or {}
+            ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
         if not ok and self.enforce_license_gate:
             self.status = f"Blocked. {why}"
             self.mode = "FILES"
@@ -2302,17 +3965,20 @@ class RetroWaveIA:
             self.focus = "MENU"
 
             f = queue[0]
-            existing = self.find_existing_media_file(f.name, int(f.size or 0))
-            if existing:
-                self.set_queue_status(f.name, "skipped", existing)
+            complete_msg = self._handle_already_complete(item.identifier, f, item.title)
+            if complete_msg:
+                status = self.import_queue_status(complete_msg)
+                self.set_queue_status(f.name, status, complete_msg)
+                if status == "staged":
+                    self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
                 self.mode = "FILES"
                 self.focus = "LIST"
                 self.preview_item = None
                 self.preview_file = None
                 self.preview_files = []
                 self.preview_prefix = ""
-                self.status = f"Skipped existing file: {existing}"
-                self.download_log.insert(0, f"Skipped existing: {existing}")
+                self.status = complete_msg
+                self.download_log.insert(0, complete_msg)
                 self.download_log = self.download_log[:8]
                 return
             self.set_queue_status(f.name, "downloading")
@@ -2323,32 +3989,61 @@ class RetroWaveIA:
             if not ok2:
                 status = "canceled" if "cancel" in err.lower() else "failed"
                 self.set_queue_status(f.name, status, err)
-                self.record_failed_file(f, err)
+                if "cancel" in err.lower() and not self.is_youtube_result(item):
+                    self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
+                if not self.is_youtube_result(item):
+                    self.record_failed_file(f, err)
                 self.mode = "FILES"
                 self.focus = "LIST"
                 self.preview_item = None
                 self.preview_file = None
                 self.preview_files = []
                 self.preview_prefix = ""
-                self.status = err
+                self.status = f"{err}  (press R to resume)" if "cancel" in err.lower() else err
                 self.download_log.insert(0, f"Error: {err}")
                 self.download_log = self.download_log[:8]
                 return
 
-            msg = self.choose_bucket_and_path(item.identifier, f.name, item.title)
-            self.set_queue_status(f.name, "done", msg)
+            import_name = f.name
+            downloaded_size = int(f.size or 0)
+            if self.is_youtube_result(item):
+                found = yt_downloads.find_downloaded_video_file(item.identifier, item.video_id)
+                if not found:
+                    err = "yt-dlp finished, but downloaded file was not found in staging."
+                    self.record_failed_file(f, err)
+                    self.mode = "FILES"
+                    self.focus = "LIST"
+                    self.preview_item = None
+                    self.preview_file = None
+                    self.preview_files = []
+                    self.preview_prefix = ""
+                    self.status = err
+                    self.download_log.insert(0, f"Error: {err}")
+                    self.download_log = self.download_log[:8]
+                    return
+                import_name = found
+                found_path, found_err = safe_staging_file_path(item.identifier, found)
+                if not found_err and found_path:
+                    downloaded_size = ia_downloads.safe_getsize(found_path)
+                    f.size = downloaded_size
+            msg = self.choose_bucket_and_path(item.identifier, import_name, item.title)
+            import_status = self.import_queue_status(msg)
+            self.set_queue_status(f.name, import_status, msg, size=downloaded_size)
+            if import_status == "staged":
+                self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
             self.download_log.insert(0, msg)
             self.download_log = self.download_log[:8]
-            self.status = msg
-            self.render()
-
-            self.mode = "FILES"
-            self.focus = "LIST"
             self.preview_item = None
             self.preview_file = None
             self.preview_files = []
             self.preview_prefix = ""
-            self.status = "Done. Downloaded 1 file."
+            if import_status == "staged":
+                self.show_download_complete("Downloaded 1 file; import pending. Press R after returning to import from staging.")
+            elif import_status == "failed":
+                self.show_download_complete("Downloaded 1 file; import failed.")
+            else:
+                size_note = f" ({display_size(downloaded_size)})" if self.is_youtube_result(item) and downloaded_size > 0 else ""
+                self.show_download_complete(f"Done. Downloaded 1 file{size_note}.")
             return
 
         # prefix or full item
@@ -2374,18 +4069,22 @@ class RetroWaveIA:
 
             if self.preview_prefix and self.preview_prefix not in ("__FULL_ITEM__", "__SELECTED__"):
                 remaining_for_glob: List[IAFile] = []
+                completed_names: List[str] = []
                 for f in queue:
-                    existing = self.find_existing_media_file(f.name, int(f.size or 0))
-                    if existing:
-                        self.set_queue_status(f.name, "skipped", existing)
-                        self.download_log.insert(0, f"Skipped existing: {existing}")
+                    complete_msg = self._handle_already_complete(item.identifier, f, item.title, batch=batch_import)
+                    if complete_msg:
+                        status = self.import_queue_status(complete_msg)
+                        self.set_queue_status(f.name, status, complete_msg)
+                        if status == "done" or status == "skipped":
+                            completed_names.append(f.name)
+                        self.download_log.insert(0, complete_msg)
                         self.download_log = self.download_log[:8]
                     else:
                         remaining_for_glob.append(f)
                 if not remaining_for_glob:
                     self.mode = "FILES"
                     self.focus = "LIST"
-                    self.status = f"Skipped {len(queue)} existing file(s)."
+                    self.status = f"All {len(queue)} file(s) were already complete."
                     return
                 queue = remaining_for_glob
                 # Use ia --glob for prefix downloads.
@@ -2400,7 +4099,7 @@ class RetroWaveIA:
                     for f in queue:
                         self.record_failed_file(f, err)
                     self._save_pending(item.identifier, item.title, queue,
-                                       self.preview_prefix, glob_pat, [])
+                                       self.preview_prefix, glob_pat, completed_names)
                     self.mode = "FILES"
                     self.focus = "LIST"
                     self.preview_item = None
@@ -2413,7 +4112,6 @@ class RetroWaveIA:
                     return
 
                 # Import each expected file (now that the glob run finished).
-                completed_names: List[str] = []
                 for f in queue:
                     ok_sz, msg_sz = self._verify_expected_size(item.identifier, f.name, int(f.size or 0))
                     if not ok_sz:
@@ -2432,16 +4130,16 @@ class RetroWaveIA:
                         return
 
                     msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, batch=batch_import)
-                    self.set_queue_status(f.name, "done", msg)
-                    completed_names.append(f.name)
+                    import_status = self.import_queue_status(msg)
+                    self.set_queue_status(f.name, import_status, msg)
+                    if import_status == "done" or import_status == "skipped":
+                        completed_names.append(f.name)
                     self.download_log.insert(0, msg)
                     self.download_log = self.download_log[:8]
                     self.status = msg
                     self.render()
 
                 self._clear_pending()
-                self.mode = "FILES"
-                self.focus = "LIST"
                 was_selected_plan = self.preview_prefix == "__SELECTED__"
                 self.preview_item = None
                 self.preview_file = None
@@ -2450,17 +4148,24 @@ class RetroWaveIA:
                 if was_selected_plan:
                     self.selected_file_names.clear()
                     self.save_current_file_view_state()
-                self.status = f"Done. Downloaded {len(queue)} file(s)."
+                staged_count = sum(1 for row in self.queue_status if row.get("status") == "staged")
+                if staged_count:
+                    self._save_pending(item.identifier, item.title, queue, self.preview_prefix, glob_pat, completed_names)
+                    self.show_download_complete(f"Downloaded {len(queue)} file(s); {staged_count} import pending.")
+                else:
+                    self.show_download_complete(f"Done. Downloaded {len(queue)} file(s).")
                 return
 
             # Full item (visible set). Sequential download keeps progress accurate per-file and imports cleanly.
             seq_completed: List[str] = []
             for idx, f in enumerate(queue):
-                existing = self.find_existing_media_file(f.name, int(f.size or 0))
-                if existing:
-                    self.set_queue_status(f.name, "skipped", existing)
-                    seq_completed.append(f.name)
-                    self.download_log.insert(0, f"Skipped existing: {existing}")
+                complete_msg = self._handle_already_complete(item.identifier, f, item.title, batch=batch_import)
+                if complete_msg:
+                    status = self.import_queue_status(complete_msg)
+                    self.set_queue_status(f.name, status, complete_msg)
+                    if status == "done" or status == "skipped":
+                        seq_completed.append(f.name)
+                    self.download_log.insert(0, complete_msg)
                     self.download_log = self.download_log[:8]
                     continue
                 self.dl_current_name = f.name
@@ -2490,16 +4195,16 @@ class RetroWaveIA:
                     return
 
                 msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, batch=batch_import)
-                self.set_queue_status(f.name, "done", msg)
-                seq_completed.append(f.name)
+                import_status = self.import_queue_status(msg)
+                self.set_queue_status(f.name, import_status, msg)
+                if import_status == "done" or import_status == "skipped":
+                    seq_completed.append(f.name)
                 self.download_log.insert(0, msg)
                 self.download_log = self.download_log[:8]
                 self.status = msg
                 self.render()
 
             self._clear_pending()
-            self.mode = "FILES"
-            self.focus = "LIST"
             was_selected_plan = self.preview_prefix == "__SELECTED__"
             self.preview_item = None
             self.preview_file = None
@@ -2508,7 +4213,12 @@ class RetroWaveIA:
             if was_selected_plan:
                 self.selected_file_names.clear()
                 self.save_current_file_view_state()
-            self.status = f"Done. Downloaded {len(queue)} file(s)."
+            staged_count = sum(1 for row in self.queue_status if row.get("status") == "staged")
+            if staged_count:
+                self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", seq_completed)
+                self.show_download_complete(f"Downloaded {len(queue)} file(s); {staged_count} import pending.")
+            else:
+                self.show_download_complete(f"Done. Downloaded {len(queue)} file(s).")
             return
 
         self.status = "Nothing selected."
@@ -2554,6 +4264,9 @@ class RetroWaveIA:
         return count >= BULK_CONFIRM_FILE_THRESHOLD or total_bytes >= BULK_CONFIRM_BYTES_THRESHOLD
 
     def current_license_status(self) -> Tuple[str, str]:
+        item = getattr(self, "preview_item", None) or self.selected_result()
+        if self.is_youtube_result(item):
+            return "open", "YouTube single video via yt-dlp."
         meta = self.cur_meta or {}
         if not meta:
             return "unknown", "No metadata loaded"
@@ -2572,7 +4285,7 @@ class RetroWaveIA:
         lines = [
             "KEYBOARD SHORTCUTS:",
             "  /  s       Open search bar (works anywhere)",
-            "  l          Local filter current result page",
+            "  l          Local filter all search results",
             "  0..9       Jump/select result number",
             "  Tab        Switch MENU <-> LIST focus",
             "  Arrows     Navigate menu items or list",
@@ -2582,12 +4295,14 @@ class RetroWaveIA:
             "  Enter      Activate menu button / open item or file",
             "  n  ]  PgDn  Next page of results",
             "  p  [  PgUp  Previous page of results",
+            "  y          Show library audit summary counts",
             "  r          Show selected result metadata summary",
             "  R          Resume pending/failed download state",
             "  #          Go to specific page number",
             "  Space      Mark/unmark file (in FILES mode)",
             "  A / I / U  Mark all visible / invert visible / clear marks",
             "  d          Preview marked files, or selected file if none marked",
+            "  D          Preview/download all visible files",
             "  f          File filter menu: keyword, clear keyword, video-only, show all",
             "  v          Toggle video-only filter (in FILES mode)",
             "  Backspace  Go back (works in FILES, FAVS, HELP, PREVIEW)",
@@ -2604,6 +4319,7 @@ class RetroWaveIA:
             "  [Filter]     choose: movies / audio / texts / software / any",
             "  [Sort]       choose: relevance / date / title / downloads",
             "  [Title only] search within item titles only",
+            "  [Local]      refines all loaded search results; L clears it quickly",
             "  [Collections] finds IA collection items",
             "  [In Collection] narrows by a collection identifier",
             "  Actions -> Search / fields searches title, creator, subject, date, etc.",
@@ -2623,6 +4339,7 @@ class RetroWaveIA:
             "  Press R from any screen to resume a canceled/stalled download.",
             "  Downloads stalled for 2 min auto-retry twice, then save resume state.",
             "  Files go to staging first, then move to TV / Movies / Music / Other.",
+            "  Final folder and filename are editable before import; Esc leaves the file in staging.",
             "  Unclear rights show a warning; [License gate] can block them.",
             f"  {'--no-change-timestamp enabled (mtimes set to now).' if IA_NO_CHANGE_TIMESTAMP else 'Source mtimes preserved.'}",
             f"  Log: {LOG_PATH}",
@@ -2637,7 +4354,7 @@ class RetroWaveIA:
     def draw_help_overlay(self) -> None:
         h, w = self.stdscr.getmaxyx()
         box_w = min(w - 4, 72)
-        box_h = min(h - 4, 18)
+        box_h = min(h - 4, 16)
         if box_w < 40 or box_h < 10:
             return
         top = max(1, (h - box_h) // 2)
@@ -2655,28 +4372,27 @@ class RetroWaveIA:
         lines = [
             " Help ",
             "",
-            self.hint_bar(include_overlay_state=False),
-            "",
-            "Universal:  / search   a actions   Tab focus   Backspace back   q quit",
+            "Tab switches MENU/LIST. Enter activates. Backspace goes back. q quits.",
         ]
         if self.mode in ("RESULTS", "SEARCH"):
             lines += [
-                "Results:    Enter/o open   l local filter   digits jump   n/p page",
-                "Options:    filter, sort, title-only, license gate are in Actions",
+                "Open Enter/o | Search / | Details r | Local l/f | Clear L/F",
+                "Actions a | Page n/p | Filter, sort, title-only in Actions",
             ]
         elif self.mode == "FILES":
             lines += [
-                "Files:      Space mark   A all   I invert   U clear   d marked/selected",
-                "Filters:    f filter menu   v video-only   keyword blank clears",
+                "Preview Enter/p | Folder o | Mark Space/m/A/I/U | Marked d | All visible D",
+                "Filter f/F | Video v | Retry R | Bucket in menu",
             ]
         elif self.mode == "FAVS":
             lines += [
-                "Favorites:  Enter/o open   Tab changes focus   Actions changes tab/removes",
+                "Open Enter/o | Tab changes saved tabs | Remove Del",
+                "Backspace returns to results/files.",
             ]
         elif self.mode == "PREVIEW_DL":
-            lines += ["Preview:    Enter confirms   Backspace/Esc cancels"]
+            lines += ["Enter confirms download | Esc or Backspace cancels."]
         else:
-            lines += ["Navigate:   j/k or arrows   Enter selects"]
+            lines += ["Use the menu or arrows to navigate.", "Search with / or s."]
         lines += ["", "Press ? or Esc to close."]
 
         y = top + 1
@@ -2690,15 +4406,14 @@ class RetroWaveIA:
     def draw_welcome(self, top_y: int) -> None:
         h, w = self.stdscr.getmaxyx()
         lines = [
-            "Welcome.",
+            "No item selected.",
             "",
-            "Press  /  to search, or choose [Search] in the menu.",
-            "Use  j/k  or arrows to navigate,  g/G  to jump to start/end.",
-            "",
-            "Tab switches between MENU and LIST focus.",
-            "n / p  or  [ / ]  pages through results.",
-            "[Favs] opens your saved items and files.",
-            "[Help] shows all shortcuts.",
+            "First steps:",
+            "  IA search: press / or choose IA Search",
+            "  YouTube search: choose YT Search",
+            "  Source: choose Source",
+            "  Help: press ?",
+            "  Quit: press q",
         ]
         if self.search_history:
             lines += ["", "Recent searches:"]
@@ -2751,11 +4466,11 @@ class RetroWaveIA:
             f"Item: {item.title}",
             f"Identifier: {item.identifier}",
             f"Plan: {self.preview_plan_kind()}",
-            f"Files: {count}   Total size: {human_size(total)}",
+            f"Files: {count}   Total size: {display_size(total)}",
         ]
         if self.preview_file:
             f = self.preview_file
-            plan_rows += [f"File: {f.name}", f"Size: {human_size(f.size)}   Format: {f.fmt or '(unknown)'}"]
+            plan_rows += [f"File: {f.name}", f"Size: {display_size(f.size)}   Format: {f.fmt or '(unknown)'}"]
         if self.preview_msg:
             plan_rows.append(self.preview_msg)
 
@@ -2828,26 +4543,46 @@ class RetroWaveIA:
 
         if self.mode in ("RESULTS", "SEARCH"):
             visible_results = self.get_visible_results()
+            with self._search_cache_lock:
+                loading_more = self._all_results_loading
+                loader_error = self._all_results_loader_error
             if not visible_results:
-                msg = (
-                    f"No results match local filter \"{self.result_filter}\". Press l to change or clear it."
-                    if self.results and self.result_filter
-                    else "Choose [Search] or press / to begin."
-                )
+                if self.results and self.result_filter:
+                    progress = self.local_filter_progress_label()
+                    if progress:
+                        msg = f"No current matches for \"{self.result_filter}\"; {progress}. Press l to change."
+                    else:
+                        msg = f"No results match local filter \"{self.result_filter}\". Press l to change or clear it."
+                else:
+                    msg = "No results. First steps: IA search /  |  YT Search menu  |  Source menu  |  Help ?  |  Quit q"
                 self.safe_addstr(list_top, 0, msg.ljust(max(0, left_w - 1)), curses.color_pair(6))
             else:
-                start_n = (self.page - 1) * ROWS_PER_PAGE + 1
-                end_n = (self.page - 1) * ROWS_PER_PAGE + len(self.results)
-                if self.total_results > 0:
+                if self.result_filter:
+                    progress = self.local_filter_progress_label()
+                    suffix = f"; {progress}" if progress else ""
+                    phdr = f" Results 1-{len(visible_results)} of {len(visible_results)}  (local filter{suffix})"
+                elif self.total_results > 0:
+                    start_n = (self.page - 1) * ROWS_PER_PAGE + 1
+                    end_n = (self.page - 1) * ROWS_PER_PAGE + len(self.results)
                     total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
                     phdr = f" Results {start_n}–{end_n} of {self.total_results}  (page {self.page}/{total_pages})  [ ] or n/p to page"
                 else:
+                    start_n = (self.page - 1) * ROWS_PER_PAGE + 1
+                    end_n = (self.page - 1) * ROWS_PER_PAGE + len(self.results)
                     phdr = f" Results {start_n}–{end_n}  (page {self.page})"
-                if self.result_filter:
-                    phdr += f"  local: {len(visible_results)}/{len(self.results)}"
+                if loading_more:
+                    phdr += "  loading more results..."
+                elif loader_error:
+                    phdr += f"  load paused: {loader_error}"
                 self.safe_addstr(list_top, 0, phdr[: max(0, left_w - 1)].ljust(max(0, left_w - 1)), curses.color_pair(3))
                 list_top += 1
                 max_rows = max(0, max_rows - 1)
+                chips = self.results_state_chips()
+                if chips and max_rows > 0:
+                    chip_line = "  ".join(f"[{chip}]" for chip in chips)
+                    self.safe_addstr(list_top, 0, chip_line[: max(0, left_w - 1)].ljust(max(0, left_w - 1)), curses.color_pair(2))
+                    list_top += 1
+                    max_rows = max(0, max_rows - 1)
                 if self.sel_r >= len(visible_results):
                     self.sel_r = max(0, len(visible_results) - 1)
                 start = 0
@@ -2857,27 +4592,22 @@ class RetroWaveIA:
                     r = visible_results[i]
                     marker = ">" if i == self.sel_r else " "
                     try:
-                        raw_idx = self.results.index(r)
+                        raw_idx = visible_results.index(r) if self.result_filter else self.results.index(r)
                     except ValueError:
                         raw_idx = i
-                    abs_num = (self.page - 1) * ROWS_PER_PAGE + raw_idx + 1
+                    abs_num = (i + 1) if self.result_filter else ((self.page - 1) * ROWS_PER_PAGE + raw_idx + 1)
                     idx = f"{abs_num:02d}"
                     raw_title = (r.title or "")
                     meta = self.result_meta_summary(r)
                     meta_suffix = f"  [{meta}]" if meta else ""
-                    max_title = max(12, left_w - 15 - len(meta_suffix))
+                    badge = self.result_source_badge(r)
+                    max_title = max(12, left_w - 16 - len(badge) - len(meta_suffix))
                     title = (raw_title[:max_title - 1] + "…") if len(raw_title) > max_title else raw_title
                     star = "*" if self.is_fav_item(r.identifier) else " "
-                    line = f"{marker} {idx} {star} │ {title}{meta_suffix}"
+                    line = f"{marker} {idx} {star} │ {badge} {title}{meta_suffix}"
                     line = line[: max(0, left_w - 1)].ljust(max(0, left_w - 1))
 
-                    if i == self.sel_r:
-                        attr = curses.color_pair(7) if self.focus == "LIST" else curses.color_pair(6)
-                        if self.focus == "LIST":
-                            attr |= curses.A_BOLD
-                        self.safe_addstr(list_top + (i - start), 0, line, attr)
-                    else:
-                        self.safe_addstr(list_top + (i - start), 0, line, curses.color_pair(6))
+                    self.safe_addstr(list_top + (i - start), 0, line, self.result_row_attr(r, i == self.sel_r))
 
         elif self.mode == "FILES":
             visible = self.get_visible_files()
@@ -2892,7 +4622,10 @@ class RetroWaveIA:
                 list_top += 1
                 max_rows = max(0, max_rows - 1)
             if not visible:
-                if self.file_kw:
+                loading_files = bool(getattr(self, "_file_load_loading", False))
+                if loading_files:
+                    msg = "Loading file list..."
+                elif self.file_kw:
                     msg = f"No files match \"{self.file_kw}\"  |  f filter menu  |  U clear marks  |  v show all"
                 elif self.video_only:
                     msg = "No video files visible  |  v show all  |  f filter menu  |  Backspace results"
@@ -2993,10 +4726,13 @@ class RetroWaveIA:
         if self.mode in ("RESULTS", "SEARCH"):
             sel_item = self.selected_result()
             details = []
-            if sel_item:
+            if sel_item and self.is_youtube_result(sel_item):
+                details += self.youtube_result_details_lines(sel_item)
+            elif sel_item:
                 status, status_reason = license_status_from_fields(sel_item.licenseurl, sel_item.rights)
                 details += [
                     "Selected:",
+                    "  Source: [IA] Internet Archive",
                     f"  {sel_item.title or '(no title)'}",
                     f"  Year:    {sel_item.year or '—'}",
                     f"  Type:    {sel_item.mediatype or '—'}",
@@ -3006,6 +4742,8 @@ class RetroWaveIA:
                     f"  ID:      {sel_item.identifier}",
                     "",
                 ]
+                if sel_item.formats:
+                    details += ["Formats:", f"  {sel_item.formats}", ""]
                 if sel_item.collection:
                     details += ["Collection:", f"  {sel_item.collection}", ""]
                 if sel_item.date or sel_item.publicdate:
@@ -3017,18 +4755,59 @@ class RetroWaveIA:
                     ]
                 if status != "unknown":
                     details += ["License reason:", f"  {status_reason}", ""]
+                followups = build_sideways_searches(
+                    {
+                        "metadata": {
+                            "identifier": sel_item.identifier,
+                            "creator": sel_item.creator,
+                            "collection": sel_item.collection,
+                            "subject": [],
+                        }
+                    },
+                    self.filter,
+                )
+                if followups:
+                    details += ["Follow-up searches:"]
+                    for label, query in followups[:4]:
+                        short = query if len(query) <= max(18, right_w - 8) else (query[: max(15, right_w - 11)] + "...")
+                        details.append(f"  {label}: {short}")
+                    details.append("")
                 if sel_item.description:
                     details.append("Description:")
                     wrap_w = max(10, right_w - 2)
                     for wrapped in textwrap.wrap(sel_item.description, width=wrap_w):
                         details.append(f"  {wrapped}")
                     details.append("")
-            details += [
-                "Enter or [Open] to view files",
-                f"Sort: {self._sort_label()}",
-                f"Local filter: {self.result_filter or '(none)'}",
-                f"Query: {self.query_built or '(none)'}",
-            ]
+            if not (sel_item and self.is_youtube_result(sel_item)):
+                if sel_item:
+                    details += [
+                        "Enter or [Open] to view files",
+                        f"Sort: {self._sort_label()}",
+                        f"Local filter: {self.result_filter or '(none)'}",
+                        f"Query: {self.query_built or '(none)'}",
+                    ]
+                else:
+                    details += [
+                        "No item selected",
+                        f"Source: {self.search_source_badge()} {self.search_source_label()}",
+                        f"Query: {self.query_built or '(none)'}",
+                    ]
+            if self.last_search_attempts and not (sel_item and self.is_youtube_result(sel_item)):
+                details += [
+                    "",
+                    "Search debug:",
+                    f"  Strategy: {self.last_search_used_label or 'custom'}",
+                    f"  Total results: {self.total_results or len(self.results)}",
+                ]
+                for label, query in self.last_search_attempts[:3]:
+                    q = query if len(query) <= max(18, right_w - 8) else (query[: max(15, right_w - 11)] + "...")
+                    details.append(f"  {label}: {q}")
+            chips = [] if (sel_item and self.is_youtube_result(sel_item)) else self.collection_choices_from_results(limit=4)
+            if chips:
+                details += ["", "Top collections:"]
+                for chip in chips:
+                    details.append(f"  [{chip}]")
+                details.append("  Search tools -> Result collections to narrow")
         elif self.mode == "FILES":
             item = self.selected_result()
             visible = self.get_visible_files()
@@ -3068,35 +4847,56 @@ class RetroWaveIA:
             if self.cur_meta:
                 ok2, why2 = is_openly_licensed(self.cur_meta)
                 details += ["", "License gate:", f"  {'ALLOW' if ok2 else 'BLOCK'}", f"  {why2}"]
+                followups = build_sideways_searches(self.cur_meta, self.filter)
+                if followups:
+                    details += ["", "Follow-up searches:"]
+                    for label, query in followups[:4]:
+                        short = query if len(query) <= max(18, right_w - 8) else (query[: max(15, right_w - 11)] + "...")
+                        details.append(f"  {label}: {short}")
 
         elif self.mode == "DOWNLOADING":
-            details = [
-                "Download progress:",
-                f"  Target: {self.dl_current_name}",
-                self.queue_summary(),
-            ]
-            if self.dl_current_total > 0:
-                pct = int((self.dl_current_written * 100) / self.dl_current_total) if self.dl_current_total else 0
-                bar_w = max(8, min(34, right_w - 4))
-                details += [
-                    f"  [{shaded_progress_bar(self.dl_current_written, self.dl_current_total, bar_w)}]",
-                    f"  {pct}%  {human_size(self.dl_current_written)}/{human_size(self.dl_current_total)}",
+            if self.dl_complete_notice:
+                details = [
+                    "Download complete:",
+                    f"  {self.dl_complete_notice}",
+                    "",
+                    "Press Enter or Backspace to return.",
                 ]
             else:
-                bar_w = max(8, min(34, right_w - 4))
-                details += [
-                    f"  [{shaded_progress_bar(self.dl_current_written, self.dl_current_total, bar_w)}]",
-                    f"  {human_size(self.dl_current_written)} downloaded",
+                details = [
+                    "Download progress:",
+                    f"  Target: {self.dl_current_name}",
+                    self.queue_summary(),
                 ]
-            if self.dl_speed_bps > 0:
-                details += [f"  Speed: {human_size(int(self.dl_speed_bps))}/s"]
-            if self.dl_eta_s > 0:
-                details += [f"  ETA: {int(self.dl_eta_s)}s"]
-            details += ["", "Press c to cancel"]
+                if self.dl_current_total > 0:
+                    pct = int((self.dl_current_written * 100) / self.dl_current_total) if self.dl_current_total else 0
+                    bar_w = max(8, min(34, right_w - 4))
+                    details += [
+                        f"  [{shaded_progress_bar(self.dl_current_written, self.dl_current_total, bar_w)}]",
+                        f"  {pct}%  {human_size(self.dl_current_written)}/{human_size(self.dl_current_total)}",
+                    ]
+                else:
+                    bar_w = max(8, min(34, right_w - 4))
+                    details += [
+                        f"  [{shaded_progress_bar(self.dl_current_written, self.dl_current_total, bar_w)}]",
+                        f"  {human_size(self.dl_current_written)} downloaded" if self.dl_current_written > 0 else "  Size unknown",
+                    ]
+                if self.dl_speed_bps > 0:
+                    details += [f"  Speed: {human_size(int(self.dl_speed_bps))}/s"]
+                if self.dl_eta_s > 0:
+                    details += [f"  ETA: {int(self.dl_eta_s)}s"]
+                details += ["", "Press c to cancel"]
 
             if self.queue_status:
                 details += ["", "Queue:"]
                 details += self.queue_table_rows(right_w, limit=8)
+
+        if getattr(self, "last_error_detail", "") and self.mode != "DOWNLOADING":
+            wrap_w = max(12, right_w - 2)
+            err_rows = ["Last error:"]
+            for wrapped in textwrap.wrap(str(self.last_error_detail), width=wrap_w) or [str(self.last_error_detail)]:
+                err_rows.append(f"  {wrapped}")
+            details = err_rows + [""] + details
 
         for line in details:
             if ry >= body_bottom:
@@ -3156,6 +4956,9 @@ class RetroWaveIA:
 
     # ---------- menu actions ----------
     def activate_menu_action(self, action: str) -> None:
+        if action == "noop":
+            return
+
         if action == "quit":
             self.exit_requested = True
             return
@@ -3164,12 +4967,24 @@ class RetroWaveIA:
             self.open_action_palette()
             return
 
+        if action == "search_tools":
+            self.open_search_tools()
+            return
+
+        if action == "source_switch":
+            self.choose_search_source()
+            return
+
         if action == "help":
             self.toggle_help_overlay()
             return
 
         if action == "theme":
             self.cycle_theme()
+            return
+
+        if action == "audit":
+            self.show_audit_summary()
             return
 
         if action == "favs":
@@ -3189,6 +5004,7 @@ class RetroWaveIA:
 
         if action == "back":
             if self.mode == "FILES":
+                self.cancel_file_load()
                 self.save_current_file_view_state()
                 self.mode = "RESULTS"
                 self.focus = "LIST"
@@ -3211,7 +5027,56 @@ class RetroWaveIA:
                 if s is not None:
                     self.query_text = s
                     self.show_welcome = False
-                    self.do_search(reset_page=True)
+                    self.start_search_async(reset_page=True)
+                return
+            if action == "combined_search":
+                s = self.prompt("Combined IA + YouTube search: ", self.query_text, history=self.search_history)
+                if s is not None:
+                    if s.strip():
+                        self.start_combined_search_async(s.strip())
+                    else:
+                        self.status = "Combined search canceled."
+                return
+            if action == "youtube_search":
+                s = self.prompt("YouTube search: ", self.query_text, history=self.search_history)
+                if s is not None:
+                    if s.strip():
+                        self.start_youtube_search_async(s.strip())
+                    else:
+                        self.status = "YouTube search canceled."
+                return
+            if action == "youtube_url":
+                s = self.prompt("YouTube URL: ", "", history=self.search_history)
+                if s is not None:
+                    if s.strip():
+                        self.start_youtube_url_async(s.strip())
+                    else:
+                        self.status = "YouTube URL canceled."
+                return
+            if action == "search_preset":
+                preset_labels = [label for label, _key in archive_query_preset_labels()]
+                pick = self.prompt_list("Archive search preset", preset_labels)
+                if not pick:
+                    self.status = "Search preset canceled."
+                    return
+                preset = None
+                for label, key in archive_query_preset_labels():
+                    if label == pick:
+                        preset = key
+                        break
+                if not preset:
+                    self.status = "Search preset canceled."
+                    return
+                extra = self.prompt("Extra search text (blank for preset only): ", getattr(self, "query_text", ""))
+                if extra is None:
+                    self.status = "Search preset canceled."
+                    return
+                try:
+                    query = build_archive_preset_query(preset, extra or "", getattr(self, "title_only", False))
+                except ValueError as e:
+                    self.status = str(e)
+                    return
+                self.set_query_and_search(extra or preset, built_query=query)
                 return
             if action == "collection_search":
                 s = self.prompt("Find collections: ", "")
@@ -3271,28 +5136,31 @@ class RetroWaveIA:
                 if pick:
                     self.query_text = pick
                     self.show_welcome = False
-                    self.do_search(reset_page=True)
+                    self.start_search_async(reset_page=True)
                 return
             if action == "filter":
                 changed = self.choose_filter()
                 if changed and self.query_text:
-                    self.do_search(reset_page=True)
+                    self.start_search_async(reset_page=True)
                 return
             if action == "sort":
                 changed = self.choose_sort()
                 if changed and self.query_text:
-                    self.do_search(reset_page=True)
+                    self.start_search_async(reset_page=True)
                 return
             if action == "result_filter":
                 s = self.prompt("Local result filter (blank clears): ", self.result_filter)
                 if s is not None:
                     self.set_result_filter(s)
                 return
+            if action == "clear_result_filter":
+                self.clear_result_filter()
+                return
             if action == "title":
                 self.title_only = not self.title_only
                 self.status = "Search mode: title" if self.title_only else "Search mode: broad"
                 if self.query_text:
-                    self.do_search(reset_page=True)
+                    self.start_search_async(reset_page=True)
                 return
             if action == "next_page":
                 self.next_page()
@@ -3301,8 +5169,7 @@ class RetroWaveIA:
                 self.prev_page()
                 return
             if action == "open":
-                self.show_welcome = False
-                self.load_files()
+                self.open_selected_result()
                 return
             if action == "details":
                 selected = self.selected_result()
@@ -3329,6 +5196,11 @@ class RetroWaveIA:
 
             if action == "toggle_file_mark":
                 self.toggle_current_file_mark()
+                self.focus = "LIST"
+                return
+
+            if action == "mark_file_range":
+                self.mark_file_range()
                 self.focus = "LIST"
                 return
 
@@ -3519,6 +5391,15 @@ class RetroWaveIA:
         self.init_colors()
         curses.curs_set(0)
         self.stdscr.keypad(True)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            curses.mouseinterval(0)
+        except Exception:
+            pass
+        try:
+            self.stdscr.timeout(100)
+        except Exception:
+            pass
 
         if self.ia_present:
             self.status = f"Ready (ia: {self.ia_version}). Choose [Search]."
@@ -3526,9 +5407,6 @@ class RetroWaveIA:
             self.status = self.ia_version
 
         self._restore_session()
-        if self.query_text:
-            self.show_welcome = False
-            self.do_search(reset_page=False)
 
         pending = self._load_pending()
         if pending:
@@ -3538,8 +5416,14 @@ class RetroWaveIA:
             self.status = f"Pending: \"{ptitle}\" ({n_remaining} file(s) left) — press R to resume"
 
         while not self.exit_requested:
+            self.finish_search_load_if_ready()
+            self.finish_file_load_if_ready()
             self.render()
             ch = self.stdscr.getch()
+            if ch == -1:
+                continue
+            if ch == curses.KEY_MOUSE and self.handle_mouse_event():
+                continue
 
             if self.help_overlay:
                 if ch in (27, ord('?'), curses.KEY_BACKSPACE, 127, 8):
@@ -3567,6 +5451,9 @@ class RetroWaveIA:
                 self.toggle_help_overlay()
                 continue
 
+            if self.handle_download_complete_key(ch):
+                continue
+
             if ch in (ord('T'),):
                 self.cycle_theme()
                 continue
@@ -3586,7 +5473,7 @@ class RetroWaveIA:
                     if items:
                         self.menu_idx = min(len(items) - 1, self.menu_idx + 1)
                     continue
-                if ch in (10, 13, curses.KEY_ENTER):
+                if is_enter_key(ch):
                     if items and 0 <= self.menu_idx < len(items):
                         _label, action = items[self.menu_idx]
                         self.activate_menu_action(action)
@@ -3596,26 +5483,36 @@ class RetroWaveIA:
                 self.open_action_palette()
                 continue
 
+            if ch in (ord('y'), ord('Y')) and self.mode in ("RESULTS", "SEARCH", "FILES", "FAVS"):
+                self.show_audit_summary()
+                continue
+
             if ch in (ord('/'), ord('s'), ord('S')):
                 s = self.prompt("Search: ", self.query_text, history=self.search_history)
                 if s is not None:
                     self.query_text = s
                     self.show_welcome = False
-                    self.do_search(reset_page=True)
+                    self.start_search_async(reset_page=True)
                 continue
 
             if ch == ord('R') and self.mode not in ("DOWNLOADING", "PREVIEW_DL"):
-                self.resume_pending_download()
+                self.resume_or_retry_download()
                 continue
 
-            if ch == 27 and self.mode == "PREVIEW_DL":
-                self.mode = "FILES"
-                self.focus = "LIST"
-                self.status = "Canceled."
+            if ch == 27:
+                if bool(getattr(self, "_search_load_loading", False)):
+                    self.cancel_search_load()
+                    self.status = "Search canceled."
+                    continue
+                if self.mode == "PREVIEW_DL":
+                    self.mode = "FILES"
+                    self.focus = "LIST"
+                    self.status = "Canceled."
                 continue
 
             if ch in (curses.KEY_BACKSPACE, 127, 8):
                 if self.mode == "FILES":
+                    self.cancel_file_load()
                     self.save_current_file_view_state()
                     self.mode = "RESULTS"
                     self.focus = "LIST"
@@ -3652,17 +5549,13 @@ class RetroWaveIA:
                     if ch in (ord('G'), curses.KEY_END) and visible_results:
                         self.sel_r = len(visible_results) - 1
                         continue
-                    if ch in (ord('l'), ord('L')) and self.results:
-                        s = self.prompt("Local result filter (blank clears): ", self.result_filter)
-                        if s is not None:
-                            self.set_result_filter(s)
+                    if self.handle_results_hotkey(ch):
                         continue
                     if ch == ord('r'):
                         self.activate_menu_action("details")
                         continue
-                    if ch in (ord('o'), ord('O')):
-                        self.show_welcome = False
-                        self.load_files()
+                    if ch in (ord('o'), ord('O')) or is_enter_key(ch):
+                        self.open_selected_result()
                         continue
                     if ord('0') <= ch <= ord('9') and self.results:
                         first = chr(ch)
@@ -3671,10 +5564,6 @@ class RetroWaveIA:
                             self.jump_to_result_number(int(val.strip()))
                         else:
                             self.status = "Canceled."
-                        continue
-                    if ch in (10, 13, curses.KEY_ENTER):
-                        self.show_welcome = False
-                        self.load_files()
                         continue
                     if ch in (ord('n'), ord(']'), curses.KEY_NPAGE):
                         self.next_page()
@@ -3689,7 +5578,7 @@ class RetroWaveIA:
                             target = int(val.strip())
                             if 1 <= target <= total_pages:
                                 self.page = target
-                                self.do_search(reset_page=False)
+                                self.start_search_async(reset_page=False)
                             else:
                                 self.status = f"Page must be 1-{total_pages}."
                         continue
@@ -3708,7 +5597,7 @@ class RetroWaveIA:
                     if ch in (ord('G'), curses.KEY_END) and visible:
                         self.sel_f = len(visible) - 1
                         continue
-                    if ch in (10, 13, curses.KEY_ENTER):
+                    if is_enter_key(ch):
                         self.set_preview_for_selected()
                         continue
 
@@ -3732,7 +5621,7 @@ class RetroWaveIA:
                     if ch in (ord('G'), curses.KEY_END) and favs_len:
                         self.favs_idx = favs_len - 1
                         continue
-                    if ch in (10, 13, curses.KEY_ENTER):
+                    if is_enter_key(ch):
                         self.activate_menu_action("primary")
                         continue
 
@@ -3755,10 +5644,37 @@ def cli_main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Check required commands and writable app directories without launching curses.",
     )
+    parser.add_argument(
+        "--scan-dvd-iso",
+        metavar="PATH",
+        help="Scan a staged DVD ISO with lsdvd and HandBrakeCLI, then write logs next to the ISO.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview supported non-curses actions without writing scan logs or moving files.",
+    )
     args = parser.parse_args(argv)
 
     if args.check:
         return print_environment_check()
+    if args.scan_dvd_iso:
+        iso_path = os.path.abspath(os.path.expanduser(args.scan_dvd_iso))
+        result = ia_dvd.scan_dvd_iso(iso_path, dry_run=args.dry_run)
+        print(f"ISO: {result.iso_path}")
+        print(f"Logs: {result.logs_dir}")
+        print(f"Layout: {result.layout}")
+        print(f"Reason: {result.reason}")
+        if result.dry_run:
+            print("Dry run: no scan commands were executed and no files were written.")
+        else:
+            print(f"lsdvd: {result.lsdvd_log}")
+            print(f"HandBrakeCLI: {result.handbrake_log}")
+            print(f"Analysis: {result.analysis_path}")
+            if result.errors:
+                for err in result.errors:
+                    print(f"Warning: {err}")
+        return 0 if result.ok else 1
 
     curses.wrapper(main)
     return 0

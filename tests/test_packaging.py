@@ -10,6 +10,7 @@ def test_console_script_targets_are_importable_callables():
     scripts = data["project"]["scripts"]
 
     assert scripts == {
+        "ia-audit": "ia_audit:main",
         "ia-config": "ia_config_cli:main",
         "ia-dl": "ia_dl:main",
         "ia-easy": "ia_easy:cli_main",
@@ -29,15 +30,20 @@ def test_packaging_includes_all_flat_modules():
     modules = set(data["tool"]["setuptools"]["py-modules"])
 
     assert {
+        "ia_audit",
         "ia_api",
         "ia_config",
         "ia_config_cli",
         "ia_common",
         "ia_dl",
         "ia_downloads",
+        "ia_dvd",
         "ia_easy",
         "ia_minotaur",
+        "ia_minotaur_events",
         "ia_organize",
         "ia_paths",
         "ia_state",
+        "yt_api",
+        "yt_downloads",
     } <= modules

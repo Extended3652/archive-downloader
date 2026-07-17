@@ -62,6 +62,18 @@ if [ "$1" = "--version" ]; then
   echo "curl 9.9.9"
   exit 0
 fi
+case "$*" in
+  *archive.org/metadata/*)
+    cat <<'JSON'
+{"files":[
+  {"name":"small.txt","size":"3","format":"Text"},
+  {"name":"big.mp4","size":"200","format":"MPEG4"},
+  {"name":"small.mp4","size":"10","format":"MPEG4"}
+]}
+JSON
+    exit 0
+    ;;
+esac
 cat <<'JSON'
 {"response":{"numFound":1,"docs":[{"identifier":"curl_item","title":"Curl Item","year":"1930","mediatype":"movies","downloads":1200,"licenseurl":"https://creativecommons.org/licenses/by/4.0/"}]}}
 JSON
@@ -69,6 +81,24 @@ exit 0
 """,
     )
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def install_fake_yt_dlp(tmp_path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake_yt = bindir / "yt-dlp"
+    write_executable(
+        fake_yt,
+        """#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "2026.06.09"
+  exit 0
+fi
+echo "unexpected yt-dlp args: $*" >&2
+exit 2
+""",
+    )
+    return fake_yt
 
 
 def test_ia_dl_search_uses_fake_curl_on_path(tmp_path, monkeypatch, capsys):
@@ -83,6 +113,7 @@ def test_ia_dl_search_uses_fake_curl_on_path(tmp_path, monkeypatch, capsys):
 
 def test_ia_dl_list_uses_fake_metadata_command(tmp_path, monkeypatch, capsys):
     install_fake_ia(tmp_path, monkeypatch)
+    install_fake_curl(tmp_path, monkeypatch)
 
     rc = ia_dl.main(["list", "movie_one", "--ext", "mp4"])
 
@@ -95,6 +126,10 @@ def test_ia_dl_list_uses_fake_metadata_command(tmp_path, monkeypatch, capsys):
 
 def test_ia_dl_download_biggest_invokes_fake_download(tmp_path, monkeypatch, capsys):
     args_path = install_fake_ia(tmp_path, monkeypatch)
+    install_fake_curl(tmp_path, monkeypatch)
+    monkeypatch.setattr(ia_dl, "emit_archive_started", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(ia_dl, "emit_archive_completed", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(ia_dl, "emit_archive_failed", lambda *_args, **_kwargs: False)
     dest = tmp_path / "downloads"
 
     rc = ia_dl.main(["download", "movie_one", "--ext", "mp4", "--biggest", "--dest", str(dest)])
@@ -115,6 +150,10 @@ def test_ia_dl_download_biggest_invokes_fake_download(tmp_path, monkeypatch, cap
 def test_minotaur_check_uses_fake_ia_and_curl(tmp_path, monkeypatch, capsys):
     install_fake_ia(tmp_path, monkeypatch)
     install_fake_curl(tmp_path, monkeypatch)
+    fake_yt = install_fake_yt_dlp(tmp_path)
+    cfg = dict(ia_minotaur.APP_CONFIG)
+    cfg["yt_dlp_path"] = str(fake_yt)
+    monkeypatch.setattr(ia_minotaur, "APP_CONFIG", cfg)
     root = tmp_path / "media"
     monkeypatch.setattr(ia_minotaur, "MEDIA_ROOT", str(root))
     monkeypatch.setattr(ia_minotaur, "STAGING_ROOT", str(root / ".ia_staging"))
@@ -134,3 +173,5 @@ def test_minotaur_check_uses_fake_ia_and_curl(tmp_path, monkeypatch, capsys):
     assert "ia 9.9.9" in captured.out
     assert "OK    curl" in captured.out
     assert "curl 9.9.9" in captured.out
+    assert "OK    yt-dlp" in captured.out
+    assert "2026.06.09" in captured.out

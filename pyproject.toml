@@ -18,6 +18,7 @@ dev = [
 ]
 
 [project.scripts]
+ia-audit = "ia_audit:main"
 ia-dl = "ia_dl:main"
 ia-easy = "ia_easy:cli_main"
 ia-minotaur = "ia_minotaur:cli_main"
@@ -25,15 +26,20 @@ ia-config = "ia_config_cli:main"
 
 [tool.setuptools]
 py-modules = [
+  "ia_audit",
   "ia_api",
   "ia_config",
   "ia_config_cli",
   "ia_common",
   "ia_dl",
   "ia_downloads",
+  "ia_dvd",
   "ia_easy",
   "ia_minotaur",
+  "ia_minotaur_events",
   "ia_organize",
   "ia_paths",
   "ia_state",
+  "yt_api",
+  "yt_downloads",
 ]
