@@ -2,6 +2,7 @@
 import pytest
 
 import ia_dl
+import ia_minotaur_events
 from ia_common import IACommandError, IAFile, SearchResult
 
 
@@ -41,12 +42,23 @@ def test_search_result_line_includes_rich_metadata():
             "Item One",
             year="1930",
             mediatype="movies",
+            formats="Archive BitTorrent, MPEG4",
             downloads=1250,
             licenseurl="https://creativecommons.org/licenses/by/4.0/",
         )
     )
 
-    assert line == "item1\tItem One (1930)\tmovies | 1.2K dl | lic:open"
+    assert line == "item1\tItem One (1930)\tmovies | 1.2K dl | torrent | lic:open"
+
+
+def test_biggest_file_prefers_real_media_over_metadata():
+    files = [
+        IAFile("item.xml", 5000, "XML"),
+        IAFile("movie.mp4", 1000, "MPEG4"),
+        IAFile("preview.jpg", 9000, "JPEG"),
+    ]
+
+    assert ia_dl.biggest_file(files).name == "movie.mp4"
 
 
 def test_ia_list_files_reuses_shared_api(monkeypatch):
@@ -138,3 +150,98 @@ def test_main_search_builds_query_and_prints_results(monkeypatch, capsys):
         )
     ]
     assert "metropolis\tMetropolis (1927)\tmovies" in captured.out
+
+
+def test_main_search_supports_archive_presets(monkeypatch, capsys):
+    calls = []
+
+    def fake_search(query, rows, page=1, sort=""):
+        calls.append((query, rows, page, sort))
+        return [SearchResult("item1", "Item One")]
+
+    monkeypatch.setattr(ia_dl, "ia_search", fake_search)
+
+    rc = ia_dl.main(["search", "Chaplin", "--preset", "public_domain_movies", "--rows", "2"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert calls[0][0].startswith("(mediatype:movies AND")
+    assert "title:(\"Chaplin\")" in calls[0][0]
+    assert "item1\tItem One" in captured.out
+
+
+def test_minotaur_event_failure_does_not_crash():
+    def failing_runner(*_args, **_kwargs):
+        raise OSError("minotaur unavailable")
+
+    ok = ia_minotaur_events.emit_minotaur_event(
+        "archive.started",
+        "Archive started",
+        "safe test",
+        wrapper_path="/mnt/ssd/home-pi/projects/minotaur_core/scripts/minotaur-event",
+        runner=failing_runner,
+    )
+
+    assert ok is False
+
+
+def test_minotaur_event_uses_env_wrapper(monkeypatch, tmp_path):
+    wrapper = tmp_path / "minotaur-event"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    calls = []
+
+    def fake_runner(cmd, **_kwargs):
+        calls.append(cmd)
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setenv("MINOTAUR_EVENT_WRAPPER", str(wrapper))
+
+    ok = ia_minotaur_events.emit_minotaur_event(
+        "archive.started",
+        "Archive started",
+        "safe test",
+        runner=fake_runner,
+    )
+
+    assert ok is True
+    assert calls[0][0] == str(wrapper)
+
+
+def test_ia_download_emits_started_and_completed(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(ia_dl, "emit_archive_started", lambda message: calls.append(("started", message)))
+    monkeypatch.setattr(ia_dl, "emit_archive_completed", lambda message: calls.append(("completed", message)))
+    monkeypatch.setattr(ia_dl, "emit_archive_failed", lambda message: calls.append(("failed", message)))
+    monkeypatch.setattr(ia_dl, "run", lambda _cmd, check=True: None)
+
+    ia_dl.ia_download("item1", str(tmp_path), None, "movie.mp4")
+
+    assert calls == [
+        ("started", "item1 movie.mp4"),
+        ("completed", str(tmp_path / "item1" / "movie.mp4")),
+    ]
+
+
+def test_ia_download_emits_failure_without_swallowing_exception(monkeypatch, tmp_path):
+    calls = []
+
+    def fail_run(_cmd, check=True):
+        raise RuntimeError("download exploded")
+
+    monkeypatch.setattr(ia_dl, "emit_archive_started", lambda message: calls.append(("started", message)))
+    monkeypatch.setattr(ia_dl, "emit_archive_completed", lambda message: calls.append(("completed", message)))
+    monkeypatch.setattr(ia_dl, "emit_archive_failed", lambda message: calls.append(("failed", message)))
+    monkeypatch.setattr(ia_dl, "run", fail_run)
+
+    with pytest.raises(RuntimeError):
+        ia_dl.ia_download("item1", str(tmp_path), None, "movie.mp4")
+
+    assert calls[0] == ("started", "item1 movie.mp4")
+    assert calls[1][0] == "failed"
+    assert "download exploded" in calls[1][1]

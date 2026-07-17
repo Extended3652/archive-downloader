@@ -5,9 +5,10 @@ import re
 import sys
 from typing import List, Optional
 
-from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, compact_count, default_media_root, human_size, run
+from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, compact_count, default_media_root, human_size, is_archive_torrent_format, is_video_file, run
 import ia_api
-from ia_organize import build_query, license_status_from_fields
+from ia_minotaur_events import emit_archive_completed, emit_archive_failed, emit_archive_started, safe_text
+from ia_organize import archive_query_preset_labels, build_archive_preset_query, build_query, license_status_from_fields
 
 
 class BadFileRegex(ValueError):
@@ -37,6 +38,8 @@ def search_result_line(r: SearchResult) -> str:
         bits.append(r.mediatype)
     if r.downloads:
         bits.append(f"{compact_count(r.downloads)} dl")
+    if r.formats and is_archive_torrent_format(r.formats):
+        bits.append("torrent")
     status, _why = license_status_from_fields(r.licenseurl, r.rights)
     if status != "unknown":
         bits.append(f"lic:{status}")
@@ -114,7 +117,33 @@ def choose_file(files: List[IAFile]) -> Optional[IAFile]:
 def biggest_file(files: List[IAFile]) -> Optional[IAFile]:
     if not files:
         return None
-    return sorted(files, key=lambda f: f.size or 0, reverse=True)[0]
+
+    def file_rank(f: IAFile) -> tuple:
+        name = (f.name or "").lower()
+        fmt = (f.fmt or "").lower()
+        ext = os.path.splitext(name)[1]
+
+        garbage_hits = (
+            ext in {".xml", ".json", ".txt", ".nfo", ".sql", ".sqlite", ".db", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".torrent"}
+            or "thumb" in name
+            or "preview" in name
+            or "metadata" in name
+            or "manifest" in name
+            or "derivative" in name
+        )
+        if is_video_file(name, fmt):
+            media_score = 4
+        elif ext in {".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac"}:
+            media_score = 3
+        elif ext in {".iso"}:
+            media_score = 2
+        elif garbage_hits:
+            media_score = -2
+        else:
+            media_score = 0
+        return (media_score, int(f.size or 0))
+
+    return sorted(files, key=file_rank, reverse=True)[0]
 
 def ia_download(identifier: str, dest: str, glob_pat: Optional[str], exact_file: Optional[str]) -> None:
     os.makedirs(dest, exist_ok=True)
@@ -126,8 +155,16 @@ def ia_download(identifier: str, dest: str, glob_pat: Optional[str], exact_file:
         cmd += ["--glob", glob_pat]
 
     print("Running:", " ".join(cmd))
-    run(cmd, check=True)
+    target = exact_file or glob_pat or identifier
+    emit_archive_started(f"{identifier} {target}")
+    try:
+        run(cmd, check=True)
+    except Exception as exc:
+        emit_archive_failed(f"{identifier} {target}: {safe_text(exc, 180)}")
+        raise
     print("Done.")
+    output = os.path.join(dest, identifier, exact_file) if exact_file else os.path.join(dest, identifier)
+    emit_archive_completed(output)
 
 def positive_int(s: str) -> int:
     v = int(s)
@@ -143,7 +180,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("search", help="Search items and print results.")
-    sp.add_argument("query", help='Search query. Example: \'title:"Test Copy" AND mediatype:movies\'')
+    sp.add_argument("query", nargs="?", default="", help='Search query or extra text for a preset. Example: \'title:"Test Copy" AND mediatype:movies\'')
     sp.add_argument("--rows", type=positive_int, default=20, help="Max results (default 20).")
     sp.add_argument("--page", type=positive_int, default=1, help="Search results page (default 1).")
     sp.add_argument(
@@ -158,6 +195,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         choices=["relevance", "date-desc", "date-asc", "title", "downloads"],
         default="relevance",
         help="Sort order (default relevance).",
+    )
+    sp.add_argument(
+        "--preset",
+        choices=[key for _label, key in archive_query_preset_labels()],
+        help="Archive search preset that targets common hidden-media collections.",
     )
 
     lp = sub.add_parser("list", help="List files for an item identifier.")
@@ -187,7 +229,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             "title": "titleSorter asc",
             "downloads": "downloads desc",
         }
-        q = build_query(sanitize_query(args.query), args.filter, args.title_only)
+        query_text = sanitize_query(args.query or "")
+        if getattr(args, "preset", None):
+            q = build_archive_preset_query(args.preset, query_text, args.title_only)
+        elif not query_text:
+            print("No query or preset provided.", file=sys.stderr)
+            return 2
+        else:
+            q = build_query(query_text, args.filter, args.title_only)
         results = ia_search(q, args.rows, page=args.page, sort=sort_map[args.sort])
         if not results:
             print("No results.")

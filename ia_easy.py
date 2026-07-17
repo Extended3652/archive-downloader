@@ -16,6 +16,7 @@ from ia_common import (
     is_video_file,
     run,
 )
+from ia_minotaur_events import emit_archive_completed, emit_archive_failed, emit_archive_started, safe_text
 
 def prompt(msg: str) -> str:
     return input(msg).strip()
@@ -91,9 +92,16 @@ def download_file(identifier: str, filename: str, dest: str) -> None:
     cmd = ["ia", "download", identifier, "--destdir", dest, "--files", filename]
     print("\nDownloading:")
     print("  " + " ".join(cmd))
-    run(cmd, check=True)
+    emit_archive_started(f"{identifier} {filename}")
+    try:
+        run(cmd, check=True)
+    except Exception as exc:
+        emit_archive_failed(f"{identifier} {filename}: {safe_text(exc, 180)}")
+        raise
     print("\nDone.")
-    print(f"Saved to: {os.path.join(dest, identifier, filename)}")
+    output = os.path.join(dest, identifier, filename)
+    print(f"Saved to: {output}")
+    emit_archive_completed(output)
 
 def main() -> int:
     print("\nInternet Archive Downloader (easy mode)")
