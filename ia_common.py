@@ -20,12 +20,19 @@ class SearchResult:
     creator: str = ""
     description: str = ""
     mediatype: str = ""
+    formats: str = ""
     downloads: int = 0
     date: str = ""
     publicdate: str = ""
     collection: str = ""
     licenseurl: str = ""
     rights: str = ""
+    source: str = "ia"
+    webpage_url: str = ""
+    video_id: str = ""
+    uploader: str = ""
+    duration: int = 0
+    upload_date: str = ""
 
 
 @dataclass
@@ -37,7 +44,8 @@ class IAFile:
 
 # ---- shared constants ----
 DEFAULT_MEDIA_ROOT = ia_config.DEFAULT_MEDIA_ROOT
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+DVD_IMAGE_EXTS = {".iso"}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"} | DVD_IMAGE_EXTS
 VIDEO_FORMAT_HINTS = (
     "h.264",
     "h264",
@@ -47,6 +55,11 @@ VIDEO_FORMAT_HINTS = (
     "webm",
     "quicktime",
     "avi",
+)
+TORRENT_FORMAT_HINTS = (
+    "archive bittorrent",
+    "bittorrent",
+    "torrent",
 )
 
 
@@ -138,6 +151,22 @@ def is_video_file(name: str, fmt: str = "") -> bool:
         return True
     fmt_l = (fmt or "").lower()
     return any(h in fmt_l for h in VIDEO_FORMAT_HINTS)
+
+
+def is_dvd_iso_file(name: str, fmt: str = "") -> bool:
+    """Return True if a filename or IA format string looks like a DVD ISO image."""
+    ext = os.path.splitext((name or "").lower())[1]
+    if ext in DVD_IMAGE_EXTS:
+        return True
+    fmt_l = (fmt or "").lower()
+    name_l = (name or "").lower()
+    return "dvd" in fmt_l and ("iso" in fmt_l or name_l.endswith(".iso"))
+
+
+def is_archive_torrent_format(fmt: str) -> bool:
+    """Return True if an IA format string indicates torrent availability."""
+    fmt_l = (fmt or "").lower()
+    return any(hint in fmt_l for hint in TORRENT_FORMAT_HINTS)
 
 
 def safe_path_under(root: str, candidate: str) -> bool:

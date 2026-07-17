@@ -20,6 +20,7 @@ def test_load_config_defaults_when_missing_or_corrupt(tmp_path):
 
     assert ia_config.load_config(str(missing), environ={}) == ia_config.DEFAULT_CONFIG
     assert ia_config.load_config(str(corrupt), environ={}) == ia_config.DEFAULT_CONFIG
+    assert ia_config.DEFAULT_CONFIG["default_bucket"] == "Movies"
 
 
 def test_load_config_normalizes_valid_file(tmp_path):
@@ -28,6 +29,7 @@ def test_load_config_normalizes_valid_file(tmp_path):
         json.dumps(
             {
                 "media_root": "~/MediaRoot",
+                "yt_dlp_path": "~/bin/yt-dlp",
                 "default_bucket": "music",
                 "default_filter": "audio",
                 "default_sort": "downloads desc",
@@ -43,6 +45,7 @@ def test_load_config_normalizes_valid_file(tmp_path):
     cfg = ia_config.load_config(str(path), environ={})
 
     assert cfg["media_root"] == os.path.expanduser("~/MediaRoot")
+    assert cfg["yt_dlp_path"] == os.path.expanduser("~/bin/yt-dlp")
     assert cfg["default_bucket"] == "Music"
     assert cfg["default_filter"] == "audio"
     assert cfg["default_sort"] == "downloads desc"

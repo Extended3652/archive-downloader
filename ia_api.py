@@ -3,10 +3,15 @@ import json
 import re
 import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 from ia_common import IAFile, SearchResult
 
 Logger = Callable[[str], None]
+SEARCH_TIMEOUT_S = 20
+SEARCH_CURL_CONNECT_TIMEOUT_S = 8
+METADATA_TIMEOUT_S = 8
+METADATA_CURL_CONNECT_TIMEOUT_S = 4
 
 
 def run_cmd(cmd: List[str], timeout: int = 60, logger: Optional[Logger] = None) -> Tuple[int, str, str]:
@@ -60,6 +65,10 @@ def ia_search_via_curl(
         "curl",
         "-sS",
         "-G",
+        "--connect-timeout",
+        str(SEARCH_CURL_CONNECT_TIMEOUT_S),
+        "--max-time",
+        str(SEARCH_TIMEOUT_S),
         "https://archive.org/advancedsearch.php",
         "--data-urlencode",
         f"q={query}",
@@ -84,6 +93,8 @@ def ia_search_via_curl(
         "--data-urlencode",
         "fl[]=collection",
         "--data-urlencode",
+        "fl[]=format",
+        "--data-urlencode",
         "fl[]=licenseurl",
         "--data-urlencode",
         "fl[]=rights",
@@ -97,7 +108,7 @@ def ia_search_via_curl(
     if sort:
         cmd += ["--data-urlencode", f"sort[]={sort}"]
 
-    code, out, err = runner(cmd, timeout=60)
+    code, out, err = runner(cmd, timeout=SEARCH_TIMEOUT_S)
     if code != 0:
         msg = (err or out).strip()
         return [], 0, msg or f"search failed (code {code})"
@@ -130,6 +141,11 @@ def ia_search_via_curl(
         collection_raw = d.get("collection", "")
         if isinstance(collection_raw, list):
             collection_raw = ", ".join(str(x) for x in collection_raw[:3])
+        formats_raw = d.get("format", [])
+        if isinstance(formats_raw, list):
+            formats = ", ".join(str(x) for x in formats_raw[:8] if str(x).strip())
+        else:
+            formats = str(formats_raw or "").strip()
         results.append(
             SearchResult(
                 ident,
@@ -138,6 +154,7 @@ def ia_search_via_curl(
                 creator,
                 desc,
                 mediatype=str(d.get("mediatype", "") or "").strip(),
+                formats=formats,
                 downloads=downloads,
                 date=str(d.get("date", "") or "").strip(),
                 publicdate=str(d.get("publicdate", "") or "").strip(),
@@ -150,14 +167,7 @@ def ia_search_via_curl(
     return results, num_found, ""
 
 
-def ia_metadata_json(
-    identifier: str,
-    runner: Callable[..., Tuple[int, str, str]] = run_cmd,
-) -> Tuple[Optional[Dict[str, Any]], str]:
-    code, out, err = runner(["ia", "metadata", identifier], timeout=60)
-    if code != 0:
-        msg = (err or out).strip()
-        return None, msg or f"metadata failed (code {code})"
+def _parse_metadata_json(out: str) -> Tuple[Optional[Dict[str, Any]], str]:
     try:
         return json.loads(out), ""
     except json.JSONDecodeError:
@@ -168,6 +178,54 @@ def ia_metadata_json(
             except Exception:
                 pass
         return None, "metadata returned non-JSON"
+
+
+def ia_metadata_json(
+    identifier: str,
+    runner: Callable[..., Tuple[int, str, str]] = run_cmd,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    ident = str(identifier or "").strip()
+    if not ident:
+        return None, "metadata identifier is blank"
+
+    curl_err = ""
+    try:
+        code, out, err = runner(
+            [
+                "curl",
+                "-sS",
+                "--fail",
+                "--connect-timeout",
+                str(METADATA_CURL_CONNECT_TIMEOUT_S),
+                "--max-time",
+                str(METADATA_TIMEOUT_S),
+                f"https://archive.org/metadata/{quote(ident, safe='')}",
+            ],
+            timeout=METADATA_TIMEOUT_S + 2,
+        )
+    except Exception as exc:
+        code, out, err = 127, "", str(exc)
+        curl_err = err.strip()
+
+    if code == 0:
+        return _parse_metadata_json(out)
+
+    msg = (err or out).strip()
+    curl_missing = code == 127 or "command not found" in msg.lower()
+    if not curl_missing:
+        return None, msg or f"metadata failed (code {code})"
+
+    try:
+        code, out, err = runner(["ia", "metadata", ident], timeout=METADATA_TIMEOUT_S)
+    except Exception as exc:
+        msg = str(exc).strip()
+        return None, msg or curl_err or "metadata failed"
+    if code == 0:
+        return _parse_metadata_json(out)
+    if code != 0:
+        msg = (err or out).strip()
+        return None, msg or curl_err or f"metadata failed (code {code})"
+    return None, curl_err or "metadata failed"
 
 
 def ia_files(

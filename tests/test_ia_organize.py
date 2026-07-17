@@ -1,18 +1,24 @@
 """Tests for pure organizing, query, and license helpers."""
 from ia_organize import (
+    ARCHIVE_QUERY_PRESETS,
     auto_clean_movie_folder_name,
+    archive_query_preset_labels,
+    build_archive_preset_query,
     build_collection_search_query,
     build_field_query,
     build_fielded_query,
     build_query,
     build_query_attempts,
+    build_sideways_searches,
     build_within_collection_query,
     detect_sxxeyy,
+    infer_bucket,
     is_openly_licensed,
     license_status_from_fields,
     looks_like_identifier,
     looks_like_advanced_query,
     normalize_collection_identifier,
+    replace_mediatype_filter,
     sanitize_folder,
     split_title_year,
 )
@@ -99,6 +105,32 @@ class TestAutoCleanMovieFolderName:
             == "Inception (2010)"
         )
 
+    def test_title_uses_year_from_filename_when_missing(self):
+        assert (
+            auto_clean_movie_folder_name("You Only Live Twice", "You.Only.Live.Twice.1967.mp4")
+            == "You Only Live Twice (1967)"
+        )
+
+
+class TestInferBucket:
+    def test_episode_pattern_prefers_tv(self):
+        assert infer_bucket("Show.S01E05.mkv", "", default_bucket="Movies") == ("TV", "episode pattern")
+
+    def test_audio_mediatype_prefers_music(self):
+        assert infer_bucket("track.mp3", "A Podcast", mediatype="audio", default_bucket="Movies") == ("Music", "audio mediatype")
+
+    def test_movie_mediatype_prefers_movies(self):
+        assert infer_bucket("file.bin", "Unknown", mediatype="movies", default_bucket="Other") == ("Movies", "movie mediatype")
+
+    def test_year_hint_prefers_movies(self):
+        assert infer_bucket("Movie.1999.avi", "", default_bucket="Other") == ("Movies", "year hint")
+
+    def test_large_video_prefers_movies(self):
+        assert infer_bucket("capture.mp4", "", is_single_large_video=True, default_bucket="Other") == ("Movies", "single large video")
+
+    def test_ambiguous_item_uses_default_not_sticky_tv(self):
+        assert infer_bucket("readme.bin", "Loose File", default_bucket="Movies") == ("Movies", "default")
+
 
 # ---------------------------------------------------------------- build_query
 class TestBuildQuery:
@@ -117,6 +149,17 @@ class TestBuildQuery:
     def test_advanced_syntax_passthrough(self):
         q = 'title:"foo" AND mediatype:audio'
         assert build_query(q, "movies", True) == q
+
+    def test_replace_mediatype_filter_updates_advanced_query(self):
+        q = 'title:"foo" AND mediatype:audio'
+        assert replace_mediatype_filter(q, "movies") == 'title:"foo" AND mediatype:movies'
+
+    def test_replace_mediatype_filter_removes_clause_for_any(self):
+        q = 'title:"foo" AND mediatype:audio'
+        assert replace_mediatype_filter(q, "any") == 'title:"foo"'
+
+    def test_wildcard_terms_are_not_quoted(self):
+        assert build_query("prel*", "any", False) == "(title:prel* OR prel*)"
 
     def test_creator_advanced_syntax_passthrough(self):
         q = "creator:(Chaplin)"
@@ -159,7 +202,7 @@ class TestBuildQuery:
     def test_identifier_like_query_gets_identifier_attempt_first(self):
         attempts = build_query_attempts("prelinger-123", "movies", False)
 
-        assert attempts[0] == ("identifier", "identifier:prelinger-123")
+        assert attempts[0] == ("identifier", "identifier:prelinger-123 AND mediatype:movies")
         assert any(label == "fields" for label, _query in attempts)
 
     def test_fielded_query_searches_ia_metadata_fields(self):
@@ -181,6 +224,34 @@ class TestBuildQuery:
 
     def test_field_query_uses_selected_field(self):
         assert build_field_query("creator", "Charlie Chaplin", "movies") == 'creator:("Charlie Chaplin") AND mediatype:movies'
+
+    def test_archive_preset_query_combines_with_extra_text(self):
+        q = build_archive_preset_query("public_domain_movies", "Chaplin", False)
+        assert q.startswith("(mediatype:movies AND")
+        assert 'title:("Chaplin")' in q
+
+    def test_archive_preset_labels_match_mapping(self):
+        labels = archive_query_preset_labels()
+        assert labels[0] == ("Classic TV", "classic_tv")
+        assert all(key in ARCHIVE_QUERY_PRESETS for _label, key in labels)
+
+    def test_sideways_searches_use_metadata_fields(self):
+        searches = build_sideways_searches(
+            {
+                "metadata": {
+                    "identifier": "item1",
+                    "creator": "Charlie Chaplin",
+                    "collection": "feature_films, public_domain",
+                    "subject": ["silent film"],
+                }
+            },
+            "movies",
+        )
+
+        labels = [label for label, _query in searches]
+        assert any(label.startswith("Same creator:") for label in labels)
+        assert any("feature_films" in label for label in labels)
+        assert any(label.startswith("Same subject:") for label in labels)
 
 
 class TestQueryHelpers:

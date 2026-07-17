@@ -45,6 +45,7 @@ def test_search_parses_docs_and_skips_missing_identifier():
                     "date": "1999-01-01",
                     "publicdate": "2005-01-01",
                     "collection": ["feature_films", "public_domain"],
+                    "format": ["Archive BitTorrent", "MPEG4"],
                     "licenseurl": "https://creativecommons.org/licenses/by/4.0/",
                     "rights": "CC-BY",
                 },
@@ -66,15 +67,20 @@ def test_search_parses_docs_and_skips_missing_identifier():
     assert results[0].date == "1999-01-01"
     assert results[0].publicdate == "2005-01-01"
     assert results[0].collection == "feature_films, public_domain"
+    assert results[0].formats == "Archive BitTorrent, MPEG4"
     assert results[0].licenseurl.startswith("https://creativecommons.org/")
     assert results[0].rights == "CC-BY"
     assert results[1].title == "(no title)"
     assert len(results[1].description) == 500
     cmd, timeout = runner.calls[0]
-    assert timeout == 60
+    assert timeout == ia_api.SEARCH_TIMEOUT_S
+    assert "--connect-timeout" in cmd
+    assert str(ia_api.SEARCH_CURL_CONNECT_TIMEOUT_S) in cmd
+    assert "--max-time" in cmd
     assert "sort[]=downloads desc" in cmd
     for field in ("fl[]=mediatype", "fl[]=downloads", "fl[]=licenseurl", "fl[]=rights"):
         assert field in cmd
+    assert "fl[]=format" in cmd
 
 
 def test_search_handles_curl_failure_and_non_json():
@@ -91,6 +97,73 @@ def test_metadata_parses_clean_and_trailing_json():
 
     assert ia_api.ia_metadata_json("id", runner=clean) == ({"metadata": {"title": "A"}}, "")
     assert ia_api.ia_metadata_json("id", runner=noisy) == ({"metadata": {"title": "B"}}, "")
+    cmd, timeout = clean.calls[0]
+    assert cmd[0] == "curl"
+    assert cmd[-1] == "https://archive.org/metadata/id"
+    assert timeout == ia_api.METADATA_TIMEOUT_S + 2
+
+
+def test_metadata_falls_back_to_ia_when_curl_is_missing():
+    calls = []
+
+    def runner(cmd, timeout=60):
+        calls.append((cmd, timeout))
+        if cmd[0] == "curl":
+            return 127, "", "command not found"
+        return 0, '{"metadata": {"title": "A"}}', ""
+
+    assert ia_api.ia_metadata_json("id with spaces", runner=runner)[1] == ""
+    assert calls[0][0] == [
+        "curl",
+        "-sS",
+        "--fail",
+        "--connect-timeout",
+        str(ia_api.METADATA_CURL_CONNECT_TIMEOUT_S),
+        "--max-time",
+        str(ia_api.METADATA_TIMEOUT_S),
+        "https://archive.org/metadata/id%20with%20spaces",
+    ]
+    assert calls[0][1] == ia_api.METADATA_TIMEOUT_S + 2
+    assert calls[1] == (["ia", "metadata", "id with spaces"], ia_api.METADATA_TIMEOUT_S)
+
+
+def test_metadata_uses_curl_without_calling_ia():
+    calls = []
+
+    def runner(cmd, timeout=60):
+        calls.append((cmd, timeout))
+        if cmd[0] == "ia":
+            raise AssertionError("ia metadata should not be called when curl succeeds")
+        return 0, '{"metadata": {"title": "A"}}', ""
+
+    assert ia_api.ia_metadata_json("id", runner=runner) == ({"metadata": {"title": "A"}}, "")
+    assert [call[0][0] for call in calls] == ["curl"]
+
+
+def test_metadata_curl_timeout_does_not_fall_back_to_ia():
+    calls = []
+
+    def runner(cmd, timeout=60):
+        calls.append((cmd, timeout))
+        if cmd[0] == "ia":
+            raise AssertionError("ia metadata should not be called after curl timeout")
+        return 28, "", "curl: (28) Operation timed out"
+
+    assert ia_api.ia_metadata_json("id", runner=runner) == (None, "curl: (28) Operation timed out")
+    assert [call[0][0] for call in calls] == ["curl"]
+
+
+def test_metadata_reports_ia_exception_after_curl_is_missing():
+    calls = []
+
+    def runner(cmd, timeout=60):
+        calls.append((cmd, timeout))
+        if cmd[0] == "curl":
+            return 127, "", "command not found"
+        raise RuntimeError("ia client timed out")
+
+    assert ia_api.ia_metadata_json("id", runner=runner) == (None, "ia client timed out")
+    assert [call[0][0] for call in calls] == ["curl", "ia"]
 
 
 def test_metadata_handles_failure_and_non_json():

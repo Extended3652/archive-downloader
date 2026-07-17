@@ -5,9 +5,11 @@ from typing import Any, Mapping, Optional, Tuple
 
 
 DEFAULT_MEDIA_ROOT = "/mnt/ssd/media"
+DEFAULT_YT_DLP_PATH = "/home/pi/.local/bin/yt-dlp"
 DEFAULT_CONFIG = {
     "media_root": DEFAULT_MEDIA_ROOT,
-    "default_bucket": "TV",
+    "yt_dlp_path": DEFAULT_YT_DLP_PATH,
+    "default_bucket": "Movies",
     "default_filter": "movies",
     "default_sort": "",
     "title_only": False,
@@ -45,7 +47,7 @@ def parse_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def normalize_bucket(value: Any, default: str = "TV") -> str:
+def normalize_bucket(value: Any, default: str = "Movies") -> str:
     candidate = str(value or "").strip().title()
     return candidate if candidate in VALID_BUCKETS else default
 
@@ -90,6 +92,8 @@ def load_config(
     cfg = dict(DEFAULT_CONFIG)
     if isinstance(data.get("media_root"), str) and data["media_root"].strip():
         cfg["media_root"] = os.path.expanduser(data["media_root"].strip())
+    if isinstance(data.get("yt_dlp_path"), str) and data["yt_dlp_path"].strip():
+        cfg["yt_dlp_path"] = os.path.expanduser(data["yt_dlp_path"].strip())
     cfg["default_bucket"] = normalize_bucket(data.get("default_bucket"), cfg["default_bucket"])
     cfg["default_filter"] = normalize_filter(data.get("default_filter"), cfg["default_filter"])
     cfg["default_sort"] = normalize_sort(data.get("default_sort"), cfg["default_sort"])
