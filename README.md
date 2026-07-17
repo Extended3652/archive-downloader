@@ -1,6 +1,8 @@
 # archive-downloader
 
-Three Python wrappers around the [`internetarchive`](https://archive.org/developers/internetarchive/) (`ia`) CLI. Pick the one that fits your workflow.
+Python tools around the [`internetarchive`](https://archive.org/developers/internetarchive/) (`ia`) CLI, with a curses TUI, helper CLIs, and library-audit utilities. Pick the one that fits your workflow.
+
+There is also **`ia_audit.py` / `ia-audit`** for scanning an existing media library for weird filenames, duplicate episodes/movies, metadata gaps, rename suggestions, stale leftovers, and optional codec/bitrate reporting.
 
 ## The tools
 
@@ -9,6 +11,8 @@ Three Python wrappers around the [`internetarchive`](https://archive.org/develop
 **`ia_easy.py`** — interactive `input()`-based flow optimized for finding and grabbing a single movie file. Defaults to `$IA_MEDIA_ROOT` or `/mnt/ssd/media`, and prompts for another folder.
 
 **`ia_minotaur.py`** — full-screen curses TUI with favorites, open-license gating, staged downloads, live progress, and automatic bucket organization (`TV/`, `Movies/`, `Music/`, `Other/`). The heaviest of the three.
+
+**`ia_audit.py`** — report-oriented library auditor for the media root. Flags suspicious filenames, suggests cleaner filenames, detects duplicate episodes and movie folders, finds likely metadata cleanup work, reports stale `.ia_staging` / `.part` / `.torrent` leftovers, and can optionally produce `ffprobe`-based codec + bitrate summaries.
 
 All three share `ia_common.py` for subprocess handling, the `SearchResult` / `IAFile` dataclasses, and small utilities. `ia_api.py` wraps Internet Archive search and metadata access for Minotaur. `ia_downloads.py` handles download command construction and staging-size checks. `ia_organize.py` handles naming, query building, and license heuristics. `ia_paths.py` centralizes media-root paths and staging path guards. `ia_state.py` handles JSON persistence for favorites, sessions, and pending downloads.
 
@@ -31,6 +35,18 @@ ia-dl search 'title:"The Big Movie" AND mediatype:movies' --rows 5
 ia-dl list <identifier> --ext mp4
 ia-dl download <identifier> --biggest --dest ./out
 
+# Audit an existing library
+ia-audit
+ia-audit --probe --max-probe 300
+ia-audit --json > audit.json
+ia-audit --rename-plan rename-plan.json
+ia-audit --apply-rename-plan rename-plan.json
+ia-audit --apply-rename-plan rename-plan.json --execute
+ia-audit --triage-plan triage-plan.json
+ia-audit --manual-triage-plan manual-triage.json
+ia-audit --apply-triage-plan triage-plan.json
+ia-audit --apply-triage-plan triage-plan.json --execute
+
 # Interactive (movies)
 ia-easy
 
@@ -39,9 +55,11 @@ ia-minotaur --check
 ia-minotaur
 ```
 
+Inside `ia-minotaur`, press `y` for a lightweight library audit summary in the status bar. For full details or fixes, use `ia-audit`.
+
 ## Media root
 
-The download tools default to `/mnt/ssd/media`. Set `IA_MEDIA_ROOT` to choose a different default for all three wrappers:
+The download tools default to `/mnt/ssd/media`. Set `IA_MEDIA_ROOT` to choose a different default for the tools:
 
 ```
 export IA_MEDIA_ROOT=/mnt/ssd/media
@@ -110,6 +128,20 @@ pytest tests/ -v
 ```
 
 The suite covers pure helpers in `ia_common.py` and `ia_minotaur.py` (filename parsing, query building, license gating, path safety). Tests do not hit the real Internet Archive API and do not require a TTY.
+
+`ia-audit --probe` uses `ffprobe` if available; without it, codec and bitrate sections stay empty and the rest of the audit still works.
+
+The cleanup section is conservative by design and does not treat normal subtitle sidecars such as `.srt` as junk.
+
+`ia-audit --rename-plan <file>` writes a JSON array of proposed in-place renames with source path, destination path, and collision flags. It does not rename anything.
+
+`ia-audit --apply-rename-plan <file>` reads a previously reviewed rename plan and validates it against the current filesystem. By default it emits a JSON dry-run report; add `--execute` to perform only the non-blocked renames.
+
+`ia-audit --triage-plan <file>` writes a JSON move plan for higher-confidence `Other` and hidden-bucket reclassification suggestions. Low-confidence items stay in the text/JSON report for manual review but are not added to the move plan.
+
+`ia-audit --manual-triage-plan <file>` interactively walks the low-confidence triage items, lets you choose bucket/folder/name, and writes a reviewable move plan JSON. It does not move anything by itself.
+
+`ia-audit --apply-triage-plan <file>` reads a previously reviewed triage move plan and validates it against the current filesystem. By default it emits a JSON dry-run report; add `--execute` to perform only the non-blocked moves.
 
 ## License gating disclaimer
 

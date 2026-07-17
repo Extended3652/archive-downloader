@@ -11,7 +11,16 @@ __pycache__/
 
 # virtualenv
 venv/
+.venv/
 .env/
+
+# build metadata
+*.egg-info/
+
+# local audit outputs
+audit.json
+rename-plan.json
+triage-plan.json
 
 # editor/backups
 *.bak
