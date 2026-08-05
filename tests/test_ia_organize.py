@@ -9,6 +9,7 @@ from ia_organize import (
     build_fielded_query,
     build_query,
     build_query_attempts,
+    build_title_year_query,
     build_sideways_searches,
     build_within_collection_query,
     detect_sxxeyy,
@@ -204,6 +205,15 @@ class TestBuildQuery:
 
         assert attempts[0] == ("identifier", "identifier:prelinger-123 AND mediatype:movies")
         assert any(label == "fields" for label, _query in attempts)
+
+    def test_title_year_query_is_precise(self):
+        assert build_title_year_query("Fargo 1996", "movies") == 'title:("Fargo") AND year:1996 AND mediatype:movies'
+
+    def test_title_year_query_gets_precise_attempt_before_broad_fallback(self):
+        attempts = build_query_attempts("Fargo 1996", "movies", False)
+
+        assert attempts[0] == ("title/year", 'title:("Fargo") AND year:1996 AND mediatype:movies')
+        assert attempts[1] == ("title", '(title:("Fargo") OR Fargo) AND year:1996 AND mediatype:movies')
 
     def test_fielded_query_searches_ia_metadata_fields(self):
         assert build_fielded_query("Chaplin", "movies") == (

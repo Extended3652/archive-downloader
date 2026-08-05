@@ -9,7 +9,10 @@ import ia_config
 
 
 def print_json(data: dict) -> None:
-    print(json.dumps(data, indent=2))
+    safe = dict(data)
+    if safe.get("radarr_api_key"):
+        safe["radarr_api_key"] = "[redacted]"
+    print(json.dumps(safe, indent=2))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -34,6 +37,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             "license_gate",
             "no_change_timestamp",
             "rows_per_page",
+            "radarr_enabled",
+            "radarr_url",
+            "radarr_api_key",
+            "radarr_local_movie_root",
+            "radarr_root_folder",
+            "radarr_quality_profile_id",
+            "radarr_monitor_movie",
+            "radarr_search_on_add",
+            "radarr_timeout_s",
         ],
     )
     set_parser.add_argument("value")

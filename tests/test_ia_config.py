@@ -37,6 +37,15 @@ def test_load_config_normalizes_valid_file(tmp_path):
                 "license_gate": "yes",
                 "no_change_timestamp": "off",
                 "rows_per_page": "50",
+                "radarr_enabled": "true",
+                "radarr_url": "http://radarr:7878/",
+                "radarr_api_key": "file-key",
+                "radarr_local_movie_root": "~/Movies",
+                "radarr_root_folder": "/data/movies",
+                "radarr_quality_profile_id": "3",
+                "radarr_monitor_movie": "false",
+                "radarr_search_on_add": "true",
+                "radarr_timeout_s": "12.5",
             }
         ),
         encoding="utf-8",
@@ -53,6 +62,15 @@ def test_load_config_normalizes_valid_file(tmp_path):
     assert cfg["license_gate"] is True
     assert cfg["no_change_timestamp"] is False
     assert cfg["rows_per_page"] == 50
+    assert cfg["radarr_enabled"] is True
+    assert cfg["radarr_url"] == "http://radarr:7878/"
+    assert cfg["radarr_api_key"] == "file-key"
+    assert cfg["radarr_local_movie_root"] == os.path.expanduser("~/Movies")
+    assert cfg["radarr_root_folder"] == "/data/movies"
+    assert cfg["radarr_quality_profile_id"] == 3
+    assert cfg["radarr_monitor_movie"] is False
+    assert cfg["radarr_search_on_add"] is False
+    assert cfg["radarr_timeout_s"] == 12.5
 
 
 def test_load_config_rejects_invalid_values(tmp_path):
@@ -89,6 +107,7 @@ def test_environment_overrides_config_file(tmp_path):
                 "license_gate": False,
                 "no_change_timestamp": True,
                 "rows_per_page": 10,
+                "radarr_api_key": "file-key",
             }
         ),
         encoding="utf-8",
@@ -105,6 +124,14 @@ def test_environment_overrides_config_file(tmp_path):
             "IA_LICENSE_GATE": "1",
             "IA_NO_CHANGE_TIMESTAMP": "false",
             "IA_ROWS_PER_PAGE": "25",
+            "IA_RADARR_ENABLED": "true",
+            "IA_RADARR_URL": "http://env-radarr:7878",
+            "IA_RADARR_API_KEY": "env-key",
+            "IA_RADARR_LOCAL_MOVIE_ROOT": "/env/local/Movies",
+            "IA_RADARR_ROOT_FOLDER": "/env/radarr/Movies",
+            "IA_RADARR_QUALITY_PROFILE_ID": "5",
+            "IA_RADARR_MONITOR_MOVIE": "false",
+            "IA_RADARR_TIMEOUT_S": "7",
         },
     )
 
@@ -116,6 +143,14 @@ def test_environment_overrides_config_file(tmp_path):
     assert cfg["license_gate"] is True
     assert cfg["no_change_timestamp"] is False
     assert cfg["rows_per_page"] == 25
+    assert cfg["radarr_enabled"] is True
+    assert cfg["radarr_url"] == "http://env-radarr:7878"
+    assert cfg["radarr_api_key"] == "env-key"
+    assert cfg["radarr_local_movie_root"] == "/env/local/Movies"
+    assert cfg["radarr_root_folder"] == "/env/radarr/Movies"
+    assert cfg["radarr_quality_profile_id"] == 5
+    assert cfg["radarr_monitor_movie"] is False
+    assert cfg["radarr_timeout_s"] == 7
 
 
 def test_save_and_set_config_value_round_trip(tmp_path):
@@ -131,6 +166,12 @@ def test_save_and_set_config_value_round_trip(tmp_path):
 
     cfg = ia_config.set_config_value("default_sort", "date asc", str(path), environ={})
     assert cfg["default_sort"] == "date asc"
+
+    cfg = ia_config.set_config_value("radarr_quality_profile_id", "3", str(path), environ={})
+    assert cfg["radarr_quality_profile_id"] == 3
+
+    cfg = ia_config.set_config_value("radarr_search_on_add", "true", str(path), environ={})
+    assert cfg["radarr_search_on_add"] is False
 
 
 def test_set_config_value_rejects_invalid_key_and_value(tmp_path):

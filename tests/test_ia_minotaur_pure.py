@@ -1180,6 +1180,36 @@ class TestRetroWaveIAState:
         assert [r.identifier for r in visible] == ["page2"]
         assert len(calls) == 1
 
+    def test_year_local_result_filter_refines_plain_title_search(self, monkeypatch):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.query_text = "Cop Land"
+        app.query_built = '(title:("Cop Land") OR Cop Land) AND mediatype:movies'
+        app.sort_by = ""
+        app.title_only = False
+        app.filter = "movies"
+        app.results = [ia_minotaur.SearchResult("unrelated", "Cop Land interview", year="2004")]
+        app.total_results = 1
+        app.page = 1
+        app.sel_r = 0
+        app.result_filter = ""
+        app._save_session = lambda: None
+        calls = []
+
+        def fake_search(query, rows, page, sort=""):
+            calls.append((query, rows, page, sort))
+            if query == 'title:("Cop Land") AND year:1997 AND mediatype:movies':
+                return [ia_minotaur.SearchResult("cop-land-1997", "Cop Land", year="1997", mediatype="movies")], 1, ""
+            return [], 0, ""
+
+        monkeypatch.setattr(ia_minotaur, "ia_search_via_curl", fake_search)
+
+        app.set_result_filter("1997")
+
+        visible = app.get_visible_results()
+        assert [r.identifier for r in visible] == ["cop-land-1997"]
+        assert calls == [('title:("Cop Land") AND year:1997 AND mediatype:movies', ia_minotaur.ROWS_PER_PAGE, 1, "")]
+        assert app.status.startswith("Local result filter: 1997 (1 visible")
+
     def test_empty_local_filter_results_show_background_scan_progress(self, monkeypatch):
         class FakeScreen:
             def getmaxyx(self):
@@ -2075,6 +2105,7 @@ class TestChooseBucketAndPath:
 
     def set_roots(self, monkeypatch, tmp_path):
         root = tmp_path / "media"
+        monkeypatch.setenv("IA_RADARR_ENABLED", "false")
         for module in (ia_minotaur, ia_paths):
             monkeypatch.setattr(module, "MEDIA_ROOT", str(root))
             monkeypatch.setattr(module, "STAGING_ROOT", str(root / ".ia_staging"))
@@ -2186,6 +2217,62 @@ class TestChooseBucketAndPath:
         final_path = root / "Movies" / "Custom Movie (1942)" / "Custom Movie (1942).mp4"
         assert msg == f"Saved: {final_path}"
         assert final_path.read_bytes() == b"x"
+
+    def test_movie_import_invokes_radarr_after_final_move(self, monkeypatch, tmp_path):
+        root = self.set_roots(monkeypatch, tmp_path)
+        self.stage_file("item1", "Metropolis.1927.mp4")
+        calls = []
+        app = self.build_app(["Movies", ""])
+        app.download_log = []
+        app.cur_meta = {"metadata": {"external-identifier": "tmdb:19"}}
+        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Metropolis", year="1927", mediatype="movies")
+
+        def fake_register(path, **kwargs):
+            calls.append((path, kwargs))
+            assert os.path.exists(path)
+            return ia_minotaur.ia_radarr.RadarrResult(True, "added", "Radarr movie added; refresh requested.", True)
+
+        monkeypatch.setattr(ia_minotaur.ia_radarr, "register_completed_movie", fake_register)
+
+        msg = app.choose_bucket_and_path("item1", "Metropolis.1927.mp4", "Metropolis")
+
+        final_path = root / "Movies" / "Metropolis (1927)" / "Metropolis (1927).mp4"
+        assert calls[0][0] == str(final_path)
+        assert calls[0][1]["metadata"] == {"metadata": {"external-identifier": "tmdb:19"}}
+        assert msg == f"Saved: {final_path} | Radarr: Radarr movie added; refresh requested."
+
+    def test_tv_import_does_not_invoke_radarr(self, monkeypatch, tmp_path):
+        root = self.set_roots(monkeypatch, tmp_path)
+        self.stage_file("item1", "pilot.S02E03.mp4")
+        calls = []
+        app = self.build_app(["TV", "A Show"])
+        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "A Show", mediatype="movies")
+        monkeypatch.setattr(ia_minotaur.ia_radarr, "register_completed_movie", lambda *_args, **_kwargs: calls.append("radarr"))
+
+        msg = app.choose_bucket_and_path("item1", "pilot.S02E03.mp4", "A Show")
+
+        final_path = root / "TV" / "A Show" / "Season 02" / "A Show - S02E03.mp4"
+        assert msg == f"Saved: {final_path}"
+        assert calls == []
+
+    def test_radarr_failure_does_not_corrupt_completed_movie(self, monkeypatch, tmp_path):
+        root = self.set_roots(monkeypatch, tmp_path)
+        self.stage_file("item1", "Metropolis.1927.mp4", b"done")
+        app = self.build_app(["Movies", ""])
+        app.download_log = []
+        app.cur_meta = {}
+        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Metropolis", year="1927", mediatype="movies")
+        monkeypatch.setattr(
+            ia_minotaur.ia_radarr,
+            "register_completed_movie",
+            lambda *_args, **_kwargs: ia_minotaur.ia_radarr.RadarrResult(False, "radarr_failed", "Radarr unavailable."),
+        )
+
+        msg = app.choose_bucket_and_path("item1", "Metropolis.1927.mp4", "Metropolis")
+
+        final_path = root / "Movies" / "Metropolis (1927)" / "Metropolis (1927).mp4"
+        assert final_path.read_bytes() == b"done"
+        assert msg == f"Saved: {final_path} | Radarr: Radarr unavailable."
 
     def test_final_import_prompt_can_edit_movie_folder_and_filename(self, monkeypatch, tmp_path):
         root = self.set_roots(monkeypatch, tmp_path)
@@ -2627,6 +2714,45 @@ class TestChooseBucketAndPath:
         assert pending["identifier"] == "item1"
         assert [f["name"] for f in pending["files"]] == ["one.mp4"]
         assert pending["completed_names"] == []
+
+    def test_import_done_requests_jellyfin_rescan_on_exit(self, monkeypatch):
+        calls = []
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.status = ""
+        app.download_log = []
+        app.render = lambda: None
+        app.jellyfin_rescan_needed = False
+        monkeypatch.setattr(
+            ia_minotaur.ia_jellyfin,
+            "request_library_rescan",
+            lambda: calls.append("rescan") or (True, "Jellyfin library rescan requested."),
+        )
+
+        app.note_import_status("done")
+        app.request_jellyfin_rescan_if_needed()
+
+        assert calls == ["rescan"]
+        assert app.jellyfin_rescan_needed is False
+        assert app.status == "Jellyfin library rescan requested."
+
+    def test_staged_import_does_not_request_jellyfin_rescan(self, monkeypatch):
+        calls = []
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.status = ""
+        app.download_log = []
+        app.render = lambda: None
+        app.jellyfin_rescan_needed = False
+        monkeypatch.setattr(
+            ia_minotaur.ia_jellyfin,
+            "request_library_rescan",
+            lambda: calls.append("rescan") or (True, "Jellyfin library rescan requested."),
+        )
+
+        app.note_import_status("staged")
+        app.request_jellyfin_rescan_if_needed()
+
+        assert calls == []
+        assert app.jellyfin_rescan_needed is False
 
     def test_download_auto_retries_after_stall(self, monkeypatch, tmp_path):
         self.set_roots(monkeypatch, tmp_path)

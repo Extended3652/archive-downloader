@@ -35,6 +35,23 @@ def test_ia_search_raises_command_error_on_search_error(monkeypatch):
     assert excinfo.value.stderr == "bad query"
 
 
+def test_ia_search_best_effort_tries_precise_title_year_first(monkeypatch):
+    calls = []
+
+    def fake_search(query, rows, page=1, sort=""):
+        calls.append((query, rows, page, sort))
+        if query == 'title:("Fargo") AND year:1996 AND mediatype:movies':
+            return [SearchResult("fargo-1996_202605", "Fargo (1996)", year="1996")]
+        return []
+
+    monkeypatch.setattr(ia_dl, "ia_search", fake_search)
+
+    results = ia_dl.ia_search_best_effort("Fargo 1996", 10, "movies", False, page=2, sort="downloads desc")
+
+    assert [r.identifier for r in results] == ["fargo-1996_202605"]
+    assert calls == [('title:("Fargo") AND year:1996 AND mediatype:movies', 10, 2, "downloads desc")]
+
+
 def test_search_result_line_includes_rich_metadata():
     line = ia_dl.search_result_line(
         SearchResult(
@@ -143,7 +160,7 @@ def test_main_search_builds_query_and_prints_results(monkeypatch, capsys):
     assert rc == 0
     assert calls == [
         (
-            '(title:("Metropolis") OR Metropolis) AND year:1927 AND mediatype:movies',
+            'title:("Metropolis") AND year:1927 AND mediatype:movies',
             3,
             2,
             "downloads desc",

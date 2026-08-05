@@ -8,7 +8,7 @@ from typing import List, Optional
 from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, compact_count, default_media_root, human_size, is_archive_torrent_format, is_video_file, run
 import ia_api
 from ia_minotaur_events import emit_archive_completed, emit_archive_failed, emit_archive_started, safe_text
-from ia_organize import archive_query_preset_labels, build_archive_preset_query, build_query, license_status_from_fields
+from ia_organize import archive_query_preset_labels, build_archive_preset_query, build_query_attempts, license_status_from_fields
 
 
 class BadFileRegex(ValueError):
@@ -29,6 +29,18 @@ def ia_search(query: str, rows: int, *, page: int = 1, sort: str = "") -> List[S
     if err:
         raise IACommandError(["curl", "https://archive.org/advancedsearch.php"], 1, err)
     return results
+
+
+def ia_search_best_effort(query_text: str, rows: int, media_filter: str, title_only: bool, *, page: int = 1, sort: str = "") -> List[SearchResult]:
+    attempts = [(label, query) for label, query in build_query_attempts(query_text, media_filter, title_only) if query]
+    if not attempts:
+        return []
+    last_results: List[SearchResult] = []
+    for _label, query in attempts:
+        last_results = ia_search(query, rows, page=page, sort=sort)
+        if last_results:
+            return last_results
+    return last_results
 
 
 def search_result_line(r: SearchResult) -> str:
@@ -236,8 +248,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("No query or preset provided.", file=sys.stderr)
             return 2
         else:
-            q = build_query(query_text, args.filter, args.title_only)
-        results = ia_search(q, args.rows, page=args.page, sort=sort_map[args.sort])
+            q = ""
+        if q:
+            results = ia_search(q, args.rows, page=args.page, sort=sort_map[args.sort])
+        else:
+            results = ia_search_best_effort(query_text, args.rows, args.filter, args.title_only, page=args.page, sort=sort_map[args.sort])
         if not results:
             print("No results.")
             return 1
@@ -259,8 +274,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         identifier = args.identifier
 
         if args.search:
-            q = build_query(sanitize_query(args.search), "any", False)
-            results = ia_search(q, args.rows)
+            results = ia_search_best_effort(sanitize_query(args.search), args.rows, "any", False)
             if not results:
                 print("No search results.")
                 return 1

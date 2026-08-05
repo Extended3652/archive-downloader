@@ -16,6 +16,15 @@ DEFAULT_CONFIG = {
     "license_gate": False,
     "no_change_timestamp": True,
     "rows_per_page": 30,
+    "radarr_enabled": False,
+    "radarr_url": "http://192.168.86.70:7878",
+    "radarr_api_key": "",
+    "radarr_local_movie_root": os.path.join(DEFAULT_MEDIA_ROOT, "Movies"),
+    "radarr_root_folder": "",
+    "radarr_quality_profile_id": 0,
+    "radarr_monitor_movie": True,
+    "radarr_search_on_add": False,
+    "radarr_timeout_s": 10,
 }
 VALID_BUCKETS = {"TV", "Movies", "Music", "Other"}
 VALID_FILTERS = {"movies", "audio", "texts", "software", "any"}
@@ -72,6 +81,28 @@ def positive_int(value: Any, default: int) -> int:
     return parsed if parsed >= 1 else default
 
 
+def non_negative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def clean_string(value: Any, default: str = "") -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return default
+
+
 def load_config(
     path: Optional[str] = None,
     environ: Optional[Mapping[str, str]] = None,
@@ -101,6 +132,20 @@ def load_config(
     cfg["license_gate"] = parse_bool(data.get("license_gate"), cfg["license_gate"])
     cfg["no_change_timestamp"] = parse_bool(data.get("no_change_timestamp"), cfg["no_change_timestamp"])
     cfg["rows_per_page"] = positive_int(data.get("rows_per_page"), cfg["rows_per_page"])
+    cfg["radarr_enabled"] = parse_bool(data.get("radarr_enabled"), cfg["radarr_enabled"])
+    cfg["radarr_url"] = clean_string(data.get("radarr_url"), cfg["radarr_url"]) or cfg["radarr_url"]
+    cfg["radarr_api_key"] = clean_string(data.get("radarr_api_key"), cfg["radarr_api_key"])
+    cfg["radarr_local_movie_root"] = os.path.expanduser(
+        clean_string(data.get("radarr_local_movie_root"), cfg["radarr_local_movie_root"])
+    )
+    cfg["radarr_root_folder"] = os.path.expanduser(clean_string(data.get("radarr_root_folder"), cfg["radarr_root_folder"]))
+    cfg["radarr_quality_profile_id"] = non_negative_int(
+        data.get("radarr_quality_profile_id"),
+        cfg["radarr_quality_profile_id"],
+    )
+    cfg["radarr_monitor_movie"] = parse_bool(data.get("radarr_monitor_movie"), cfg["radarr_monitor_movie"])
+    cfg["radarr_search_on_add"] = False
+    cfg["radarr_timeout_s"] = positive_float(data.get("radarr_timeout_s"), cfg["radarr_timeout_s"])
 
     if env.get("IA_MEDIA_ROOT"):
         cfg["media_root"] = os.path.expanduser(str(env["IA_MEDIA_ROOT"]))
@@ -118,6 +163,30 @@ def load_config(
         cfg["no_change_timestamp"] = parse_bool(env["IA_NO_CHANGE_TIMESTAMP"], cfg["no_change_timestamp"])
     if env.get("IA_ROWS_PER_PAGE"):
         cfg["rows_per_page"] = positive_int(env["IA_ROWS_PER_PAGE"], cfg["rows_per_page"])
+    if env.get("IA_RADARR_ENABLED"):
+        cfg["radarr_enabled"] = parse_bool(env["IA_RADARR_ENABLED"], cfg["radarr_enabled"])
+    if env.get("IA_RADARR_URL"):
+        cfg["radarr_url"] = clean_string(env["IA_RADARR_URL"], cfg["radarr_url"]) or cfg["radarr_url"]
+    if env.get("IA_RADARR_API_KEY"):
+        cfg["radarr_api_key"] = clean_string(env["IA_RADARR_API_KEY"], cfg["radarr_api_key"])
+    elif env.get("RADARR_API_KEY"):
+        cfg["radarr_api_key"] = clean_string(env["RADARR_API_KEY"], cfg["radarr_api_key"])
+    if env.get("IA_RADARR_LOCAL_MOVIE_ROOT"):
+        cfg["radarr_local_movie_root"] = os.path.expanduser(clean_string(env["IA_RADARR_LOCAL_MOVIE_ROOT"]))
+    if env.get("IA_RADARR_ROOT_FOLDER"):
+        cfg["radarr_root_folder"] = os.path.expanduser(clean_string(env["IA_RADARR_ROOT_FOLDER"]))
+    if env.get("IA_RADARR_QUALITY_PROFILE_ID"):
+        cfg["radarr_quality_profile_id"] = non_negative_int(
+            env["IA_RADARR_QUALITY_PROFILE_ID"],
+            cfg["radarr_quality_profile_id"],
+        )
+    if env.get("IA_RADARR_MONITOR_MOVIE"):
+        cfg["radarr_monitor_movie"] = parse_bool(env["IA_RADARR_MONITOR_MOVIE"], cfg["radarr_monitor_movie"])
+    if env.get("IA_RADARR_TIMEOUT_S"):
+        cfg["radarr_timeout_s"] = positive_float(env["IA_RADARR_TIMEOUT_S"], cfg["radarr_timeout_s"])
+
+    if not cfg["radarr_local_movie_root"]:
+        cfg["radarr_local_movie_root"] = os.path.join(cfg["media_root"], "Movies")
 
     return cfg
 
@@ -176,6 +245,39 @@ def normalize_config_value(key: str, value: str) -> Tuple[Any, str]:
         if rows < 1:
             raise ValueError("rows_per_page must be >= 1")
         return rows, "rows_per_page"
+    if key == "radarr_enabled":
+        return parse_bool(value, False), "radarr_enabled"
+    if key == "radarr_url":
+        cleaned = clean_string(value)
+        if not cleaned:
+            raise ValueError("radarr_url must not be empty")
+        return cleaned, "radarr_url"
+    if key == "radarr_api_key":
+        return clean_string(value), "radarr_api_key"
+    if key == "radarr_local_movie_root":
+        cleaned = clean_string(value)
+        if not cleaned:
+            raise ValueError("radarr_local_movie_root must not be empty")
+        return os.path.expanduser(cleaned), "radarr_local_movie_root"
+    if key == "radarr_root_folder":
+        cleaned = clean_string(value)
+        if not cleaned:
+            raise ValueError("radarr_root_folder must not be empty")
+        return os.path.expanduser(cleaned), "radarr_root_folder"
+    if key == "radarr_quality_profile_id":
+        parsed = positive_int(value, 0)
+        if parsed < 1:
+            raise ValueError("radarr_quality_profile_id must be >= 1")
+        return parsed, "radarr_quality_profile_id"
+    if key == "radarr_monitor_movie":
+        return parse_bool(value, True), "radarr_monitor_movie"
+    if key == "radarr_search_on_add":
+        return False, "radarr_search_on_add"
+    if key == "radarr_timeout_s":
+        parsed = positive_float(value, 0)
+        if parsed <= 0:
+            raise ValueError("radarr_timeout_s must be > 0")
+        return parsed, "radarr_timeout_s"
     raise ValueError(f"unknown config key: {key}")
 
 

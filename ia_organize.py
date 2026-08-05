@@ -339,6 +339,16 @@ def build_fielded_query(user_text: str, media_filter: str) -> str:
     return add_media_filter(base, media_filter)
 
 
+def build_title_year_query(user_text: str, media_filter: str) -> str:
+    s = re.sub(r"\s+", " ", (user_text or "").strip())
+    if not s or looks_like_advanced_query(s):
+        return ""
+    title, year = split_title_year(s)
+    if not year:
+        return ""
+    return add_media_filter(f"{quote_title(title)} AND year:{year}", media_filter)
+
+
 def build_collection_search_query(user_text: str) -> str:
     s = re.sub(r"\s+", " ", (user_text or "").strip())
     if not s:
@@ -381,6 +391,9 @@ def build_query_attempts(user_text: str, media_filter: str, title_only: bool) ->
     attempts: List[Tuple[str, str]] = []
     if looks_like_identifier(s):
         attempts.append(("identifier", add_media_filter(f"identifier:{s}", media_filter)))
+    title_year = build_title_year_query(s, media_filter)
+    if title_year:
+        attempts.append(("title/year", title_year))
     attempts.append(("title", first))
     attempts.append(("fields", build_fielded_query(s, media_filter)))
     attempts.append(("plain", add_media_filter(s, media_filter)))

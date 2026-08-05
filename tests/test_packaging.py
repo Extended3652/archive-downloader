@@ -15,6 +15,7 @@ def test_console_script_targets_are_importable_callables():
         "ia-dl": "ia_dl:main",
         "ia-easy": "ia_easy:cli_main",
         "ia-minotaur": "ia_minotaur:cli_main",
+        "ia-radarr": "ia_radarr_cli:main",
     }
 
     for target in scripts.values():
@@ -43,6 +44,8 @@ def test_packaging_includes_all_flat_modules():
         "ia_minotaur_events",
         "ia_organize",
         "ia_paths",
+        "ia_radarr",
+        "ia_radarr_cli",
         "ia_state",
         "yt_api",
         "yt_downloads",

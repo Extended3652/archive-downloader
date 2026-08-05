@@ -23,6 +23,7 @@ ia-dl = "ia_dl:main"
 ia-easy = "ia_easy:cli_main"
 ia-minotaur = "ia_minotaur:cli_main"
 ia-config = "ia_config_cli:main"
+ia-radarr = "ia_radarr_cli:main"
 
 [tool.setuptools]
 py-modules = [
@@ -35,10 +36,13 @@ py-modules = [
   "ia_downloads",
   "ia_dvd",
   "ia_easy",
+  "ia_jellyfin",
   "ia_minotaur",
   "ia_minotaur_events",
   "ia_organize",
   "ia_paths",
+  "ia_radarr",
+  "ia_radarr_cli",
   "ia_state",
   "yt_api",
   "yt_downloads",

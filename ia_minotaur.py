@@ -43,7 +43,9 @@ import ia_audit
 import ia_config
 import ia_downloads
 import ia_dvd
+import ia_jellyfin
 import ia_minotaur_events
+import ia_radarr
 import yt_api
 import yt_downloads
 from ia_organize import (
@@ -54,15 +56,18 @@ from ia_organize import (
     build_field_query,
     build_query_attempts,
     build_sideways_searches,
+    build_title_year_query,
     build_within_collection_query,
     build_query,
     detect_sxxeyy,
     infer_bucket,
     is_openly_licensed,
     license_status_from_fields,
+    looks_like_advanced_query,
     normalize_collection_identifier,
     replace_mediatype_filter,
     sanitize_folder,
+    split_title_year,
 )
 import ia_state
 
@@ -388,6 +393,7 @@ class RetroWaveIA:
         self.dl_overall_total: int = 0
         self.dl_cancel_requested: bool = False
         self.dl_complete_notice: str = ""
+        self.jellyfin_rescan_needed: bool = False
 
         if not self.ia_present:
             self.mode = "ERROR"
@@ -869,6 +875,10 @@ class RetroWaveIA:
             self._all_results_loader_token = 0
         if not hasattr(self, "_all_results_loader_thread"):
             self._all_results_loader_thread = None
+        if not hasattr(self, "_local_filter_extra_results"):
+            self._local_filter_extra_results = []
+        if not hasattr(self, "_local_filter_refinement_key"):
+            self._local_filter_refinement_key = ""
 
     def _ensure_search_load_state(self) -> None:
         if not hasattr(self, "_search_load_lock") or getattr(self, "_search_load_lock", None) is None:
@@ -907,6 +917,8 @@ class RetroWaveIA:
             self._all_results_loading = False
             self._all_results_loader_error = ""
             self._all_results_loader_thread = None
+            self._local_filter_extra_results = []
+            self._local_filter_refinement_key = ""
 
     def _prime_search_cache(self, key: str, page_num: int, page_results: List[SearchResult], total_pages: int) -> None:
         self._ensure_search_cache_state()
@@ -1008,8 +1020,22 @@ class RetroWaveIA:
         self._ensure_search_cache_state()
         with self._search_cache_lock:
             if self._all_results_cache_key == self._search_cache_key() and self._all_results_cache:
-                return list(self._all_results_cache)
-        return list(getattr(self, "results", []) or [])
+                base = list(self._all_results_cache)
+            else:
+                base = list(getattr(self, "results", []) or [])
+            extras = list(getattr(self, "_local_filter_extra_results", []) or [])
+        if not extras:
+            return base
+        seen = {(r.identifier or "").strip() for r in base if (r.identifier or "").strip()}
+        merged = list(base)
+        for item in extras:
+            ident = (item.identifier or "").strip()
+            if ident and ident in seen:
+                continue
+            if ident:
+                seen.add(ident)
+            merged.append(item)
+        return merged
 
     def get_visible_results(self) -> List[SearchResult]:
         needle = self.result_filter.strip().lower()
@@ -1077,13 +1103,52 @@ class RetroWaveIA:
         self.sel_r = 0
         if self.result_filter:
             self._ensure_all_search_results_loaded()
+            self.load_year_refinement_for_local_filter()
         else:
             self.cancel_result_prefetch()
+            self._local_filter_extra_results = []
+            self._local_filter_refinement_key = ""
         n = len(self.get_visible_results())
         progress = self.local_filter_progress_label()
         suffix = f"; {progress}" if progress else ""
         self.status = f"Local result filter: {self.result_filter or '(none)'} ({n} visible{suffix})"
         self._save_session()
+
+    def local_filter_year_refinement_query(self) -> str:
+        year = str(getattr(self, "result_filter", "") or "").strip()
+        if not re.fullmatch(r"(?:19\d{2}|20\d{2})", year):
+            return ""
+        query_text = str(getattr(self, "query_text", "") or "").strip()
+        if not query_text or looks_like_advanced_query(query_text):
+            return ""
+        _title, existing_year = split_title_year(query_text)
+        if existing_year:
+            return ""
+        return build_title_year_query(f"{query_text} {year}", getattr(self, "filter", "any"))
+
+    def load_year_refinement_for_local_filter(self) -> None:
+        self._ensure_search_cache_state()
+        query = self.local_filter_year_refinement_query()
+        if not query:
+            self._local_filter_extra_results = []
+            self._local_filter_refinement_key = ""
+            return
+        key = "\0".join([self._search_cache_key(), str(getattr(self, "result_filter", "") or ""), query])
+        if getattr(self, "_local_filter_refinement_key", "") == key:
+            return
+        results, _total, err = ia_search_via_curl(
+            query,
+            rows=ROWS_PER_PAGE,
+            page=1,
+            sort=getattr(self, "sort_by", ""),
+        )
+        if err:
+            log_line(f"LOCAL_FILTER_YEAR_REFINE_ERR: {err}")
+            self._local_filter_extra_results = []
+            self._local_filter_refinement_key = key
+            return
+        self._local_filter_extra_results = list(results or [])
+        self._local_filter_refinement_key = key
 
     def clear_result_filter(self) -> None:
         if not self.result_filter:
@@ -1092,6 +1157,8 @@ class RetroWaveIA:
         self.result_filter = ""
         self.sel_r = 0
         self.cancel_result_prefetch()
+        self._local_filter_extra_results = []
+        self._local_filter_refinement_key = ""
         self._save_session()
         n = len(self.get_visible_results())
         self.status = f"Local result filter cleared. ({n} visible)"
@@ -2974,7 +3041,9 @@ class RetroWaveIA:
                 final_path = f"{base}_{stamp}{ext}"
             os.makedirs(os.path.dirname(final_path), exist_ok=True)
             shutil.move(staging_path, final_path)
-            return f"Saved: {final_path}"
+            msg = f"Saved: {final_path}"
+            note = self.register_radarr_movie_if_needed(final_path, batch.get("bucket", ""), item_title)
+            return f"{msg} | {note}" if note else msg
 
         def is_single_large_video(name: str) -> bool:
             try:
@@ -3104,7 +3173,37 @@ class RetroWaveIA:
 
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         shutil.move(staging_path, final_path)
-        return f"Saved: {final_path}"
+        msg = f"Saved: {final_path}"
+        note = self.register_radarr_movie_if_needed(final_path, bucket, item_title)
+        return f"{msg} | {note}" if note else msg
+
+    def register_radarr_movie_if_needed(self, final_path: str, bucket: str, item_title: str) -> str:
+        if bucket != "Movies":
+            return ""
+        if not os.path.exists(final_path):
+            return ""
+        item = None
+        try:
+            item = self.selected_result()
+        except Exception:
+            item = getattr(self, "preview_item", None)
+        meta = getattr(self, "cur_meta", None)
+        result = ia_radarr.register_completed_movie(
+            final_path,
+            item_title=item_title or getattr(item, "title", ""),
+            item_year=getattr(item, "year", ""),
+            metadata=meta,
+            logger=lambda message: log_line(f"RADARR: {message}"),
+        )
+        if result.status == "disabled":
+            return ""
+        note = f"Radarr: {result.message}"
+        try:
+            self.download_log.insert(0, note)
+            self.download_log = self.download_log[:8]
+        except Exception:
+            pass
+        return note
 
     def choose_batch_import_options(self, item_title: str) -> Optional[Dict[str, str]]:
         use_batch = self.prompt("Use one destination for this queue? Enter=yes, type n=no: ", "")
@@ -3376,6 +3475,24 @@ class RetroWaveIA:
         if text.startswith("Refused:") or text.startswith("Downloaded, but staging file not found:"):
             return "failed"
         return "done"
+
+    def note_import_status(self, status: str) -> None:
+        if status == "done":
+            self.jellyfin_rescan_needed = True
+
+    def request_jellyfin_rescan_if_needed(self) -> None:
+        if not getattr(self, "jellyfin_rescan_needed", False):
+            return
+        self.status = "Requesting Jellyfin library rescan..."
+        self.render()
+        ok, msg = ia_jellyfin.request_library_rescan()
+        log_line(msg)
+        self.download_log.insert(0, msg)
+        self.download_log = self.download_log[:8]
+        if ok:
+            self.jellyfin_rescan_needed = False
+        self.status = msg
+        self.render()
 
     def import_left_in_staging(self, msg: str) -> bool:
         return self.import_queue_status(msg) == "staged"
@@ -3878,6 +3995,7 @@ class RetroWaveIA:
         for f in staged_ready:
             msg = self.choose_bucket_and_path(identifier, f.name, item_title)
             import_status = self.import_queue_status(msg)
+            self.note_import_status(import_status)
             if import_status == "done" or import_status == "skipped":
                 new_completed.append(f.name)
             self.download_log.insert(0, msg)
@@ -3902,6 +4020,7 @@ class RetroWaveIA:
                     return
                 msg = self.choose_bucket_and_path(identifier, f.name, item_title)
                 import_status = self.import_queue_status(msg)
+                self.note_import_status(import_status)
                 if import_status == "done" or import_status == "skipped":
                     new_completed.append(f.name)
                 self.download_log.insert(0, msg)
@@ -3968,6 +4087,7 @@ class RetroWaveIA:
             complete_msg = self._handle_already_complete(item.identifier, f, item.title)
             if complete_msg:
                 status = self.import_queue_status(complete_msg)
+                self.note_import_status(status)
                 self.set_queue_status(f.name, status, complete_msg)
                 if status == "staged":
                     self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
@@ -4028,6 +4148,7 @@ class RetroWaveIA:
                     f.size = downloaded_size
             msg = self.choose_bucket_and_path(item.identifier, import_name, item.title)
             import_status = self.import_queue_status(msg)
+            self.note_import_status(import_status)
             self.set_queue_status(f.name, import_status, msg, size=downloaded_size)
             if import_status == "staged":
                 self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
@@ -4074,6 +4195,7 @@ class RetroWaveIA:
                     complete_msg = self._handle_already_complete(item.identifier, f, item.title, batch=batch_import)
                     if complete_msg:
                         status = self.import_queue_status(complete_msg)
+                        self.note_import_status(status)
                         self.set_queue_status(f.name, status, complete_msg)
                         if status == "done" or status == "skipped":
                             completed_names.append(f.name)
@@ -4131,6 +4253,7 @@ class RetroWaveIA:
 
                     msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, batch=batch_import)
                     import_status = self.import_queue_status(msg)
+                    self.note_import_status(import_status)
                     self.set_queue_status(f.name, import_status, msg)
                     if import_status == "done" or import_status == "skipped":
                         completed_names.append(f.name)
@@ -4162,6 +4285,7 @@ class RetroWaveIA:
                 complete_msg = self._handle_already_complete(item.identifier, f, item.title, batch=batch_import)
                 if complete_msg:
                     status = self.import_queue_status(complete_msg)
+                    self.note_import_status(status)
                     self.set_queue_status(f.name, status, complete_msg)
                     if status == "done" or status == "skipped":
                         seq_completed.append(f.name)
@@ -4196,6 +4320,7 @@ class RetroWaveIA:
 
                 msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, batch=batch_import)
                 import_status = self.import_queue_status(msg)
+                self.note_import_status(import_status)
                 self.set_queue_status(f.name, import_status, msg)
                 if import_status == "done" or import_status == "skipped":
                     seq_completed.append(f.name)
@@ -5626,6 +5751,7 @@ class RetroWaveIA:
                         continue
 
         # exit
+        self.request_jellyfin_rescan_if_needed()
         self._save_session()
 
 
