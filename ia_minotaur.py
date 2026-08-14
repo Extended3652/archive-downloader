@@ -35,7 +35,9 @@ from ia_paths import (
     SESSION_PATH,
     STAGING_ROOT,
     check_writable_dir,
+    normalize_media_permissions,
     safe_staging_file_path,
+    set_process_umask,
     staging_file_path,
 )
 import ia_api
@@ -232,6 +234,8 @@ def ensure_dirs() -> None:
     os.makedirs(BUCKET_MOVIES, exist_ok=True)
     os.makedirs(BUCKET_MUSIC, exist_ok=True)
     os.makedirs(BUCKET_OTHER, exist_ok=True)
+    for path in (STAGING_ROOT, BUCKET_TV, BUCKET_MOVIES, BUCKET_MUSIC, BUCKET_OTHER):
+        normalize_media_permissions(path)
 
 
 def environment_checks() -> List[Tuple[str, bool, str]]:
@@ -3041,6 +3045,7 @@ class RetroWaveIA:
                 final_path = f"{base}_{stamp}{ext}"
             os.makedirs(os.path.dirname(final_path), exist_ok=True)
             shutil.move(staging_path, final_path)
+            normalize_media_permissions(final_path, include_parents=True)
             msg = f"Saved: {final_path}"
             note = self.register_radarr_movie_if_needed(final_path, batch.get("bucket", ""), item_title)
             return f"{msg} | {note}" if note else msg
@@ -3173,6 +3178,7 @@ class RetroWaveIA:
 
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         shutil.move(staging_path, final_path)
+        normalize_media_permissions(final_path, include_parents=True)
         msg = f"Saved: {final_path}"
         note = self.register_radarr_movie_if_needed(final_path, bucket, item_title)
         return f"{msg} | {note}" if note else msg
@@ -5761,6 +5767,7 @@ def main(stdscr):
 
 
 def cli_main(argv: Optional[List[str]] = None) -> int:
+    set_process_umask()
     parser = argparse.ArgumentParser(
         prog="ia_minotaur",
         description="Full-screen Internet Archive browser/downloader.",

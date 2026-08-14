@@ -1,6 +1,7 @@
 """Tests for download command and staging-size helpers."""
 import io
 import os
+import stat
 
 import ia_downloads
 import ia_paths
@@ -76,6 +77,53 @@ def test_verify_expected_size_rejects_escaping_staging_path(monkeypatch, tmp_pat
 
     assert not ok
     assert msg.startswith("Refused: staging path escapes item staging dir:")
+
+
+def test_normalize_media_permissions_adds_group_write_and_skips_symlinks(tmp_path):
+    root = tmp_path / "media"
+    media_dir = root / "Movies" / "Movie (1999)"
+    media_dir.mkdir(parents=True)
+    media_file = media_dir / "Movie (1999).mp4"
+    media_file.write_bytes(b"x")
+    link = media_dir / "linked.mp4"
+    link.symlink_to(media_file)
+    media_dir.chmod(0o2755)
+    media_file.chmod(0o644)
+
+    ia_paths.normalize_media_permissions(str(media_dir), media_root=str(root), recursive=True)
+
+    assert stat.S_IMODE(media_dir.stat().st_mode) == 0o2775
+    assert stat.S_IMODE(media_file.stat().st_mode) == 0o664
+    assert link.is_symlink()
+
+
+def test_normalize_media_permissions_preserves_existing_world_write(tmp_path):
+    root = tmp_path / "media"
+    media_dir = root / "Movies" / "Writable Movie"
+    media_dir.mkdir(parents=True)
+    media_file = media_dir / "movie.mp4"
+    media_file.write_bytes(b"x")
+    media_dir.chmod(0o777)
+    media_file.chmod(0o666)
+
+    ia_paths.normalize_media_permissions(str(media_dir), media_root=str(root), recursive=True)
+
+    assert stat.S_IMODE(media_dir.stat().st_mode) == 0o2777
+    assert stat.S_IMODE(media_file.stat().st_mode) == 0o666
+
+
+def test_normalize_media_permissions_refuses_outside_media_root(tmp_path):
+    root = tmp_path / "media"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.write_text("x", encoding="utf-8")
+
+    try:
+        ia_paths.normalize_media_permissions(str(outside), media_root=str(root))
+    except ValueError as exc:
+        assert "escapes media root" in str(exc)
+    else:
+        raise AssertionError("expected outside normalization to be refused")
 
 
 class FakeProcess:

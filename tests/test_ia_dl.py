@@ -1,4 +1,7 @@
 """Tests for the scriptable ia_dl CLI helpers."""
+import os
+import stat
+
 import pytest
 
 import ia_dl
@@ -235,7 +238,16 @@ def test_ia_download_emits_started_and_completed(monkeypatch, tmp_path):
     monkeypatch.setattr(ia_dl, "emit_archive_started", lambda message: calls.append(("started", message)))
     monkeypatch.setattr(ia_dl, "emit_archive_completed", lambda message: calls.append(("completed", message)))
     monkeypatch.setattr(ia_dl, "emit_archive_failed", lambda message: calls.append(("failed", message)))
-    monkeypatch.setattr(ia_dl, "run", lambda _cmd, check=True: None)
+
+    def fake_run(_cmd, check=True):
+        item_dir = tmp_path / "item1"
+        item_dir.mkdir()
+        output = item_dir / "movie.mp4"
+        output.write_bytes(b"movie")
+        item_dir.chmod(0o2755)
+        output.chmod(0o644)
+
+    monkeypatch.setattr(ia_dl, "run", fake_run)
 
     ia_dl.ia_download("item1", str(tmp_path), None, "movie.mp4")
 
@@ -243,6 +255,9 @@ def test_ia_download_emits_started_and_completed(monkeypatch, tmp_path):
         ("started", "item1 movie.mp4"),
         ("completed", str(tmp_path / "item1" / "movie.mp4")),
     ]
+    assert (tmp_path / "item1" / "movie.mp4").read_bytes() == b"movie"
+    assert stat.S_IMODE(os.stat(tmp_path / "item1").st_mode) == 0o2775
+    assert stat.S_IMODE(os.stat(tmp_path / "item1" / "movie.mp4").st_mode) == 0o664
 
 
 def test_ia_download_emits_failure_without_swallowing_exception(monkeypatch, tmp_path):
@@ -262,3 +277,14 @@ def test_ia_download_emits_failure_without_swallowing_exception(monkeypatch, tmp
     assert calls[0] == ("started", "item1 movie.mp4")
     assert calls[1][0] == "failed"
     assert "download exploded" in calls[1][1]
+
+
+def test_main_sets_process_umask(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(ia_dl, "set_process_umask", lambda: calls.append("umask"))
+    monkeypatch.setattr(ia_dl, "ia_search", lambda *_args, **_kwargs: [])
+
+    rc = ia_dl.main(["search", "nothing", "--rows", "1"])
+
+    assert rc == 1
+    assert calls == ["umask"]

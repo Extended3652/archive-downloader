@@ -7,6 +7,7 @@ to a temp path before this module is imported.
 import io
 import os
 import curses
+import stat
 
 import ia_minotaur
 import ia_paths
@@ -2073,6 +2074,14 @@ class TestEnvironmentChecks:
 
         assert ("curl", False, "command not found") in checks
 
+    def test_cli_main_sets_process_umask_for_check(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(ia_minotaur, "set_process_umask", lambda: calls.append("umask"))
+        monkeypatch.setattr(ia_minotaur, "print_environment_check", lambda: 0)
+
+        assert ia_minotaur.cli_main(["--check"]) == 0
+        assert calls == ["umask"]
+
 
 # --------------------------------------------------------- import paths
 class TestChooseBucketAndPath:
@@ -2205,6 +2214,20 @@ class TestChooseBucketAndPath:
         final_path = root / "Movies" / "The Big Movie (1999)" / "The Big Movie (1999).mkv"
         assert msg == f"Saved: {final_path}"
         assert final_path.read_bytes() == b"x"
+
+    def test_movie_import_normalizes_final_permissions(self, monkeypatch, tmp_path):
+        root = self.set_roots(monkeypatch, tmp_path)
+        staging_path = self.stage_file("item1", "The.Big.Movie.1999.1080p.mkv")
+        os.chmod(staging_path, 0o644)
+        app = self.build_app(["Movies", ""])
+        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "The Big Movie", mediatype="movies")
+
+        msg = app.choose_bucket_and_path("item1", "The.Big.Movie.1999.1080p.mkv", "")
+
+        final_path = root / "Movies" / "The Big Movie (1999)" / "The Big Movie (1999).mkv"
+        assert msg == f"Saved: {final_path}"
+        assert stat.S_IMODE(final_path.parent.stat().st_mode) == 0o2775
+        assert stat.S_IMODE(final_path.stat().st_mode) == 0o664
 
     def test_movie_import_uses_chosen_folder_as_filename(self, monkeypatch, tmp_path):
         root = self.set_roots(monkeypatch, tmp_path)

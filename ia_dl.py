@@ -7,6 +7,7 @@ from typing import List, Optional
 
 from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, compact_count, default_media_root, human_size, is_archive_torrent_format, is_video_file, run
 import ia_api
+from ia_paths import normalize_media_permissions, set_process_umask
 from ia_minotaur_events import emit_archive_completed, emit_archive_failed, emit_archive_started, safe_text
 from ia_organize import archive_query_preset_labels, build_archive_preset_query, build_query_attempts, license_status_from_fields
 
@@ -159,6 +160,7 @@ def biggest_file(files: List[IAFile]) -> Optional[IAFile]:
 
 def ia_download(identifier: str, dest: str, glob_pat: Optional[str], exact_file: Optional[str]) -> None:
     os.makedirs(dest, exist_ok=True)
+    normalize_media_permissions(dest, media_root=dest)
 
     cmd = ["ia", "download", identifier, "--destdir", dest]
     if exact_file:
@@ -176,6 +178,8 @@ def ia_download(identifier: str, dest: str, glob_pat: Optional[str], exact_file:
         raise
     print("Done.")
     output = os.path.join(dest, identifier, exact_file) if exact_file else os.path.join(dest, identifier)
+    item_dir = os.path.join(dest, identifier)
+    normalize_media_permissions(item_dir, media_root=dest, recursive=True, include_parents=True)
     emit_archive_completed(output)
 
 def positive_int(s: str) -> int:
@@ -185,6 +189,7 @@ def positive_int(s: str) -> int:
     return v
 
 def main(argv: Optional[List[str]] = None) -> int:
+    set_process_umask()
     ap = argparse.ArgumentParser(
         prog="ia_dl",
         description="Helper CLI for searching and downloading from Internet Archive using the 'ia' tool."

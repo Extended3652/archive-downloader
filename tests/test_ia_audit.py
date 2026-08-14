@@ -1,7 +1,9 @@
 import json
 import os
+import stat
 import tempfile
 
+import ia_audit
 from ia_audit import (
     apply_move_plan,
     apply_rename_plan,
@@ -26,6 +28,13 @@ from ia_audit import (
 
 
 class TestLooksWeirdFilename:
+    def test_main_sets_process_umask(self, monkeypatch, tmp_path, capsys):
+        calls = []
+        monkeypatch.setattr(ia_audit, "set_process_umask", lambda: calls.append("umask"))
+
+        assert ia_audit.main(["--root", str(tmp_path), "--json"]) == 0
+        assert calls == ["umask"]
+
     def test_scene_tags_flag_weird_name(self):
         reasons = looks_weird_filename("Movie.1999.1080p.BluRay.x264-YIFY.mkv")
         assert "release/sample tag" in reasons or "scene tags remain" in reasons
@@ -307,6 +316,7 @@ class TestTriageSuggestions:
             dst = os.path.join(dst_dir, "Movie (1999).mp4")
             with open(src, "wb") as fh:
                 fh.write(b"x")
+            os.chmod(src, 0o644)
             result = apply_move_plan(
                 root,
                 [{"from": os.path.relpath(src, root), "to": os.path.relpath(dst, root)}],
@@ -316,6 +326,31 @@ class TestTriageSuggestions:
             assert result["results"][0]["status"] == "moved"
             assert not os.path.exists(src)
             assert os.path.exists(dst)
+            assert stat.S_IMODE(os.stat(dst_dir).st_mode) == 0o2775
+            assert stat.S_IMODE(os.stat(dst).st_mode) == 0o664
+
+    def test_apply_rename_plan_execute_normalizes_permissions(self):
+        with tempfile.TemporaryDirectory() as root:
+            movie_dir = os.path.join(root, "Movies", "Movie (1999)")
+            os.makedirs(movie_dir, exist_ok=True)
+            src = os.path.join(movie_dir, "clip.mp4")
+            dst = os.path.join(movie_dir, "Movie (1999).mp4")
+            with open(src, "wb") as fh:
+                fh.write(b"x")
+            os.chmod(movie_dir, 0o2755)
+            os.chmod(src, 0o644)
+
+            result = apply_rename_plan(
+                root,
+                [{"from": os.path.relpath(src, root), "to": os.path.relpath(dst, root)}],
+                execute=True,
+            )
+
+            assert result["renamed"] == 1
+            assert not os.path.exists(src)
+            assert os.path.exists(dst)
+            assert stat.S_IMODE(os.stat(movie_dir).st_mode) == 0o2775
+            assert stat.S_IMODE(os.stat(dst).st_mode) == 0o664
 
     def test_load_plan(self):
         with tempfile.TemporaryDirectory() as root:

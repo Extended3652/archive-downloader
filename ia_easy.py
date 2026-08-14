@@ -16,6 +16,7 @@ from ia_common import (
     is_video_file,
     run,
 )
+from ia_paths import normalize_media_permissions, set_process_umask
 from ia_minotaur_events import emit_archive_completed, emit_archive_failed, emit_archive_started, safe_text
 
 def prompt(msg: str) -> str:
@@ -89,6 +90,7 @@ def filter_video_files(files: List[IAFile], keyword: Optional[str]) -> List[IAFi
 
 def download_file(identifier: str, filename: str, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
+    normalize_media_permissions(dest, media_root=dest)
     cmd = ["ia", "download", identifier, "--destdir", dest, "--files", filename]
     print("\nDownloading:")
     print("  " + " ".join(cmd))
@@ -100,6 +102,8 @@ def download_file(identifier: str, filename: str, dest: str) -> None:
         raise
     print("\nDone.")
     output = os.path.join(dest, identifier, filename)
+    item_dir = os.path.join(dest, identifier)
+    normalize_media_permissions(item_dir, media_root=dest, recursive=True, include_parents=True)
     print(f"Saved to: {output}")
     emit_archive_completed(output)
 
@@ -184,6 +188,7 @@ def main() -> int:
 
 
 def cli_main(argv: Optional[List[str]] = None) -> int:
+    set_process_umask()
     parser = argparse.ArgumentParser(
         prog="ia_easy",
         description="Interactive Internet Archive movie downloader.",

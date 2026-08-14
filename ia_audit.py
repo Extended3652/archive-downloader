@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import ia_config
 from ia_common import human_size
 from ia_organize import auto_clean_movie_folder_name, detect_sxxeyy, sanitize_folder
-from ia_paths import STAGING_ROOT
+from ia_paths import STAGING_ROOT, normalize_media_permissions, set_process_umask
 
 
 MEDIA_EXTS = {
@@ -257,6 +257,7 @@ def apply_rename_plan(root: str, plan: Sequence[Dict[str, Any]], *, execute: boo
 
         os.makedirs(os.path.dirname(item["to_abs"]), exist_ok=True)
         os.replace(item["from_abs"], item["to_abs"])
+        normalize_media_permissions(item["to_abs"], media_root=root, include_parents=True)
         result["status"] = "renamed"
         results.append(result)
         renamed += 1
@@ -534,6 +535,7 @@ def apply_move_plan(root: str, plan: Sequence[Dict[str, Any]], *, execute: bool 
             continue
         os.makedirs(os.path.dirname(item["to_abs"]), exist_ok=True)
         os.replace(item["from_abs"], item["to_abs"])
+        normalize_media_permissions(item["to_abs"], media_root=root, include_parents=True)
         result["status"] = "moved"
         results.append(result)
         moved += 1
@@ -862,6 +864,7 @@ def print_text_report(report: Dict[str, Any]) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    set_process_umask()
     parser = argparse.ArgumentParser(
         prog="ia-audit",
         description="Audit a local media library for naming, duplicate, metadata, cleanup, and codec issues.",
