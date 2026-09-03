@@ -27,24 +27,36 @@ def download_base_args(no_change_timestamp: bool) -> List[str]:
     return ["--no-change-timestamp"] if no_change_timestamp else []
 
 
-def single_download_cmd(identifier: str, filename: str, no_change_timestamp: bool) -> List[str]:
+def single_download_cmd(
+    identifier: str,
+    filename: str,
+    no_change_timestamp: bool,
+    staging_root: Optional[str] = None,
+) -> List[str]:
+    root = staging_root or STAGING_ROOT
     return [
         "ia",
         "download",
         identifier,
         filename,
         "--destdir",
-        STAGING_ROOT,
+        root,
     ] + download_base_args(no_change_timestamp)
 
 
-def glob_download_cmd(identifier: str, glob_pat: str, no_change_timestamp: bool) -> List[str]:
+def glob_download_cmd(
+    identifier: str,
+    glob_pat: str,
+    no_change_timestamp: bool,
+    staging_root: Optional[str] = None,
+) -> List[str]:
+    root = staging_root or STAGING_ROOT
     return [
         "ia",
         "download",
         identifier,
         "--destdir",
-        STAGING_ROOT,
+        root,
         "--glob",
         glob_pat,
     ] + download_base_args(no_change_timestamp)

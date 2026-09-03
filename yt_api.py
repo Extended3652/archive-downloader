@@ -123,12 +123,29 @@ def parse_yt_search_json(raw: str) -> List[SearchResult]:
     return results
 
 
+def _raw_entry_count(raw: str) -> int:
+    """Count entries in yt-dlp's JSON before SearchResult filtering, for diagnostics.
+
+    Returns -1 if the output wasn't valid JSON at all (a real parsing bug),
+    vs. 0+ if yt-dlp's JSON simply contained no (or fewer) entries.
+    """
+    try:
+        data = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return -1
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if isinstance(entries, list):
+        return len(entries)
+    return 1 if isinstance(data, dict) else 0
+
+
 def yt_search(
     query: str,
     rows: int = 10,
     *,
     yt_dlp_path: Optional[str] = None,
     runner: Callable[..., Tuple[int, str, str]] = run_cmd,
+    logger: Optional[Logger] = None,
 ) -> Tuple[List[SearchResult], int, str]:
     terms = str(query or "").strip()
     if not terms:
@@ -140,6 +157,11 @@ def yt_search(
         msg = (err or out).strip()
         return [], 0, msg or f"yt-dlp search failed (code {code})"
     results = parse_yt_search_json(out)
+    if not results and logger:
+        logger(
+            f"YT_SEARCH_EMPTY: query={terms!r} stdout_bytes={len(out)} "
+            f"raw_entries={_raw_entry_count(out)}"
+        )
     return results, len(results), ""
 
 

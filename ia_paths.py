@@ -31,8 +31,11 @@ def staging_identifier_dir(identifier: str) -> str:
 
 
 def safe_staging_file_path(identifier: str, filename: str) -> Tuple[Optional[str], str]:
+    item_dir = staging_identifier_dir(identifier)
+    if not safe_path_under(STAGING_ROOT, item_dir):
+        return None, f"Refused: staging item dir escapes staging root: {item_dir}"
     path = staging_file_path(identifier, filename)
-    if not safe_path_under(staging_identifier_dir(identifier), path):
+    if not safe_path_under(item_dir, path):
         return None, f"Refused: staging path escapes item staging dir: {path}"
     return path, ""
 

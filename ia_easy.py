@@ -19,8 +19,54 @@ from ia_common import (
 from ia_paths import normalize_media_permissions, set_process_umask
 from ia_minotaur_events import emit_archive_completed, emit_archive_failed, emit_archive_started, safe_text
 
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+TEXT = "\033[38;5;253m"
+HEADER = "\033[38;5;250m"
+CYAN = "\033[38;5;178m"
+GREEN = "\033[38;5;114m"
+GOLD = "\033[38;5;178m"
+MAGENTA = "\033[38;5;208m"
+YELLOW = "\033[38;5;220m"
+RED = "\033[38;5;203m"
+KEYS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def getch() -> str:
+    try:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        if sys.stdin.isatty():
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+    return sys.stdin.read(1)
+
+
+def key_for_index(index: int) -> str:
+    return KEYS[index - 1]
+
+
+def index_for_key(key: str, count: int) -> Optional[int]:
+    key = key.upper()
+    if key in KEYS[:count]:
+        return KEYS.index(key) + 1
+    return None
+
+
+def menu_key(key: str, label: str) -> None:
+    print(f"  {BOLD}{GOLD}[{TEXT}{key}{MAGENTA}]{RESET} {label}")
+
+
 def prompt(msg: str) -> str:
-    return input(msg).strip()
+    return input(f"{CYAN}{msg}{RESET}").strip()
 
 def prompt_int(msg: str, lo: int, hi: int) -> Optional[int]:
     while True:
@@ -31,7 +77,7 @@ def prompt_int(msg: str, lo: int, hi: int) -> Optional[int]:
             v = int(s)
             if lo <= v <= hi:
                 return v
-        print(f"Enter a number {lo}-{hi}, or press Enter to cancel.")
+        print(f"{YELLOW}Enter a number {lo}-{hi}, or press Enter to cancel.{RESET}")
 
 def ia_search_simple(q: str, rows: int = 20) -> List[SearchResult]:
     # If user types just words, we'll search those in title and restrict to movies.
@@ -92,27 +138,26 @@ def download_file(identifier: str, filename: str, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
     normalize_media_permissions(dest, media_root=dest)
     cmd = ["ia", "download", identifier, "--destdir", dest, "--files", filename]
-    print("\nDownloading:")
-    print("  " + " ".join(cmd))
+    print(f"\n{MAGENTA}Downloading:{RESET}")
+    print(f"  {TEXT}{' '.join(cmd)}{RESET}")
     emit_archive_started(f"{identifier} {filename}")
     try:
         run(cmd, check=True)
     except Exception as exc:
         emit_archive_failed(f"{identifier} {filename}: {safe_text(exc, 180)}")
         raise
-    print("\nDone.")
+    print(f"\n{GREEN}Done.{RESET}")
     output = os.path.join(dest, identifier, filename)
     item_dir = os.path.join(dest, identifier)
     normalize_media_permissions(item_dir, media_root=dest, recursive=True, include_parents=True)
-    print(f"Saved to: {output}")
+    print(f"{CYAN}Saved to:{RESET} {TEXT}{output}{RESET}")
     emit_archive_completed(output)
 
 def main() -> int:
-    print("\nInternet Archive Downloader (easy mode)")
-    print("-------------------------------------")
-    print("Tips:")
-    print("- Press Enter on any prompt to cancel/back out.")
-    print("- Search is limited to mediatype:movies by default.\n")
+    print(f"\n{HEADER}{'-' * 40}{RESET}")
+    print(f"{BOLD}{MAGENTA}Internet Archive Downloader{RESET} {DIM}(easy mode){RESET}")
+    print(f"{HEADER}{'-' * 40}{RESET}")
+    print(f"{DIM}Typed prompts still use Enter; result and file selections are one key.{RESET}\n")
 
     default_dest = default_media_root()
     dest = prompt(f"Download folder (default: {default_dest}): ")
@@ -130,21 +175,28 @@ def main() -> int:
         try:
             results = ia_search_simple(q, rows=25)
         except IACommandError as e:
-            print(f"Search failed: {e.stderr or e}")
+            print(f"{RED}Search failed:{RESET} {e.stderr or e}")
             continue
 
         if not results:
-            print("No results. Try different words.")
+            print(f"{YELLOW}No results. Try different words.{RESET}")
             continue
 
-        print("\nResults:")
-        for i, r in enumerate(results, start=1):
+        print(f"\n{CYAN}Results{RESET}")
+        keyed_results = results[:len(KEYS)]
+        for i, r in enumerate(keyed_results, start=1):
             y = f" ({r.year})" if r.year else ""
             title = (r.title[:80] + "...") if len(r.title) > 80 else r.title
-            print(f"{i:2d}. {title}{y}")
-            print(f"    id: {r.identifier}")
+            menu_key(key_for_index(i), f"{title}{y}")
+            print(f"    {DIM}id:{RESET} {r.identifier}")
 
-        idx = prompt_int("\nPick an item number to view files: ", 1, len(results))
+        menu_key("0", "Back")
+        print(f"\n{CYAN}Pick item:{RESET} ", end="", flush=True)
+        choice = getch().upper()
+        print(choice)
+        if choice == "0":
+            continue
+        idx = index_for_key(choice, len(keyed_results))
         if idx is None:
             continue
 
@@ -152,38 +204,47 @@ def main() -> int:
         try:
             files = ia_metadata_files(item.identifier)
         except IACommandError as e:
-            print(f"Could not fetch metadata: {e.stderr or e}")
+            print(f"{RED}Could not fetch metadata:{RESET} {e.stderr or e}")
             continue
         except json.JSONDecodeError:
-            print("Could not read metadata for that item.")
+            print(f"{RED}Could not read metadata for that item.{RESET}")
             continue
 
         keyword = prompt("Optional filter keyword for files (example: mp4, h.264, 720p). Enter to skip: ")
         vids = filter_video_files(files, keyword if keyword else None)
 
         if not vids:
-            print("No video-like files found for that item.")
+            print(f"{YELLOW}No video-like files found for that item.{RESET}")
             continue
 
-        print("\nVideo files (biggest first):")
-        for i, f in enumerate(vids, start=1):
+        print(f"\n{CYAN}Video files{RESET} {DIM}(biggest first){RESET}")
+        keyed_vids = vids[:len(KEYS)]
+        for i, f in enumerate(keyed_vids, start=1):
             fmt = f.fmt if f.fmt else ""
-            print(f"{i:2d}. {human_size(f.size):>10}  {fmt:<22}  {f.name}")
+            menu_key(key_for_index(i), f"{human_size(f.size):>10}  {fmt:<22}  {f.name}")
 
-        fidx = prompt_int("\nPick a file number to download: ", 1, len(vids))
+        menu_key("0", "Back")
+        print(f"\n{CYAN}Pick file:{RESET} ", end="", flush=True)
+        choice = getch().upper()
+        print(choice)
+        if choice == "0":
+            continue
+        fidx = index_for_key(choice, len(keyed_vids))
         if fidx is None:
             continue
 
-        chosen = vids[fidx - 1]
+        chosen = keyed_vids[fidx - 1]
         try:
             download_file(item.identifier, chosen.name, dest)
         except IACommandError as e:
-            print(f"Download failed: {e.stderr or e}")
+            print(f"{RED}Download failed:{RESET} {e.stderr or e}")
             continue
 
-        again = prompt("\nDownload another? (y/n): ").lower()
-        if again not in ("y", "yes"):
-            print("\nBye.")
+        print(f"\n{CYAN}Download another?{RESET} {BOLD}{GOLD}[{TEXT}Y{MAGENTA}]{RESET} yes  {BOLD}{GOLD}[{TEXT}N{MAGENTA}]{RESET} no: ", end="", flush=True)
+        again = getch().lower()
+        print(again)
+        if again != "y":
+            print(f"\n{DIM}Bye.{RESET}")
             return 0
 
 
@@ -201,9 +262,9 @@ if __name__ == "__main__":
     try:
         raise SystemExit(cli_main(sys.argv[1:]))
     except IANotInstalled:
-        print("\nError: 'ia' command not found.")
-        print("Install with: pip3 install --user internetarchive\n")
+        print(f"\n{RED}Error:{RESET} 'ia' command not found.")
+        print(f"{DIM}Install with: pip3 install --user internetarchive{RESET}\n")
         raise SystemExit(2)
     except KeyboardInterrupt:
-        print("\nBye.")
+        print(f"\n{DIM}Bye.{RESET}")
         raise SystemExit(0)

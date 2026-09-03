@@ -1,19 +1,78 @@
 #!/usr/bin/env python3
 import argparse
+import fnmatch
 import os
 import re
+import shutil
 import sys
 from typing import List, Optional
 
-from ia_common import IACommandError, IAFile, IANotInstalled, SearchResult, compact_count, default_media_root, human_size, is_archive_torrent_format, is_video_file, run
+from ia_common import (
+    IACommandError,
+    IAFile,
+    IANotInstalled,
+    SearchResult,
+    compact_count,
+    default_media_root,
+    human_size,
+    is_archive_torrent_format,
+    deduplicate_file_variants,
+    is_video_file,
+    run,
+    safe_path_under,
+)
 import ia_api
+import ia_downloads
 from ia_paths import normalize_media_permissions, set_process_umask
 from ia_minotaur_events import emit_archive_completed, emit_archive_failed, emit_archive_started, safe_text
 from ia_organize import archive_query_preset_labels, build_archive_preset_query, build_query_attempts, license_status_from_fields
 
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+TEXT = "\033[38;5;253m"
+CYAN = "\033[38;5;178m"
+GREEN = "\033[38;5;114m"
+GOLD = "\033[38;5;178m"
+RED = "\033[38;5;167m"
+MAGENTA = "\033[38;5;208m"
+KEYS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
 
 class BadFileRegex(ValueError):
     """Raised when a user-provided filename regex cannot be compiled."""
+
+
+def getch() -> str:
+    try:
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        if sys.stdin.isatty():
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
+    return sys.stdin.read(1)
+
+
+def key_for_index(index: int) -> str:
+    return KEYS[index - 1]
+
+
+def index_for_key(key: str, count: int) -> Optional[int]:
+    key = key.upper()
+    if key in KEYS[:count]:
+        return KEYS.index(key) + 1
+    return None
+
+
+def menu_key(key: str, label: str) -> None:
+    print(f"  {BOLD}{GOLD}[{TEXT}{key}{MAGENTA}]{RESET} {label}")
 
 def sanitize_query(q: str) -> str:
     q = q.strip()
@@ -62,18 +121,21 @@ def search_result_line(r: SearchResult) -> str:
 def choose_result(results: List[SearchResult]) -> Optional[SearchResult]:
     if not results:
         return None
-    for i, r in enumerate(results, start=1):
+    keyed_results = results[:len(KEYS)]
+    for i, r in enumerate(keyed_results, start=1):
         y = f" ({r.year})" if r.year else ""
-        print(f"{i:2d}. {r.identifier}  |  {r.title}{y}")
+        menu_key(key_for_index(i), f"{r.identifier}  |  {r.title}{y}")
+    menu_key("0", "Cancel")
     while True:
-        s = input("Pick a number (or blank to cancel): ").strip()
-        if s == "":
+        print(f"{CYAN}Pick item:{RESET} ", end="", flush=True)
+        s = getch().upper()
+        print(s)
+        if s == "0":
             return None
-        if s.isdigit():
-            idx = int(s)
-            if 1 <= idx <= len(results):
-                return results[idx - 1]
-        print("Invalid selection.")
+        idx = index_for_key(s, len(keyed_results))
+        if idx is not None:
+            return keyed_results[idx - 1]
+        print(f"{RED}Invalid selection.{RESET}")
 
 def ia_list_files(identifier: str) -> List[IAFile]:
     def runner(cmd, timeout=60):
@@ -84,6 +146,12 @@ def ia_list_files(identifier: str) -> List[IAFile]:
     if err:
         raise IACommandError(["ia", "metadata", identifier], 1, err)
     return files
+
+
+def resolve_glob_files(identifier: str, glob_pat: str) -> List[IAFile]:
+    """Resolve an IA glob against the logical file list before downloading."""
+    files = deduplicate_file_variants(ia_list_files(identifier))
+    return [f for f in files if fnmatch.fnmatchcase(f.name, glob_pat)]
 
 def filter_files(files: List[IAFile], exts: Optional[List[str]], regex: Optional[str]) -> List[IAFile]:
     out = files[:]
@@ -104,7 +172,7 @@ def filter_files(files: List[IAFile], exts: Optional[List[str]], regex: Optional
         except re.error as e:
             raise BadFileRegex(str(e)) from e
         out = [f for f in out if rx.search(f.name)]
-    return out
+    return deduplicate_file_variants(out)
 
 def print_files(files: List[IAFile]) -> None:
     if not files:
@@ -112,20 +180,25 @@ def print_files(files: List[IAFile]) -> None:
         return
     for i, f in enumerate(files, start=1):
         fmt = f.fmt if f.fmt else ""
-        print(f"{i:2d}. {human_size(f.size):>10}  {fmt:<20}  {f.name}")
+        key = key_for_index(i) if i <= len(KEYS) else "?"
+        prefix = f"{BOLD}{GOLD}[{TEXT}{key}{MAGENTA}]{RESET}" if i <= len(KEYS) else f"{i:2d}."
+        print(f"  {prefix} {human_size(f.size):>10}  {fmt:<20}  {f.name}")
 
 def choose_file(files: List[IAFile]) -> Optional[IAFile]:
     if not files:
         return None
+    keyed_files = files[:len(KEYS)]
+    menu_key("0", "Cancel")
     while True:
-        s = input("Pick a file number (or blank to cancel): ").strip()
-        if s == "":
+        print(f"{CYAN}Pick file:{RESET} ", end="", flush=True)
+        s = getch().upper()
+        print(s)
+        if s == "0":
             return None
-        if s.isdigit():
-            idx = int(s)
-            if 1 <= idx <= len(files):
-                return files[idx - 1]
-        print("Invalid selection.")
+        idx = index_for_key(s, len(keyed_files))
+        if idx is not None:
+            return keyed_files[idx - 1]
+        print(f"{RED}Invalid selection.{RESET}")
 
 def biggest_file(files: List[IAFile]) -> Optional[IAFile]:
     if not files:
@@ -158,28 +231,74 @@ def biggest_file(files: List[IAFile]) -> Optional[IAFile]:
 
     return sorted(files, key=file_rank, reverse=True)[0]
 
+def cli_staging_root(dest: str) -> str:
+    return os.path.join(dest, ".ia_staging")
+
+
+def staged_download_path(staging_root: str, identifier: str, filename: str) -> str:
+    item_dir = os.path.join(staging_root, identifier)
+    if not safe_path_under(staging_root, item_dir):
+        raise ValueError(f"Refused: staging item dir escapes staging root: {item_dir}")
+    path = os.path.join(item_dir, filename)
+    if not safe_path_under(item_dir, path):
+        raise ValueError(f"Refused: staging path escapes item staging dir: {path}")
+    return path
+
+
+def import_staged_download(staging_root: str, identifier: str, filename: Optional[str], dest: str) -> str:
+    final_item_dir = os.path.join(dest, identifier)
+    if not safe_path_under(dest, final_item_dir):
+        raise ValueError(f"Refused: destination item dir escapes destination root: {final_item_dir}")
+
+    if filename:
+        src = staged_download_path(staging_root, identifier, filename)
+        final_path = os.path.join(final_item_dir, filename)
+        if not safe_path_under(final_item_dir, final_path):
+            raise ValueError(f"Refused: destination path escapes item dir: {final_path}")
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"Downloaded, but staging file not found: {src}")
+        if os.path.exists(final_path):
+            raise FileExistsError(f"Refusing to overwrite existing file: {final_path}")
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+        shutil.move(src, final_path)
+        normalize_media_permissions(final_path, media_root=dest, include_parents=True)
+        return final_path
+
+    src_dir = os.path.join(staging_root, identifier)
+    if not safe_path_under(staging_root, src_dir):
+        raise ValueError(f"Refused: staging item dir escapes staging root: {src_dir}")
+    if not os.path.isdir(src_dir):
+        raise FileNotFoundError(f"Downloaded, but staging dir not found: {src_dir}")
+    if os.path.exists(final_item_dir):
+        raise FileExistsError(f"Refusing to overwrite existing directory: {final_item_dir}")
+    os.makedirs(dest, exist_ok=True)
+    shutil.move(src_dir, final_item_dir)
+    normalize_media_permissions(final_item_dir, media_root=dest, recursive=True, include_parents=True)
+    return final_item_dir
+
+
 def ia_download(identifier: str, dest: str, glob_pat: Optional[str], exact_file: Optional[str]) -> None:
     os.makedirs(dest, exist_ok=True)
-    normalize_media_permissions(dest, media_root=dest)
+    staging_root = cli_staging_root(dest)
+    os.makedirs(staging_root, exist_ok=True)
 
-    cmd = ["ia", "download", identifier, "--destdir", dest]
     if exact_file:
-        cmd += ["--files", exact_file]
+        cmd = ia_downloads.single_download_cmd(identifier, exact_file, False, staging_root=staging_root)
     elif glob_pat:
-        cmd += ["--glob", glob_pat]
+        cmd = ia_downloads.glob_download_cmd(identifier, glob_pat, False, staging_root=staging_root)
+    else:
+        cmd = ["ia", "download", identifier, "--destdir", staging_root]
 
-    print("Running:", " ".join(cmd))
+    print(f"{CYAN}Running:{RESET} {' '.join(cmd)}")
     target = exact_file or glob_pat or identifier
     emit_archive_started(f"{identifier} {target}")
     try:
         run(cmd, check=True)
+        output = import_staged_download(staging_root, identifier, exact_file, dest)
     except Exception as exc:
         emit_archive_failed(f"{identifier} {target}: {safe_text(exc, 180)}")
         raise
-    print("Done.")
-    output = os.path.join(dest, identifier, exact_file) if exact_file else os.path.join(dest, identifier)
-    item_dir = os.path.join(dest, identifier)
-    normalize_media_permissions(item_dir, media_root=dest, recursive=True, include_parents=True)
+    print(f"{GREEN}Done.{RESET}")
     emit_archive_completed(output)
 
 def positive_int(s: str) -> int:
@@ -293,9 +412,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("Error: provide an identifier or use --search.", file=sys.stderr)
             return 2
 
-        # If user provided --glob or --file, skip listing/picking.
-        if args.file or args.glob:
-            ia_download(identifier, args.dest, args.glob, args.file)
+        # Exact files are already unambiguous. Resolve globs locally so IA
+        # cannot fetch a hidden .ia variant that matches the same prefix.
+        if args.file:
+            ia_download(identifier, args.dest, None, args.file)
+            return 0
+        if args.glob:
+            try:
+                glob_files = resolve_glob_files(identifier, args.glob)
+            except IACommandError:
+                raise
+            if not glob_files:
+                print("No files match the glob.")
+                return 1
+            for f in glob_files:
+                ia_download(identifier, args.dest, None, f.name)
             return 0
 
         files = ia_list_files(identifier)

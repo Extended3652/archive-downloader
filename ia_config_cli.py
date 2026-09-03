@@ -12,6 +12,8 @@ def print_json(data: dict) -> None:
     safe = dict(data)
     if safe.get("radarr_api_key"):
         safe["radarr_api_key"] = "[redacted]"
+    if safe.get("bazarr_api_key"):
+        safe["bazarr_api_key"] = "[redacted]"
     print(json.dumps(safe, indent=2))
 
 
@@ -46,6 +48,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             "radarr_monitor_movie",
             "radarr_search_on_add",
             "radarr_timeout_s",
+            "bazarr_enabled",
+            "bazarr_url",
+            "bazarr_api_key",
+            "bazarr_timeout_s",
+            "bazarr_wait_timeout_s",
+            "bazarr_poll_interval_s",
         ],
     )
     set_parser.add_argument("value")

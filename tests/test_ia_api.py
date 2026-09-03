@@ -23,6 +23,25 @@ def test_ia_ok_success_and_failure():
     assert ia_api.ia_ok(runner=fail_runner) == (False, "command not found")
 
 
+def test_ia_files_preserves_metadata_and_deduplicates_proven_pair():
+    payload = {
+        "files": [
+            {"name": "foo.ia.mp4", "size": "10", "format": "h.264 IA",
+             "source": "derivative", "original": "foo.mp4", "sha1": "derivative"},
+            {"name": "foo.mp4", "size": "10", "format": "MPEG4",
+             "source": "original", "sha1": "original"},
+            {"name": "The Critic Webisodes.mp4", "size": "20", "format": "MPEG4",
+             "source": "original"},
+        ]
+    }
+    files, _meta, err = ia_api.ia_files("item", runner=runner_for(stdout=json.dumps(payload)))
+
+    assert err == ""
+    assert [f.name for f in files] == ["The Critic Webisodes.mp4", "foo.mp4"]
+    assert files[1].source == "original"
+    assert files[1].raw_metadata["source"] == "original"
+
+
 def test_curl_version_returns_first_line():
     runner = runner_for(stdout="curl 8.0\nfeatures\n")
 
@@ -81,6 +100,83 @@ def test_search_parses_docs_and_skips_missing_identifier():
     for field in ("fl[]=mediatype", "fl[]=downloads", "fl[]=licenseurl", "fl[]=rights"):
         assert field in cmd
     assert "fl[]=format" in cmd
+
+
+def _rerank_payload():
+    return {
+        "response": {
+            "numFound": 3,
+            "docs": [
+                {"identifier": "meta", "title": "Unrelated Feature",
+                 "description": "shot on a toad road", "downloads": 99999},
+                {"identifier": "exact", "title": "Toad Road", "downloads": 1},
+                {"identifier": "prefix", "title": "Toad Road: The Cut", "downloads": 2},
+            ],
+        }
+    }
+
+
+def _cmd_has(cmd, needle):
+    return any(needle == part for part in cmd)
+
+
+def test_rerank_fetches_wide_window_and_reorders_by_title():
+    runner = runner_for(stdout=json.dumps(_rerank_payload()))
+
+    results, total, err = ia_api.ia_search_via_curl(
+        "q", 30, 1, "", runner=runner, rerank_text="Toad Road", media_filter="movies"
+    )
+
+    assert err == ""
+    assert total == 3
+    # Exact title first, prefix second, high-download metadata-only match last.
+    assert [r.identifier for r in results] == ["exact", "prefix", "meta"]
+    cmd = runner.calls[0][0]
+    # A single wide candidate window is fetched from page 1, not the 30-row page.
+    assert _cmd_has(cmd, f"rows={ia_api.RANK_POOL_ROWS}")
+    assert _cmd_has(cmd, "page=1")
+
+
+def test_rerank_paginates_within_ranked_pool():
+    runner = runner_for(stdout=json.dumps(_rerank_payload()))
+    page1, total1, _ = ia_api.ia_search_via_curl(
+        "q", 2, 1, "", runner=runner, rerank_text="Toad Road"
+    )
+    page2, total2, _ = ia_api.ia_search_via_curl(
+        "q", 2, 2, "", runner=runner, rerank_text="Toad Road"
+    )
+
+    assert total1 == total2 == 3
+    assert [r.identifier for r in page1] == ["exact", "prefix"]
+    assert [r.identifier for r in page2] == ["meta"]
+
+
+def test_rerank_disabled_for_explicit_sort():
+    runner = runner_for(stdout=json.dumps(_rerank_payload()))
+
+    results, _total, _err = ia_api.ia_search_via_curl(
+        "q", 30, 1, "downloads desc", runner=runner, rerank_text="Toad Road"
+    )
+
+    # Explicit IA sort is honoured: original doc order, no wide window.
+    assert [r.identifier for r in results] == ["meta", "exact", "prefix"]
+    cmd = runner.calls[0][0]
+    assert _cmd_has(cmd, "rows=30")
+
+
+def test_rerank_deep_page_falls_back_to_raw_ia_paging():
+    runner = runner_for(stdout=json.dumps(_rerank_payload()))
+
+    results, _total, _err = ia_api.ia_search_via_curl(
+        "q", 100, 3, "", runner=runner, rerank_text="Toad Road"
+    )
+
+    # Page 3 at 100 rows is beyond the candidate window (200 rows -> 2 pages),
+    # so we fetch that raw IA page directly and leave its order untouched.
+    assert [r.identifier for r in results] == ["meta", "exact", "prefix"]
+    cmd = runner.calls[0][0]
+    assert _cmd_has(cmd, "rows=100")
+    assert _cmd_has(cmd, "page=3")
 
 
 def test_search_handles_curl_failure_and_non_json():

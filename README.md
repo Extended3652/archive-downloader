@@ -6,11 +6,11 @@ There is also **`ia_audit.py` / `ia-audit`** for scanning an existing media libr
 
 ## The tools
 
-**`ia_dl.py`** — scriptable argparse CLI. Subcommands: `search`, `list`, `download`. Good for shell scripts and one-off invocations.
+**`ia_dl.py`** — scriptable argparse CLI. Subcommands: `search`, `list`, `download`. Good for shell scripts and one-off invocations. Downloads stage under the destination's `.ia_staging/` directory before being imported into the final `dest/<identifier>/` path.
 
 **`ia_easy.py`** — interactive `input()`-based flow optimized for finding and grabbing a single movie file. Defaults to `$IA_MEDIA_ROOT` or `/mnt/ssd/media`, and prompts for another folder.
 
-**`ia_minotaur.py`** — full-screen curses TUI with favorites, open-license gating, staged downloads, live progress, and automatic bucket organization (`TV/`, `Movies/`, `Music/`, `Other/`). The heaviest of the three.
+**`ia_minotaur.py`** — full-screen curses TUI with favorites, inspectable search fallback attempts, open-license gating, staged downloads, live progress, and automatic bucket organization (`TV/`, `Movies/`, `Music/`, `Other/`). The heaviest of the three.
 
 **`ia_audit.py`** — report-oriented library auditor for the media root. Flags suspicious filenames, suggests cleaner filenames, detects duplicate episodes and movie folders, finds likely metadata cleanup work, reports stale `.ia_staging` / `.part` / `.torrent` leftovers, and can optionally produce `ffprobe`-based codec + bitrate summaries.
 
@@ -57,6 +57,8 @@ ia-minotaur
 
 Inside `ia-minotaur`, press `y` for a lightweight library audit summary in the status bar. For full details or fixes, use `ia-audit`.
 
+Searches try a small fallback sequence for plain text queries, such as identifier, title/year, title, fielded, and plain queries. In `ia-minotaur`, open Actions or Search tools and choose Search attempts to inspect or re-run one of those generated IA queries.
+
 ## Media root
 
 The download tools default to `/mnt/ssd/media`. Set `IA_MEDIA_ROOT` to choose a different default for the tools:
@@ -84,11 +86,17 @@ You can also create a read-only JSON config at `~/.config/archive-downloader/con
   "radarr_quality_profile_id": 1,
   "radarr_monitor_movie": true,
   "radarr_search_on_add": false,
-  "radarr_timeout_s": 10
+  "radarr_timeout_s": 10,
+  "bazarr_enabled": false,
+  "bazarr_url": "http://localhost:6767",
+  "bazarr_api_key": "",
+  "bazarr_timeout_s": 10,
+  "bazarr_wait_timeout_s": 120,
+  "bazarr_poll_interval_s": 3
 }
 ```
 
-Environment variables override the config file: `IA_MEDIA_ROOT`, `IA_DEFAULT_BUCKET`, `IA_DEFAULT_FILTER`, `IA_DEFAULT_SORT`, `IA_TITLE_ONLY`, `IA_LICENSE_GATE`, `IA_NO_CHANGE_TIMESTAMP`, `IA_ROWS_PER_PAGE`, `IA_RADARR_ENABLED`, `IA_RADARR_URL`, `IA_RADARR_API_KEY`, `RADARR_API_KEY`, `IA_RADARR_LOCAL_MOVIE_ROOT`, `IA_RADARR_ROOT_FOLDER`, `IA_RADARR_QUALITY_PROFILE_ID`, `IA_RADARR_MONITOR_MOVIE`, and `IA_RADARR_TIMEOUT_S`.
+Environment variables override the config file: `IA_MEDIA_ROOT`, `IA_DEFAULT_BUCKET`, `IA_DEFAULT_FILTER`, `IA_DEFAULT_SORT`, `IA_TITLE_ONLY`, `IA_LICENSE_GATE`, `IA_NO_CHANGE_TIMESTAMP`, `IA_ROWS_PER_PAGE`, `IA_RADARR_ENABLED`, `IA_RADARR_URL`, `IA_RADARR_API_KEY`, `RADARR_API_KEY`, `IA_RADARR_LOCAL_MOVIE_ROOT`, `IA_RADARR_ROOT_FOLDER`, `IA_RADARR_QUALITY_PROFILE_ID`, `IA_RADARR_MONITOR_MOVIE`, `IA_RADARR_TIMEOUT_S`, `IA_BAZARR_ENABLED`, `IA_BAZARR_URL`, `IA_BAZARR_API_KEY`, `BAZARR_API_KEY`, `IA_BAZARR_TIMEOUT_S`, `IA_BAZARR_WAIT_TIMEOUT_S`, and `IA_BAZARR_POLL_INTERVAL_S`.
 
 `ia-minotaur` can ask Jellyfin to rescan libraries when you quit after a successful import. Set `JELLYFIN_URL` and `JELLYFIN_API_KEY` in the environment that launches the downloader:
 
@@ -153,7 +161,23 @@ Controlled write test for one already imported movie requires `--apply`; without
 ia-radarr register "/mnt/ssd/media/Movies/Metropolis (1927)/Metropolis (1927).mp4" --title "Metropolis" --year 1927 --apply
 ```
 
-Radarr search-on-add remains disabled. The feature adds existing media as monitored for subtitle management, updates stale Radarr paths when safe, and requests a Radarr refresh. It never asks Radarr to download, replace, delete, move, or rename media. Bazarr is not called directly; it should pick up the movie from its normal Radarr sync. If a movie does not appear in Bazarr, verify Radarr shows the movie at the expected path, run `ia-radarr check`, confirm Bazarr's Radarr connection, then trigger Bazarr's Radarr sync from Bazarr.
+Radarr search-on-add remains disabled. The feature adds existing media as monitored for subtitle management, updates stale Radarr paths when safe, and requests a Radarr refresh. It never asks Radarr to download, replace, delete, move, or rename media.
+
+## Bazarr subtitle handoff
+
+`ia-minotaur` can optionally notify Bazarr immediately after a completed movie import has reached its final `Movies/Title (Year)/` path and Radarr registration has returned a movie id. Enable it with:
+
+```
+ia-config set bazarr_enabled true
+ia-config set bazarr_url http://bazarr-host:6767
+export BAZARR_API_KEY=your-api-key
+```
+
+For newly imported movies, the handoff asks Bazarr to sync that movie from Radarr, scan that movie on disk for existing subtitles, and search missing subtitles for that Radarr movie id. Archive-downloader does not choose providers, score subtitles, download subtitle files itself, or run subtitle synchronization itself; Bazarr remains responsible for those steps and uses its own configured automatic synchronization.
+
+If an English subtitle already exists beside the media, archive-downloader still notifies/scans Bazarr but skips the provider search to avoid replacing a valid subtitle unnecessarily. If Bazarr is unavailable, missing configuration, or cannot find a qualifying subtitle within `bazarr_wait_timeout_s`, the import remains successful and the TUI reports the Bazarr status. Jellyfin library refresh remains best-effort and is requested after this handoff.
+
+TV imports are not yet registered with Sonarr by archive-downloader, so there is no reliable Sonarr series/episode id for a targeted Bazarr TV handoff in the current flow.
 
 `ia-minotaur` organizes downloads into buckets under the shared media root:
 

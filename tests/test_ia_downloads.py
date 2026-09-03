@@ -79,6 +79,17 @@ def test_verify_expected_size_rejects_escaping_staging_path(monkeypatch, tmp_pat
     assert msg.startswith("Refused: staging path escapes item staging dir:")
 
 
+def test_verify_expected_size_rejects_escaping_staging_identifier(monkeypatch, tmp_path):
+    root = tmp_path / "media"
+    for module in (ia_paths, ia_downloads):
+        monkeypatch.setattr(module, "STAGING_ROOT", str(root / ".ia_staging"))
+
+    ok, msg = ia_downloads.verify_expected_size("../escape", "file.mp4", 1)
+
+    assert not ok
+    assert msg.startswith("Refused: staging item dir escapes staging root:")
+
+
 def test_normalize_media_permissions_adds_group_write_and_skips_symlinks(tmp_path):
     root = tmp_path / "media"
     media_dir = root / "Movies" / "Movie (1999)"

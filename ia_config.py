@@ -25,6 +25,12 @@ DEFAULT_CONFIG = {
     "radarr_monitor_movie": True,
     "radarr_search_on_add": False,
     "radarr_timeout_s": 10,
+    "bazarr_enabled": False,
+    "bazarr_url": "http://localhost:6767",
+    "bazarr_api_key": "",
+    "bazarr_timeout_s": 10,
+    "bazarr_wait_timeout_s": 120,
+    "bazarr_poll_interval_s": 3,
 }
 VALID_BUCKETS = {"TV", "Movies", "Music", "Other"}
 VALID_FILTERS = {"movies", "audio", "texts", "software", "any"}
@@ -146,6 +152,12 @@ def load_config(
     cfg["radarr_monitor_movie"] = parse_bool(data.get("radarr_monitor_movie"), cfg["radarr_monitor_movie"])
     cfg["radarr_search_on_add"] = False
     cfg["radarr_timeout_s"] = positive_float(data.get("radarr_timeout_s"), cfg["radarr_timeout_s"])
+    cfg["bazarr_enabled"] = parse_bool(data.get("bazarr_enabled"), cfg["bazarr_enabled"])
+    cfg["bazarr_url"] = clean_string(data.get("bazarr_url"), cfg["bazarr_url"]) or cfg["bazarr_url"]
+    cfg["bazarr_api_key"] = clean_string(data.get("bazarr_api_key"), cfg["bazarr_api_key"])
+    cfg["bazarr_timeout_s"] = positive_float(data.get("bazarr_timeout_s"), cfg["bazarr_timeout_s"])
+    cfg["bazarr_wait_timeout_s"] = positive_float(data.get("bazarr_wait_timeout_s"), cfg["bazarr_wait_timeout_s"])
+    cfg["bazarr_poll_interval_s"] = positive_float(data.get("bazarr_poll_interval_s"), cfg["bazarr_poll_interval_s"])
 
     if env.get("IA_MEDIA_ROOT"):
         cfg["media_root"] = os.path.expanduser(str(env["IA_MEDIA_ROOT"]))
@@ -184,6 +196,20 @@ def load_config(
         cfg["radarr_monitor_movie"] = parse_bool(env["IA_RADARR_MONITOR_MOVIE"], cfg["radarr_monitor_movie"])
     if env.get("IA_RADARR_TIMEOUT_S"):
         cfg["radarr_timeout_s"] = positive_float(env["IA_RADARR_TIMEOUT_S"], cfg["radarr_timeout_s"])
+    if env.get("IA_BAZARR_ENABLED"):
+        cfg["bazarr_enabled"] = parse_bool(env["IA_BAZARR_ENABLED"], cfg["bazarr_enabled"])
+    if env.get("IA_BAZARR_URL"):
+        cfg["bazarr_url"] = clean_string(env["IA_BAZARR_URL"], cfg["bazarr_url"]) or cfg["bazarr_url"]
+    if env.get("IA_BAZARR_API_KEY"):
+        cfg["bazarr_api_key"] = clean_string(env["IA_BAZARR_API_KEY"], cfg["bazarr_api_key"])
+    elif env.get("BAZARR_API_KEY"):
+        cfg["bazarr_api_key"] = clean_string(env["BAZARR_API_KEY"], cfg["bazarr_api_key"])
+    if env.get("IA_BAZARR_TIMEOUT_S"):
+        cfg["bazarr_timeout_s"] = positive_float(env["IA_BAZARR_TIMEOUT_S"], cfg["bazarr_timeout_s"])
+    if env.get("IA_BAZARR_WAIT_TIMEOUT_S"):
+        cfg["bazarr_wait_timeout_s"] = positive_float(env["IA_BAZARR_WAIT_TIMEOUT_S"], cfg["bazarr_wait_timeout_s"])
+    if env.get("IA_BAZARR_POLL_INTERVAL_S"):
+        cfg["bazarr_poll_interval_s"] = positive_float(env["IA_BAZARR_POLL_INTERVAL_S"], cfg["bazarr_poll_interval_s"])
 
     if not cfg["radarr_local_movie_root"]:
         cfg["radarr_local_movie_root"] = os.path.join(cfg["media_root"], "Movies")
@@ -278,6 +304,30 @@ def normalize_config_value(key: str, value: str) -> Tuple[Any, str]:
         if parsed <= 0:
             raise ValueError("radarr_timeout_s must be > 0")
         return parsed, "radarr_timeout_s"
+    if key == "bazarr_enabled":
+        return parse_bool(value, False), "bazarr_enabled"
+    if key == "bazarr_url":
+        cleaned = clean_string(value)
+        if not cleaned:
+            raise ValueError("bazarr_url must not be empty")
+        return cleaned, "bazarr_url"
+    if key == "bazarr_api_key":
+        return clean_string(value), "bazarr_api_key"
+    if key == "bazarr_timeout_s":
+        parsed = positive_float(value, 0)
+        if parsed <= 0:
+            raise ValueError("bazarr_timeout_s must be > 0")
+        return parsed, "bazarr_timeout_s"
+    if key == "bazarr_wait_timeout_s":
+        parsed = positive_float(value, 0)
+        if parsed <= 0:
+            raise ValueError("bazarr_wait_timeout_s must be > 0")
+        return parsed, "bazarr_wait_timeout_s"
+    if key == "bazarr_poll_interval_s":
+        parsed = positive_float(value, 0)
+        if parsed <= 0:
+            raise ValueError("bazarr_poll_interval_s must be > 0")
+        return parsed, "bazarr_poll_interval_s"
     raise ValueError(f"unknown config key: {key}")
 
 

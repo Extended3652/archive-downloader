@@ -17,7 +17,10 @@ def test_path_prints_config_path(monkeypatch, tmp_path, capsys):
 
 def test_show_prints_effective_config(monkeypatch, tmp_path, capsys):
     path = tmp_path / "config.json"
-    path.write_text('{"default_bucket": "Music", "radarr_api_key": "secret"}', encoding="utf-8")
+    path.write_text(
+        '{"default_bucket": "Music", "radarr_api_key": "secret", "bazarr_api_key": "bazarr-secret"}',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("IA_CONFIG_PATH", str(path))
 
     rc = ia_config_cli.main(["show"])
@@ -27,6 +30,7 @@ def test_show_prints_effective_config(monkeypatch, tmp_path, capsys):
     data = json.loads(captured.out)
     assert data["default_bucket"] == "Music"
     assert data["radarr_api_key"] == "[redacted]"
+    assert data["bazarr_api_key"] == "[redacted]"
     assert data["media_root"]
 
 

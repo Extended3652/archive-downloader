@@ -148,6 +148,34 @@ def test_main_download_bad_regex_returns_cli_error(monkeypatch, capsys):
     assert "Bad regex:" in captured.err
 
 
+def test_filter_files_deduplicates_proven_pair_and_keeps_extra():
+    files = [
+        IAFile("foo.ia.mp4", 10, "h.264 IA", source="derivative", original="foo.mp4"),
+        IAFile("foo.mp4", 10, "MPEG4", source="original"),
+        IAFile("The Critic Webisodes.mp4", 20, "MPEG4", source="original"),
+    ]
+
+    filtered = ia_dl.filter_files(files, ["mp4"], None)
+
+    assert [f.name for f in filtered] == ["foo.mp4", "The Critic Webisodes.mp4"]
+
+
+def test_resolve_glob_files_returns_only_logical_preferred_names(monkeypatch):
+    monkeypatch.setattr(
+        ia_dl,
+        "ia_list_files",
+        lambda _identifier: [
+            IAFile("foo.ia.mp4", 10, "h.264 IA", source="derivative", original="foo.mp4"),
+            IAFile("foo.mp4", 10, "MPEG4", source="original"),
+            IAFile("The Critic Webisodes.mp4", 20, "MPEG4", source="original"),
+        ],
+    )
+
+    assert [f.name for f in ia_dl.resolve_glob_files("item", "*")] == [
+        "foo.mp4", "The Critic Webisodes.mp4"
+    ]
+
+
 def test_main_search_builds_query_and_prints_results(monkeypatch, capsys):
     calls = []
 
@@ -240,12 +268,9 @@ def test_ia_download_emits_started_and_completed(monkeypatch, tmp_path):
     monkeypatch.setattr(ia_dl, "emit_archive_failed", lambda message: calls.append(("failed", message)))
 
     def fake_run(_cmd, check=True):
-        item_dir = tmp_path / "item1"
-        item_dir.mkdir()
-        output = item_dir / "movie.mp4"
-        output.write_bytes(b"movie")
-        item_dir.chmod(0o2755)
-        output.chmod(0o644)
+        staged = tmp_path / ".ia_staging" / "item1"
+        staged.mkdir(parents=True)
+        (staged / "movie.mp4").write_bytes(b"movie")
 
     monkeypatch.setattr(ia_dl, "run", fake_run)
 
@@ -256,8 +281,6 @@ def test_ia_download_emits_started_and_completed(monkeypatch, tmp_path):
         ("completed", str(tmp_path / "item1" / "movie.mp4")),
     ]
     assert (tmp_path / "item1" / "movie.mp4").read_bytes() == b"movie"
-    assert stat.S_IMODE(os.stat(tmp_path / "item1").st_mode) == 0o2775
-    assert stat.S_IMODE(os.stat(tmp_path / "item1" / "movie.mp4").st_mode) == 0o664
 
 
 def test_ia_download_emits_failure_without_swallowing_exception(monkeypatch, tmp_path):
@@ -277,6 +300,43 @@ def test_ia_download_emits_failure_without_swallowing_exception(monkeypatch, tmp
     assert calls[0] == ("started", "item1 movie.mp4")
     assert calls[1][0] == "failed"
     assert "download exploded" in calls[1][1]
+
+
+def test_import_staged_download_normalizes_single_file_permissions(tmp_path):
+    staging = tmp_path / ".ia_staging"
+    src_dir = staging / "item1" / "subdir"
+    src_dir.mkdir(parents=True)
+    src = src_dir / "movie.mp4"
+    src.write_bytes(b"movie")
+    src.chmod(0o644)
+
+    final = ia_dl.import_staged_download(str(staging), "item1", "subdir/movie.mp4", str(tmp_path))
+    final_path = tmp_path / "item1" / "subdir" / "movie.mp4"
+
+    assert final == str(final_path)
+    assert stat.S_IMODE((tmp_path / "item1").stat().st_mode) == 0o2775
+    assert stat.S_IMODE(final_path.parent.stat().st_mode) == 0o2775
+    assert stat.S_IMODE(final_path.stat().st_mode) == 0o664
+
+
+def test_import_staged_download_normalizes_moved_directory_tree(tmp_path):
+    staging = tmp_path / ".ia_staging"
+    src_dir = staging / "item1"
+    nested = src_dir / "subdir"
+    nested.mkdir(parents=True)
+    media_file = nested / "movie.mp4"
+    media_file.write_bytes(b"movie")
+    src_dir.chmod(0o2755)
+    nested.chmod(0o2755)
+    media_file.chmod(0o644)
+
+    final = ia_dl.import_staged_download(str(staging), "item1", None, str(tmp_path))
+    final_dir = tmp_path / "item1"
+
+    assert final == str(final_dir)
+    assert stat.S_IMODE(final_dir.stat().st_mode) == 0o2775
+    assert stat.S_IMODE((final_dir / "subdir").stat().st_mode) == 0o2775
+    assert stat.S_IMODE((final_dir / "subdir" / "movie.mp4").stat().st_mode) == 0o664
 
 
 def test_main_sets_process_umask(monkeypatch, capsys):

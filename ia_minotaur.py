@@ -17,6 +17,7 @@ from ia_common import (
     VIDEO_EXTS,
     VIDEO_FORMAT_HINTS,
     compact_count,
+    deduplicate_file_variants,
     human_size,
     is_archive_torrent_format,
     is_dvd_iso_file,
@@ -45,6 +46,7 @@ import ia_audit
 import ia_config
 import ia_downloads
 import ia_dvd
+import ia_bazarr
 import ia_jellyfin
 import ia_minotaur_events
 import ia_radarr
@@ -85,8 +87,8 @@ APP_CONFIG = ia_config.load_config()
 ROWS_PER_PAGE = int(APP_CONFIG["rows_per_page"])
 MAX_HISTORY = 20
 
-MIN_H = 18
-MIN_W = 70
+MIN_H = 14
+MIN_W = 50
 
 # Keep downloaded file mtimes as "now" so normal tools like find -mmin work as expected.
 # This also reduces confusion when verifying "new downloads" by timestamp.
@@ -290,8 +292,24 @@ def ia_ok() -> Tuple[bool, str]:
     return ia_api.ia_ok(runner=run_cmd)
 
 
-def ia_search_via_curl(query: str, rows: int, page: int, sort: str = "") -> Tuple[List[SearchResult], int, str]:
-    return ia_api.ia_search_via_curl(query, rows, page, sort, runner=run_cmd)
+def ia_search_via_curl(
+    query: str,
+    rows: int,
+    page: int,
+    sort: str = "",
+    *,
+    rerank_text: str = "",
+    media_filter: str = "any",
+) -> Tuple[List[SearchResult], int, str]:
+    return ia_api.ia_search_via_curl(
+        query,
+        rows,
+        page,
+        sort,
+        runner=run_cmd,
+        rerank_text=rerank_text,
+        media_filter=media_filter,
+    )
 
 
 def ia_files(identifier: str) -> Tuple[List[IAFile], Optional[Dict[str, Any]], str]:
@@ -299,7 +317,16 @@ def ia_files(identifier: str) -> Tuple[List[IAFile], Optional[Dict[str, Any]], s
 
 
 def yt_search(query: str, rows: int = 10) -> Tuple[List[SearchResult], int, str]:
-    return yt_api.yt_search(query, rows, yt_dlp_path=APP_CONFIG["yt_dlp_path"], runner=run_cmd)
+    return yt_api.yt_search(query, rows, yt_dlp_path=APP_CONFIG["yt_dlp_path"], runner=run_cmd, logger=log_line)
+
+
+def youtube_result_status(results: List[SearchResult]) -> str:
+    if results:
+        return f"YouTube — {len(results)} result(s). [YT] rows open as single-video downloads."
+    return (
+        "YouTube — 0 results. yt-dlp ran without error but returned nothing; "
+        "YouTube may have rate-limited/blocked the search — try again in a moment."
+    )
 
 
 def yt_metadata_url(url: str) -> Tuple[Optional[SearchResult], str]:
@@ -573,10 +600,30 @@ class RetroWaveIA:
     def init_colors(self) -> None:
         curses.start_color()
         curses.use_default_colors()
-        if self.theme_name == "Minimal":
+        supports_256 = (getattr(curses, "COLORS", 0) or 0) >= 256
+        if supports_256 and self.theme_name not in ("Minimal", "High contrast"):
+            colors = (
+                250,  # title/header
+                178,  # borders/section accent
+                178,  # gold accent
+                114,  # good/selected
+                167,  # warning/error
+                253,  # normal text
+                16,   # selected foreground
+                16,   # prompt foreground
+                16,   # action foreground
+            )
+            backs = (-1, -1, -1, -1, -1, -1, 178, 208, 220)
+        elif supports_256 and self.theme_name == "High contrast":
+            colors = (220, 178, 220, 114, 167, 253, 16, 16, 16)
+            backs = (-1, -1, -1, -1, -1, -1, 178, 208, 220)
+        elif supports_256 and self.theme_name == "Minimal":
+            colors = (253, 178, 253, 114, 167, 253, 16, 16, 16)
+            backs = (-1, -1, -1, -1, -1, -1, 253, 178, 220)
+        elif self.theme_name == "Minimal":
             colors = (
                 curses.COLOR_WHITE,
-                curses.COLOR_CYAN,
+                curses.COLOR_YELLOW,
                 curses.COLOR_WHITE,
                 curses.COLOR_GREEN,
                 curses.COLOR_RED,
@@ -585,11 +632,11 @@ class RetroWaveIA:
                 curses.COLOR_BLACK,
                 curses.COLOR_BLACK,
             )
-            backs = (-1, -1, -1, -1, -1, -1, curses.COLOR_WHITE, curses.COLOR_CYAN, curses.COLOR_YELLOW)
+            backs = (-1, -1, -1, -1, -1, -1, curses.COLOR_WHITE, curses.COLOR_YELLOW, curses.COLOR_YELLOW)
         elif self.theme_name == "High contrast":
             colors = (
                 curses.COLOR_YELLOW,
-                curses.COLOR_CYAN,
+                curses.COLOR_YELLOW,
                 curses.COLOR_YELLOW,
                 curses.COLOR_GREEN,
                 curses.COLOR_RED,
@@ -598,11 +645,11 @@ class RetroWaveIA:
                 curses.COLOR_BLACK,
                 curses.COLOR_BLACK,
             )
-            backs = (-1, -1, -1, -1, -1, -1, curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_YELLOW)
+            backs = (-1, -1, -1, -1, -1, -1, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_YELLOW)
         else:
             colors = (
-                curses.COLOR_MAGENTA,
-                curses.COLOR_CYAN,
+                curses.COLOR_YELLOW,
+                curses.COLOR_YELLOW,
                 curses.COLOR_YELLOW,
                 curses.COLOR_GREEN,
                 curses.COLOR_RED,
@@ -611,7 +658,7 @@ class RetroWaveIA:
                 curses.COLOR_BLACK,
                 curses.COLOR_BLACK,
             )
-            backs = (-1, -1, -1, -1, -1, -1, curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_YELLOW)
+            backs = (-1, -1, -1, -1, -1, -1, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_YELLOW)
         for i, (fg, bg) in enumerate(zip(colors, backs), start=1):
             curses.init_pair(i, fg, bg)
 
@@ -858,6 +905,21 @@ class RetroWaveIA:
             ]
         )
 
+    def _rerank_args(self, *, custom: bool = False) -> Tuple[str, str]:
+        """Return (rerank_text, media_filter) for local relevance ranking.
+
+        Only plain user-text searches under relevance sort get re-ranked; custom
+        or advanced queries are left in Internet Archive's own order. The chosen
+        values are stashed so background page prefetch ranks pages identically.
+        """
+        qt = str(getattr(self, "query_text", "") or "")
+        if custom or not qt.strip() or looks_like_advanced_query(qt):
+            args = ("", "any")
+        else:
+            args = (qt, str(getattr(self, "filter", "any") or "any"))
+        self._active_rerank_text, self._active_rerank_filter = args
+        return args
+
     def _ensure_search_cache_state(self) -> None:
         if not hasattr(self, "_search_cache_lock") or getattr(self, "_search_cache_lock", None) is None:
             self._search_cache_lock = threading.RLock()
@@ -940,7 +1002,15 @@ class RetroWaveIA:
             self._all_results_total_pages = max(0, total_pages)
             self._all_results_loader_error = ""
 
-    def _start_search_prefetch(self, query: str, total_pages: int, sort_by: str, current_page: int) -> None:
+    def _start_search_prefetch(
+        self,
+        query: str,
+        total_pages: int,
+        sort_by: str,
+        current_page: int,
+        rerank_text: str = "",
+        media_filter: str = "any",
+    ) -> None:
         self._ensure_search_cache_state()
         if total_pages <= 1:
             with self._search_cache_lock:
@@ -969,7 +1039,14 @@ class RetroWaveIA:
                 with self._search_cache_lock:
                     if token != self._all_results_loader_token or self._all_results_cache_key != key:
                         return
-                page_results, _page_total, err = ia_search_via_curl(query, rows=ROWS_PER_PAGE, page=page, sort=sort_by)
+                page_results, _page_total, err = ia_search_via_curl(
+                    query,
+                    rows=ROWS_PER_PAGE,
+                    page=page,
+                    sort=sort_by,
+                    rerank_text=rerank_text,
+                    media_filter=media_filter,
+                )
                 if err:
                     with self._search_cache_lock:
                         if token == self._all_results_loader_token and self._all_results_cache_key == key:
@@ -1014,11 +1091,25 @@ class RetroWaveIA:
             total = int(getattr(self, "total_results", 0) or len(page_results))
             total_pages = max(1, (total + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
             self._prime_search_cache(key, current_page, page_results, total_pages)
-            self._start_search_prefetch(query, total_pages, getattr(self, "sort_by", ""), current_page)
+            self._start_search_prefetch(
+                query,
+                total_pages,
+                getattr(self, "sort_by", ""),
+                current_page,
+                getattr(self, "_active_rerank_text", ""),
+                getattr(self, "_active_rerank_filter", "any"),
+            )
             return
 
         if not loading and total_pages > loaded_pages:
-            self._start_search_prefetch(query, total_pages, getattr(self, "sort_by", ""), current_page)
+            self._start_search_prefetch(
+                query,
+                total_pages,
+                getattr(self, "sort_by", ""),
+                current_page,
+                getattr(self, "_active_rerank_text", ""),
+                getattr(self, "_active_rerank_filter", "any"),
+            )
 
     def _load_all_search_results(self) -> List[SearchResult]:
         self._ensure_search_cache_state()
@@ -1251,6 +1342,7 @@ class RetroWaveIA:
             ("YouTube URL", "youtube_url"),
             ("Search history", "history"),
             ("Search presets", "search_preset"),
+            ("Search attempts", "search_attempts"),
             ("Field search", "field_search"),
             ("Collection search", "collection_search"),
             ("Within collection", "within_collection"),
@@ -1268,6 +1360,33 @@ class RetroWaveIA:
             if label == pick:
                 self.activate_menu_action(action)
                 return
+
+    def choose_search_attempt(self) -> None:
+        attempts = [(label, query) for label, query in getattr(self, "last_search_attempts", []) if query]
+        if not attempts:
+            self.status = "No search attempts recorded yet."
+            return
+
+        labels: List[str] = []
+        for label, query in attempts:
+            marker = "*" if label == getattr(self, "last_search_used_label", "") else " "
+            short = query if len(query) <= 72 else query[:69] + "..."
+            labels.append(f"{marker} {label}: {short}")
+
+        pick = self.prompt_list("Search attempts", labels)
+        if not pick:
+            self.status = "Search attempt unchanged."
+            return
+
+        idx = labels.index(pick)
+        label, query = attempts[idx]
+        self.start_search_async(
+            reset_page=True,
+            built_query=query,
+            built_query_label=label,
+            attempts_display=attempts,
+        )
+        self.status = f"Searching with {label} attempt..."
 
     def choose_search_source(self) -> None:
         options = [
@@ -1823,6 +1942,7 @@ class RetroWaveIA:
             ("Search / source chooser", "source_switch", None),
             ("Search / YouTube direct URL", "youtube_url", None),
             ("Search / tools (history fields collections local filter)", "search_tools", "a"),
+            ("Search / attempts (inspect or re-run fallback query)", "search_attempts", None),
             ("Local / clear filter", "clear_result_filter", "L/F"),
             ("Search / collections (mediatype collection)", "collection_search", None),
             ("Search / fields (title creator subject date collection)", "field_search", None),
@@ -1851,7 +1971,7 @@ class RetroWaveIA:
             ("Select / mark all visible files", "mark_all_visible", "A"),
             ("Select / invert visible marks", "invert_visible_marks", "I"),
             ("Select / clear marked files", "clear_file_marks", "U"),
-            ("Download / marked files", "download", "d"),
+            ("Download / marked files batch queue", "download", "d"),
             ("Download / retry failed files retry failed", "retry_failed", "R"),
             ("Download / folder prefix folder", "folder", "o"),
             ("Download / all visible files all", "item", "D"),
@@ -1999,9 +2119,17 @@ class RetroWaveIA:
         previous_cache_key = self._search_cache_key()
         self.results = []
         self.total_results = 0
+        rerank_text, rerank_filter = self._rerank_args(custom=built_query is not None)
         for label, query in attempts:
             self.query_built = query
-            self.results, self.total_results, err = ia_search_via_curl(query, rows=ROWS_PER_PAGE, page=self.page, sort=self.sort_by)
+            self.results, self.total_results, err = ia_search_via_curl(
+                query,
+                rows=ROWS_PER_PAGE,
+                page=self.page,
+                sort=self.sort_by,
+                rerank_text=rerank_text,
+                media_filter=rerank_filter,
+            )
             if err:
                 last_err = err
                 break
@@ -2034,14 +2162,21 @@ class RetroWaveIA:
         else:
             self.status = f"Page {self.page} — {len(self.results)} results{search_hint}. Arrows to select, Enter to open."
 
-    def start_search_async(self, reset_page: bool = True, built_query: Optional[str] = None) -> None:
+    def start_search_async(
+        self,
+        reset_page: bool = True,
+        built_query: Optional[str] = None,
+        built_query_label: str = "custom",
+        attempts_display: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
         self._ensure_search_load_state()
         self.cancel_file_load()
         self.search_source = "ia"
         if reset_page:
             self.page = 1
-        attempts = [("custom", built_query)] if built_query is not None else build_query_attempts(self.query_text, self.filter, self.title_only)
+        attempts = [(built_query_label, built_query)] if built_query is not None else build_query_attempts(self.query_text, self.filter, self.title_only)
         attempts = [(label, query) for label, query in attempts if query]
+        display_attempts = [(label, query) for label, query in (attempts_display or attempts) if query]
         if not attempts:
             self.query_built = ""
             self.status = "Select [Search] in the menu to search."
@@ -2055,7 +2190,7 @@ class RetroWaveIA:
         self._save_session()
         self.show_welcome = False
         self.status = "Searching... press Esc to cancel waiting."
-        self.last_search_attempts = list(attempts)
+        self.last_search_attempts = list(display_attempts)
         previous_cache_key = self._search_cache_key()
 
         with self._search_load_lock:
@@ -2072,6 +2207,7 @@ class RetroWaveIA:
 
         page = self.page
         sort_by = self.sort_by
+        rerank_text, rerank_filter = self._rerank_args(custom=built_query is not None)
 
         def worker() -> None:
             used_label = ""
@@ -2080,7 +2216,14 @@ class RetroWaveIA:
             final_total = 0
             final_query = ""
             for label, query in attempts:
-                results, total, err = ia_search_via_curl(query, rows=ROWS_PER_PAGE, page=page, sort=sort_by)
+                results, total, err = ia_search_via_curl(
+                    query,
+                    rows=ROWS_PER_PAGE,
+                    page=page,
+                    sort=sort_by,
+                    rerank_text=rerank_text,
+                    media_filter=rerank_filter,
+                )
                 if err:
                     last_err = err
                     break
@@ -2097,7 +2240,7 @@ class RetroWaveIA:
                 "total": final_total,
                 "query": final_query,
                 "used_label": used_label,
-                "attempts": list(attempts),
+                "attempts": list(display_attempts),
                 "previous_cache_key": previous_cache_key,
                 "preserve_local_filter": preserve_local_filter,
                 "page": page,
@@ -2139,6 +2282,7 @@ class RetroWaveIA:
             self._search_load_result = {"pending": True, "source": "all"}
 
         sort_by = self.sort_by
+        rerank_text, rerank_filter = self._rerank_args()
 
         def worker() -> None:
             ia_results: List[SearchResult] = []
@@ -2147,7 +2291,14 @@ class RetroWaveIA:
             ia_label = ""
             ia_err = ""
             for label, query in attempts:
-                results, total, err = ia_search_via_curl(query, rows=ROWS_PER_PAGE, page=1, sort=sort_by)
+                results, total, err = ia_search_via_curl(
+                    query,
+                    rows=ROWS_PER_PAGE,
+                    page=1,
+                    sort=sort_by,
+                    rerank_text=rerank_text,
+                    media_filter=rerank_filter,
+                )
                 if err:
                     ia_err = err
                     break
@@ -2307,7 +2458,7 @@ class RetroWaveIA:
                 self.status = f"Page {self.page} — {len(self.results)} results{search_hint}. Arrows to select, Enter to open."
         elif source == "youtube":
             self.result_filter = ""
-            self.status = f"YouTube — {len(self.results)} result(s). [YT] rows open as single-video downloads."
+            self.status = youtube_result_status(self.results)
         elif source == "all":
             self.result_filter = ""
             ia_count = int(result.get("ia_count") or 0)
@@ -2353,7 +2504,7 @@ class RetroWaveIA:
         self.last_search_text = query_text
         self.last_search_used_label = "youtube"
         self.last_search_attempts = [("youtube", self.query_built)]
-        self.status = f"YouTube — {len(results)} result(s). [YT] rows open as single-video downloads."
+        self.status = youtube_result_status(results)
 
     def do_youtube_url(self, url: str) -> None:
         self.cancel_file_load()
@@ -2644,7 +2795,7 @@ class RetroWaveIA:
         self.selected_file_order.clear()
 
     def get_visible_files(self) -> List[IAFile]:
-        files = list(self.files)
+        files = deduplicate_file_variants(list(self.files))
         if self.video_only:
             files = [f for f in files if is_video_file(f.name, f.fmt)]
         kw = self.file_kw.strip()
@@ -2657,7 +2808,7 @@ class RetroWaveIA:
         ordered_names = self._ordered_selected_file_names()
         if not ordered_names:
             return []
-        visible_by_name = {f.name: f for f in self.files}
+        visible_by_name = {f.name: f for f in self.get_visible_files()}
         return [visible_by_name[name] for name in ordered_names if name in visible_by_name]
 
     def toggle_current_file_mark(self) -> None:
@@ -3047,8 +3198,12 @@ class RetroWaveIA:
             shutil.move(staging_path, final_path)
             normalize_media_permissions(final_path, include_parents=True)
             msg = f"Saved: {final_path}"
+            self.last_radarr_result = None
             note = self.register_radarr_movie_if_needed(final_path, batch.get("bucket", ""), item_title)
-            return f"{msg} | {note}" if note else msg
+            bazarr_note = self.notify_bazarr_if_needed(final_path, batch.get("bucket", ""), item_title)
+            notes = [note, bazarr_note]
+            notes = [value for value in notes if value]
+            return f"{msg} | {' | '.join(notes)}" if notes else msg
 
         def is_single_large_video(name: str) -> bool:
             try:
@@ -3180,10 +3335,15 @@ class RetroWaveIA:
         shutil.move(staging_path, final_path)
         normalize_media_permissions(final_path, include_parents=True)
         msg = f"Saved: {final_path}"
+        self.last_radarr_result = None
         note = self.register_radarr_movie_if_needed(final_path, bucket, item_title)
-        return f"{msg} | {note}" if note else msg
+        bazarr_note = self.notify_bazarr_if_needed(final_path, bucket, item_title)
+        notes = [note, bazarr_note]
+        notes = [value for value in notes if value]
+        return f"{msg} | {' | '.join(notes)}" if notes else msg
 
     def register_radarr_movie_if_needed(self, final_path: str, bucket: str, item_title: str) -> str:
+        self.last_radarr_result = None
         if bucket != "Movies":
             return ""
         if not os.path.exists(final_path):
@@ -3201,6 +3361,7 @@ class RetroWaveIA:
             metadata=meta,
             logger=lambda message: log_line(f"RADARR: {message}"),
         )
+        self.last_radarr_result = result
         if result.status == "disabled":
             return ""
         note = f"Radarr: {result.message}"
@@ -3211,8 +3372,37 @@ class RetroWaveIA:
             pass
         return note
 
+    def notify_bazarr_if_needed(self, final_path: str, bucket: str, item_title: str) -> str:
+        if bucket not in ("Movies", "TV"):
+            return ""
+        if not os.path.exists(final_path):
+            return ""
+        if bucket == "Movies":
+            radarr_result = getattr(self, "last_radarr_result", None)
+            radarr_id = int(getattr(radarr_result, "movie_id", 0) or 0)
+            result = ia_bazarr.handoff_movie(
+                final_path,
+                radarr_id,
+                logger=lambda message: log_line(f"BAZARR: {message}"),
+            )
+        else:
+            result = ia_bazarr.handoff_series(
+                final_path,
+                0,
+                logger=lambda message: log_line(f"BAZARR: {message}"),
+            )
+        if result.status == "disabled":
+            return ""
+        note = f"Bazarr: {result.message}"
+        try:
+            self.download_log.insert(0, note)
+            self.download_log = self.download_log[:8]
+        except Exception:
+            pass
+        return note
+
     def choose_batch_import_options(self, item_title: str) -> Optional[Dict[str, str]]:
-        use_batch = self.prompt("Use one destination for this queue? Enter=yes, type n=no: ", "")
+        use_batch = self.prompt("Batch destination for this queue? Enter=yes, type n=no: ", "")
         if use_batch is None or use_batch.strip().lower().startswith("n"):
             return None
         default_bucket = normalize_save_bucket(self.last_bucket, "Movies")
@@ -3224,10 +3414,23 @@ class RetroWaveIA:
             folder = self.pick_folder_name("TV", sanitize_folder(item_title), "Queue show name: ")
             if folder is None:
                 return None
-            season = self.prompt("Queue season number: ", "01")
+            mode = self.prompt_list(
+                "TV batch seasons",
+                ["Auto from SxxEyy filenames", "One season for whole queue"],
+                default_idx=0,
+            )
+            if mode is None:
+                return None
+            season = self.prompt("Fallback/queue season number: ", "01")
             if season is None:
                 return None
-            return {"bucket": bucket, "folder": folder, "season": season or "01"}
+            self.add_folder_fav("TV", folder)
+            return {
+                "bucket": bucket,
+                "folder": folder,
+                "season": season or "01",
+                "season_mode": "auto" if mode.startswith("Auto") else "single",
+            }
         if bucket == "Movies":
             folder = self.pick_folder_name("Movies", auto_clean_movie_folder_name(item_title, ""), "Queue movie folder: ")
             if folder is None:
@@ -3252,6 +3455,8 @@ class RetroWaveIA:
             except Exception:
                 season = 1
             ep = detect_sxxeyy(filename) or detect_sxxeyy(item_title)
+            if batch.get("season_mode") == "auto" and ep:
+                season = ep[0]
             new_name = filename
             if ep:
                 ext = os.path.splitext(filename)[1] or ".mp4"
@@ -4194,7 +4399,14 @@ class RetroWaveIA:
             self.mode = "DOWNLOADING"
             self.focus = "MENU"
 
-            if self.preview_prefix and self.preview_prefix not in ("__FULL_ITEM__", "__SELECTED__"):
+            # Prefix plans are resolved to the logical queue above. Keep the
+            # IA server-side glob path disabled: it could also fetch a hidden
+            # .ia variant that is absent from the queue.
+            if (
+                self.preview_prefix
+                and self.preview_prefix not in ("__FULL_ITEM__", "__SELECTED__")
+                and getattr(self, "_allow_server_glob_for_logical_queue", False)
+            ):
                 remaining_for_glob: List[IAFile] = []
                 completed_names: List[str] = []
                 for f in queue:
@@ -4451,6 +4663,7 @@ class RetroWaveIA:
             "  [Sort]       choose: relevance / date / title / downloads",
             "  [Title only] search within item titles only",
             "  [Local]      refines all loaded search results; L clears it quickly",
+            "  [Attempts]   inspect or re-run the fallback queries for this search",
             "  [Collections] finds IA collection items",
             "  [In Collection] narrows by a collection identifier",
             "  Actions -> Search / fields searches title, creator, subject, date, etc.",
@@ -5208,6 +5421,9 @@ class RetroWaveIA:
                     self.status = str(e)
                     return
                 self.set_query_and_search(extra or preset, built_query=query)
+                return
+            if action == "search_attempts":
+                self.choose_search_attempt()
                 return
             if action == "collection_search":
                 s = self.prompt("Find collections: ", "")

@@ -377,7 +377,7 @@ class TestRetroWaveIAState:
         labels = [label for label, _action in app.action_palette_options()]
 
         assert "Open / preview selected file" in labels
-        assert "Download / marked files" in labels
+        assert "Download / marked files batch queue" in labels
         assert "Filter / file filter menu" in labels
         assert "Select / toggle file mark" in labels
         assert "Select / mark file range" in labels
@@ -470,6 +470,16 @@ class TestRetroWaveIAState:
         assert any("Tab switches MENU/LIST" in line for line in lines)
         assert any("Open Enter/o | Search / | Details r | Local l/f | Clear L/F" in line for line in lines)
         assert any("Actions a | Page n/p" in line for line in lines)
+
+    def test_compact_terminal_is_not_too_small(self):
+        class FakeScreen:
+            def getmaxyx(self):
+                return (14, 50)
+
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.stdscr = FakeScreen()
+
+        assert app.term_too_small() is False
 
     def test_show_audit_summary_updates_status(self, monkeypatch):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -692,6 +702,41 @@ class TestRetroWaveIAState:
         assert app.selected_file_names == set()
         assert app.selected_file_order == []
 
+    def test_video_view_and_marked_plan_use_logical_preferred_files(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [
+            ia_minotaur.IAFile(
+                "03 - Marty's First Date.ia.mp4",
+                10,
+                "h.264 IA",
+                source="derivative",
+                original="03 - Marty's First Date.mp4",
+            ),
+            ia_minotaur.IAFile(
+                "03 - Marty's First Date.mp4",
+                10,
+                "MPEG4",
+                source="original",
+            ),
+            ia_minotaur.IAFile("The Critic Webisodes.mp4", 20, "MPEG4", source="original"),
+        ]
+        app.file_kw = ""
+        app.video_only = True
+        app.sel_f = 0
+        app.selected_file_names = set()
+        app.selected_file_order = []
+        app.save_current_file_view_state = lambda: None
+
+        app.mark_all_visible_files()
+
+        assert [f.name for f in app.get_visible_files()] == [
+            "03 - Marty's First Date.mp4", "The Critic Webisodes.mp4"
+        ]
+        assert app.selected_file_order == [
+            "03 - Marty's First Date.mp4", "The Critic Webisodes.mp4"
+        ]
+        assert [f.name for f in app.get_marked_visible_files()] == app.selected_file_order
+
     def test_prefix_suggestions_include_directory_prefixes(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
 
@@ -781,6 +826,43 @@ class TestRetroWaveIAState:
         path = app.batch_destination_path(batch, "source.mp4", "Ignored")
 
         assert path.endswith("/Movies/Movie Folder/Movie Folder.mp4")
+
+    def test_tv_batch_destination_auto_splits_detected_seasons(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        batch = {"bucket": "TV", "folder": "A Show", "season": "01", "season_mode": "auto"}
+
+        s1 = app.batch_destination_path(batch, "A.Show.S01E02.mp4", "Ignored")
+        s2 = app.batch_destination_path(batch, "A.Show.S02E03.mp4", "Ignored")
+
+        assert s1.endswith("/TV/A Show/Season 01/A Show - S01E02.mp4")
+        assert s2.endswith("/TV/A Show/Season 02/A Show - S02E03.mp4")
+
+    def test_tv_batch_destination_single_season_keeps_queue_season(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        batch = {"bucket": "TV", "folder": "A Show", "season": "05", "season_mode": "single"}
+
+        path = app.batch_destination_path(batch, "A.Show.S02E03.mp4", "Ignored")
+
+        assert path.endswith("/TV/A Show/Season 05/A Show - S05E03.mp4")
+
+    def test_choose_tv_batch_import_options_defaults_to_auto_seasons(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.last_bucket = "TV"
+        app.favs = {"items": [], "files": [], "folders": {"TV": [], "Movies": [], "Music": [], "Other": []}}
+        app.add_folder_fav = lambda *_args, **_kwargs: None
+        prompts = iter(["", "01"])
+        menus = iter(["TV", "A Show", "Auto from SxxEyy filenames"])
+        app.prompt = lambda _label, default="": next(prompts) or default
+        app.prompt_list = lambda _title, _options, default_idx=0: next(menus)
+
+        batch = app.choose_batch_import_options("A Show")
+
+        assert batch == {
+            "bucket": "TV",
+            "folder": "A Show",
+            "season": "01",
+            "season_mode": "auto",
+        }
 
     def test_movie_filename_for_folder_preserves_extension(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -1148,7 +1230,7 @@ class TestRetroWaveIAState:
         calls = []
         started = []
 
-        def fake_search(query, rows, page, sort=""):
+        def fake_search(query, rows, page, sort="", **_kwargs):
             calls.append((query, rows, page, sort))
             return ([ia_minotaur.SearchResult("page2", "Omega Match", mediatype="movies", description="omega")], ia_minotaur.ROWS_PER_PAGE + 1, "")
 
@@ -1196,7 +1278,7 @@ class TestRetroWaveIAState:
         app._save_session = lambda: None
         calls = []
 
-        def fake_search(query, rows, page, sort=""):
+        def fake_search(query, rows, page, sort="", **_kwargs):
             calls.append((query, rows, page, sort))
             if query == 'title:("Cop Land") AND year:1997 AND mediatype:movies':
                 return [ia_minotaur.SearchResult("cop-land-1997", "Cop Land", year="1997", mediatype="movies")], 1, ""
@@ -1522,7 +1604,7 @@ class TestRetroWaveIAState:
         app.render = lambda: None
         calls = []
 
-        def fake_search(query, rows, page, sort=""):
+        def fake_search(query, rows, page, sort="", **_kwargs):
             calls.append(query)
             if "creator" in query:
                 return [ia_minotaur.SearchResult("one", "One")], 1, ""
@@ -1584,7 +1666,7 @@ class TestRetroWaveIAState:
         monkeypatch.setattr(
             ia_minotaur,
             "ia_search_via_curl",
-            lambda query, rows, page, sort="": ([ia_minotaur.SearchResult("one", "One")], 1, ""),
+            lambda query, rows, page, sort="", **_kwargs: ([ia_minotaur.SearchResult("one", "One")], 1, ""),
         )
 
         app.do_search(reset_page=True)
@@ -1613,7 +1695,7 @@ class TestRetroWaveIAState:
         monkeypatch.setattr(
             ia_minotaur,
             "ia_search_via_curl",
-            lambda query, rows, page, sort="": ([ia_minotaur.SearchResult("one", "One")], 1, ""),
+            lambda query, rows, page, sort="", **_kwargs: ([ia_minotaur.SearchResult("one", "One")], 1, ""),
         )
 
         app.do_search(reset_page=True)
@@ -1797,7 +1879,7 @@ class TestRetroWaveIAState:
         monkeypatch.setattr(
             ia_minotaur,
             "ia_search_via_curl",
-            lambda query, rows, page, sort="": (
+            lambda query, rows, page, sort="", **_kwargs: (
                 [ia_minotaur.SearchResult(f"item{i}", f"Item {i}") for i in range(ia_minotaur.ROWS_PER_PAGE)],
                 500,
                 "",
@@ -1850,6 +1932,60 @@ class TestRetroWaveIAState:
         assert app._search_load_loading is True
         assert app.query_built == "identifier:noir AND mediatype:movies"
         assert app.status.startswith("Searching...")
+
+    def test_choose_search_attempt_reruns_selected_attempt_and_keeps_attempts(self, monkeypatch):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.query_text = "noir"
+        app.query_built = ""
+        app.filter = "movies"
+        app.title_only = False
+        app.sort_by = ""
+        app.search_history = []
+        app.page = 1
+        app.sel_r = 0
+        app.result_filter = ""
+        app.last_search_text = "noir"
+        app.focus = "MENU"
+        app.enforce_license_gate = False
+        app.show_welcome = True
+        app.cancel_file_load = lambda: None
+        app._save_session = lambda: None
+        app.last_search_used_label = "title"
+        app.last_search_attempts = [
+            ("title", 'title:("noir") AND mediatype:movies'),
+            ("fields", '(title:("noir") OR creator:("noir")) AND mediatype:movies'),
+        ]
+        picked = []
+
+        def fake_prompt_list(_title, labels, default_idx=0):
+            picked.extend(labels)
+            return labels[1]
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=False):
+                self._target = target
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(app, "prompt_list", fake_prompt_list)
+        monkeypatch.setattr(ia_minotaur.threading, "Thread", FakeThread)
+        monkeypatch.setattr(
+            ia_minotaur,
+            "ia_search_via_curl",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("search ran inline")),
+        )
+
+        app.choose_search_attempt()
+
+        assert picked[0].startswith("* title:")
+        assert picked[1].startswith("  fields:")
+        assert app._search_load_loading is True
+        assert app.query_built == '(title:("noir") OR creator:("noir")) AND mediatype:movies'
+        assert app.last_search_attempts == [
+            ("title", 'title:("noir") AND mediatype:movies'),
+            ("fields", '(title:("noir") OR creator:("noir")) AND mediatype:movies'),
+        ]
 
     def test_finish_search_load_applies_background_results(self, monkeypatch):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -2115,6 +2251,7 @@ class TestChooseBucketAndPath:
     def set_roots(self, monkeypatch, tmp_path):
         root = tmp_path / "media"
         monkeypatch.setenv("IA_RADARR_ENABLED", "false")
+        monkeypatch.setenv("IA_BAZARR_ENABLED", "false")
         for module in (ia_minotaur, ia_paths):
             monkeypatch.setattr(module, "MEDIA_ROOT", str(root))
             monkeypatch.setattr(module, "STAGING_ROOT", str(root / ".ia_staging"))
@@ -2296,6 +2433,50 @@ class TestChooseBucketAndPath:
         final_path = root / "Movies" / "Metropolis (1927)" / "Metropolis (1927).mp4"
         assert final_path.read_bytes() == b"done"
         assert msg == f"Saved: {final_path} | Radarr: Radarr unavailable."
+
+    def test_movie_import_orders_radarr_bazarr_before_jellyfin(self, monkeypatch, tmp_path):
+        root = self.set_roots(monkeypatch, tmp_path)
+        self.stage_file("item1", "Metropolis.1927.mp4", b"done")
+        events = []
+        app = self.build_app(["Movies", ""])
+        app.download_log = []
+        app.status = ""
+        app.render = lambda: None
+        app.cur_meta = {}
+        app.jellyfin_rescan_needed = False
+        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Metropolis", year="1927", mediatype="movies")
+
+        def fake_register(path, **_kwargs):
+            events.append(("radarr", os.path.exists(path)))
+            return ia_minotaur.ia_radarr.RadarrResult(True, "added", "Radarr movie added; refresh requested.", True, 77)
+
+        def fake_bazarr(path, radarr_id, **_kwargs):
+            events.append(("bazarr", radarr_id, os.path.exists(path)))
+            return ia_minotaur.ia_bazarr.BazarrResult(
+                True,
+                "downloaded",
+                "Bazarr subtitle found/downloaded; synchronization completed or delegated.",
+            )
+
+        monkeypatch.setattr(ia_minotaur.ia_radarr, "register_completed_movie", fake_register)
+        monkeypatch.setattr(ia_minotaur.ia_bazarr, "handoff_movie", fake_bazarr)
+        monkeypatch.setattr(
+            ia_minotaur.ia_jellyfin,
+            "request_library_rescan",
+            lambda: events.append(("jellyfin",)) or (True, "Jellyfin library rescan requested."),
+        )
+
+        msg = app.choose_bucket_and_path("item1", "Metropolis.1927.mp4", "Metropolis")
+        app.note_import_status(app.import_queue_status(msg))
+        app.request_jellyfin_rescan_if_needed()
+
+        final_path = root / "Movies" / "Metropolis (1927)" / "Metropolis (1927).mp4"
+        assert final_path.exists()
+        assert events == [("radarr", True), ("bazarr", 77, True), ("jellyfin",)]
+        assert msg == (
+            f"Saved: {final_path} | Radarr: Radarr movie added; refresh requested. | "
+            "Bazarr: Bazarr subtitle found/downloaded; synchronization completed or delegated."
+        )
 
     def test_final_import_prompt_can_edit_movie_folder_and_filename(self, monkeypatch, tmp_path):
         root = self.set_roots(monkeypatch, tmp_path)

@@ -41,6 +41,8 @@ JSON
 fi
 if [ "$1" = "download" ]; then
   printf '%s\\n' "$@" > "{args_path}"
+  mkdir -p "$5/$2"
+  printf 'fake-video' > "$5/$2/$3"
   exit 0
 fi
 echo "unexpected ia args: $*" >&2
@@ -140,11 +142,11 @@ def test_ia_dl_download_biggest_invokes_fake_download(tmp_path, monkeypatch, cap
     assert args_path.read_text(encoding="utf-8").splitlines() == [
         "download",
         "movie_one",
-        "--destdir",
-        str(dest),
-        "--files",
         "big.mp4",
+        "--destdir",
+        str(dest / ".ia_staging"),
     ]
+    assert (dest / "movie_one" / "big.mp4").exists()
 
 
 def test_minotaur_check_uses_fake_ia_and_curl(tmp_path, monkeypatch, capsys):

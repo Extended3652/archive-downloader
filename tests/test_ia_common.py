@@ -12,12 +12,53 @@ from ia_common import (
     IANotInstalled,
     SearchResult,
     compact_count,
+    deduplicate_file_variants,
     default_media_root,
     human_size,
     is_video_file,
     run,
     safe_path_under,
 )
+
+
+def test_deduplicate_file_variants_prefers_explicit_original():
+    original = IAFile(
+        "foo.mp4", 10, "MPEG4", source="original", sha1="original-hash"
+    )
+    derivative = IAFile(
+        "foo.ia.mp4",
+        10,
+        "h.264 IA",
+        source="derivative",
+        original="foo.mp4",
+        sha1="derivative-hash",
+    )
+
+    logical = deduplicate_file_variants([derivative, original])
+
+    assert [f.name for f in logical] == ["foo.mp4"]
+    assert logical[0].variant_names == ("foo.mp4", "foo.ia.mp4")
+    assert [m.get("source") for m in logical[0].variant_metadata] == ["original", "derivative"]
+
+
+def test_deduplicate_file_variants_keeps_uncertain_hash_mismatch():
+    files = [
+        IAFile("foo.mp4", 10, "MPEG4", sha1="original-hash"),
+        IAFile("foo.ia.mp4", 10, "h.264 IA", sha1="different-hash"),
+    ]
+
+    assert [f.name for f in deduplicate_file_variants(files)] == ["foo.mp4", "foo.ia.mp4"]
+
+
+def test_deduplicate_file_variants_keeps_unpaired_extra():
+    files = [
+        IAFile("foo.mp4", 10, "MPEG4"),
+        IAFile("The Critic Webisodes.mp4", 20, "MPEG4"),
+    ]
+
+    assert [f.name for f in deduplicate_file_variants(files)] == [
+        "foo.mp4", "The Critic Webisodes.mp4"
+    ]
 
 
 # ---------------------------------------------------------------- human_size

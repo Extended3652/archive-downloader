@@ -4,9 +4,10 @@ Centralizes the dataclasses, subprocess wrapper, and small utilities that
 were previously duplicated across the three scripts.
 """
 import os
+import re
 import subprocess
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import ia_config
 
@@ -40,6 +41,18 @@ class IAFile:
     name: str
     size: int
     fmt: str = ""
+    source: str = ""
+    original: str = ""
+    md5: str = ""
+    sha1: str = ""
+    crc32: str = ""
+    raw_metadata: Dict[str, Any] = None
+    variant_names: Tuple[str, ...] = ()
+    variant_metadata: Tuple[Dict[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.raw_metadata is None:
+            self.raw_metadata = {}
 
 
 # ---- shared constants ----
@@ -151,6 +164,89 @@ def is_video_file(name: str, fmt: str = "") -> bool:
         return True
     fmt_l = (fmt or "").lower()
     return any(h in fmt_l for h in VIDEO_FORMAT_HINTS)
+
+
+def terminal_ia_variant_name(name: str) -> Optional[str]:
+    """Return the normal filename for ``name.ia.ext``, if it has that shape."""
+    match = re.match(r"^(.*)\.ia(\.[^/]+)$", str(name or ""), re.IGNORECASE)
+    if not match:
+        return None
+    return f"{match.group(1)}{match.group(2)}"
+
+
+def _metadata_value(file: IAFile, key: str) -> str:
+    value = getattr(file, key, "") or (file.raw_metadata or {}).get(key, "")
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def _explicit_derivative_pair(normal: IAFile, variant: IAFile) -> bool:
+    source = _metadata_value(variant, "source").lower()
+    original = _metadata_value(variant, "original")
+    return source == "derivative" and original == normal.name
+
+
+def _same_trusted_hash(normal: IAFile, variant: IAFile) -> bool:
+    if int(normal.size or 0) != int(variant.size or 0):
+        return False
+    for key in ("sha1", "md5"):
+        left = _metadata_value(normal, key).lower()
+        right = _metadata_value(variant, key).lower()
+        if left and right and left == right:
+            return True
+    return False
+
+
+def _metadata_snapshot(file: IAFile) -> Dict[str, Any]:
+    snapshot = dict(file.raw_metadata or {})
+    for key in ("source", "original", "md5", "sha1", "crc32"):
+        value = getattr(file, key, "")
+        if value and key not in snapshot:
+            snapshot[key] = value
+    return snapshot
+
+
+def deduplicate_file_variants(files: List[IAFile]) -> List[IAFile]:
+    """Collapse only proven terminal ``.ia``/normal filename variants.
+
+    The returned preferred file retains the complete variant name list. Files
+    with only filename similarity, or conflicting/insufficient metadata, stay
+    as separate logical files.
+    """
+    by_name = {f.name: f for f in files}
+    hidden_names = set()
+    result: List[IAFile] = []
+    for file in files:
+        if file.name in hidden_names:
+            continue
+        normal_name = terminal_ia_variant_name(file.name)
+        normal = by_name.get(normal_name or "")
+        if normal is None:
+            result.append(file)
+            continue
+
+        variant = file
+        if normal.name == file.name:
+            variant_name = terminal_ia_variant_name(normal.name)
+            variant = by_name.get(variant_name or "")
+        if variant is None:
+            result.append(file)
+            continue
+
+        proven = _explicit_derivative_pair(normal, variant) or _same_trusted_hash(normal, variant)
+        if not proven:
+            result.append(file)
+            continue
+
+        preferred = normal
+        preferred.variant_names = tuple(dict.fromkeys([normal.name, variant.name]))
+        preferred.variant_metadata = tuple(
+            _metadata_snapshot(f) for f in (normal, variant)
+        )
+        hidden_names.update(preferred.variant_names)
+        result.append(preferred)
+    return result
 
 
 def is_dvd_iso_file(name: str, fmt: str = "") -> bool:

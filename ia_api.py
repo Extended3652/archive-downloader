@@ -5,13 +5,23 @@ import subprocess
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
-from ia_common import IAFile, SearchResult
+import ia_ranking
+from ia_common import IAFile, SearchResult, deduplicate_file_variants
 
 Logger = Callable[[str], None]
 SEARCH_TIMEOUT_S = 20
 SEARCH_CURL_CONNECT_TIMEOUT_S = 8
 METADATA_TIMEOUT_S = 8
 METADATA_CURL_CONNECT_TIMEOUT_S = 4
+
+# When local relevance re-ranking is requested for a plain-text query, fetch a
+# larger candidate window from IA in a single request and rank it locally. IA's
+# default relevance ordering can bury an exact-title match dozens of results
+# deep (e.g. the "Toad Road" movie ranks ~70th for query "Toad Road"), so
+# ranking only the rows already on the current page would not surface it. The
+# window is bounded to keep the request cheap; ranked results fill the leading
+# pages and deeper pages fall back to IA's raw ordering.
+RANK_POOL_ROWS = 200
 
 
 def run_cmd(cmd: List[str], timeout: int = 60, logger: Optional[Logger] = None) -> Tuple[int, str, str]:
@@ -60,7 +70,21 @@ def ia_search_via_curl(
     page: int,
     sort: str = "",
     runner: Callable[..., Tuple[int, str, str]] = run_cmd,
+    *,
+    rerank_text: str = "",
+    media_filter: str = "any",
 ) -> Tuple[List[SearchResult], int, str]:
+    # Local re-ranking only applies to relevance ordering (empty sort); when the
+    # user chose an explicit IA sort we honour it untouched. It also only kicks
+    # in for the leading pages that the candidate window can cover.
+    rows = max(1, int(rows or 1))
+    pool_pages = max(1, RANK_POOL_ROWS // rows)
+    do_rerank = bool((rerank_text or "").strip()) and not sort and page <= pool_pages
+    if do_rerank:
+        fetch_rows, fetch_page = RANK_POOL_ROWS, 1
+    else:
+        fetch_rows, fetch_page = rows, page
+
     cmd = [
         "curl",
         "-sS",
@@ -101,9 +125,9 @@ def ia_search_via_curl(
         "--data-urlencode",
         "output=json",
         "--data-urlencode",
-        f"rows={rows}",
+        f"rows={fetch_rows}",
         "--data-urlencode",
-        f"page={page}",
+        f"page={fetch_page}",
     ]
     if sort:
         cmd += ["--data-urlencode", f"sort[]={sort}"]
@@ -163,6 +187,11 @@ def ia_search_via_curl(
                 rights=str(d.get("rights", "") or "").strip(),
             )
         )
+
+    if do_rerank:
+        ranked = ia_ranking.rerank(results, rerank_text, media_filter)
+        start = (page - 1) * rows
+        results = ranked[start : start + rows]
 
     return results, num_found, ""
 
@@ -247,7 +276,20 @@ def ia_files(
         except Exception:
             size = 0
         fmt = str(f.get("format", "")).strip()
-        files.append(IAFile(name=name, size=size, fmt=fmt))
+        files.append(
+            IAFile(
+                name=name,
+                size=size,
+                fmt=fmt,
+                source=str(f.get("source", "") or "").strip(),
+                original=str(f.get("original", "") or "").strip(),
+                md5=str(f.get("md5", "") or "").strip(),
+                sha1=str(f.get("sha1", "") or "").strip(),
+                crc32=str(f.get("crc32", "") or "").strip(),
+                raw_metadata=dict(f),
+            )
+        )
 
+    files = deduplicate_file_variants(files)
     files.sort(key=lambda x: x.size or 0, reverse=True)
     return files, meta, ""

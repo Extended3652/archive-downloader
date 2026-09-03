@@ -46,6 +46,12 @@ def test_load_config_normalizes_valid_file(tmp_path):
                 "radarr_monitor_movie": "false",
                 "radarr_search_on_add": "true",
                 "radarr_timeout_s": "12.5",
+                "bazarr_enabled": "true",
+                "bazarr_url": "http://bazarr:6767/",
+                "bazarr_api_key": "bazarr-file-key",
+                "bazarr_timeout_s": "9.5",
+                "bazarr_wait_timeout_s": "30",
+                "bazarr_poll_interval_s": "1.5",
             }
         ),
         encoding="utf-8",
@@ -71,6 +77,12 @@ def test_load_config_normalizes_valid_file(tmp_path):
     assert cfg["radarr_monitor_movie"] is False
     assert cfg["radarr_search_on_add"] is False
     assert cfg["radarr_timeout_s"] == 12.5
+    assert cfg["bazarr_enabled"] is True
+    assert cfg["bazarr_url"] == "http://bazarr:6767/"
+    assert cfg["bazarr_api_key"] == "bazarr-file-key"
+    assert cfg["bazarr_timeout_s"] == 9.5
+    assert cfg["bazarr_wait_timeout_s"] == 30
+    assert cfg["bazarr_poll_interval_s"] == 1.5
 
 
 def test_load_config_rejects_invalid_values(tmp_path):
@@ -132,6 +144,12 @@ def test_environment_overrides_config_file(tmp_path):
             "IA_RADARR_QUALITY_PROFILE_ID": "5",
             "IA_RADARR_MONITOR_MOVIE": "false",
             "IA_RADARR_TIMEOUT_S": "7",
+            "IA_BAZARR_ENABLED": "true",
+            "IA_BAZARR_URL": "http://env-bazarr:6767",
+            "IA_BAZARR_API_KEY": "env-bazarr-key",
+            "IA_BAZARR_TIMEOUT_S": "8",
+            "IA_BAZARR_WAIT_TIMEOUT_S": "40",
+            "IA_BAZARR_POLL_INTERVAL_S": "2",
         },
     )
 
@@ -151,6 +169,12 @@ def test_environment_overrides_config_file(tmp_path):
     assert cfg["radarr_quality_profile_id"] == 5
     assert cfg["radarr_monitor_movie"] is False
     assert cfg["radarr_timeout_s"] == 7
+    assert cfg["bazarr_enabled"] is True
+    assert cfg["bazarr_url"] == "http://env-bazarr:6767"
+    assert cfg["bazarr_api_key"] == "env-bazarr-key"
+    assert cfg["bazarr_timeout_s"] == 8
+    assert cfg["bazarr_wait_timeout_s"] == 40
+    assert cfg["bazarr_poll_interval_s"] == 2
 
 
 def test_save_and_set_config_value_round_trip(tmp_path):
@@ -172,6 +196,12 @@ def test_save_and_set_config_value_round_trip(tmp_path):
 
     cfg = ia_config.set_config_value("radarr_search_on_add", "true", str(path), environ={})
     assert cfg["radarr_search_on_add"] is False
+
+    cfg = ia_config.set_config_value("bazarr_enabled", "true", str(path), environ={})
+    assert cfg["bazarr_enabled"] is True
+
+    cfg = ia_config.set_config_value("bazarr_wait_timeout_s", "45", str(path), environ={})
+    assert cfg["bazarr_wait_timeout_s"] == 45
 
 
 def test_set_config_value_rejects_invalid_key_and_value(tmp_path):
