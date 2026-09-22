@@ -42,6 +42,17 @@ def test_ia_files_preserves_metadata_and_deduplicates_proven_pair():
     assert files[1].raw_metadata["source"] == "original"
 
 
+def test_ia_files_reports_dark_items_instead_of_silent_zero_files():
+    # archive.org returns HTTP 200 with a stub payload (is_dark, no
+    # metadata/files keys) for restricted/taken-down items, not a 404.
+    payload = {"created": 123, "is_dark": True, "dir": "/1/items/foo"}
+    files, meta, err = ia_api.ia_files("foo", runner=runner_for(stdout=json.dumps(payload)))
+
+    assert files == []
+    assert meta == payload
+    assert "dark" in err.lower()
+
+
 def test_curl_version_returns_first_line():
     runner = runner_for(stdout="curl 8.0\nfeatures\n")
 

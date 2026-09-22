@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import curses
+from copy import deepcopy
 import os
 import re
 import shlex
@@ -9,6 +10,7 @@ import threading
 import sys
 import textwrap
 import time
+from dataclasses import dataclass, field, replace
 from typing import List, Tuple, Optional, Dict, Any, Set
 
 from ia_common import (
@@ -50,6 +52,7 @@ import ia_bazarr
 import ia_jellyfin
 import ia_minotaur_events
 import ia_radarr
+import ia_ranking
 import yt_api
 import yt_downloads
 from ia_organize import (
@@ -333,6 +336,87 @@ def yt_metadata_url(url: str) -> Tuple[Optional[SearchResult], str]:
     return yt_api.yt_metadata_url(url, yt_dlp_path=APP_CONFIG["yt_dlp_path"], runner=run_cmd)
 
 
+JOB_TERMINAL_STATUSES = ("done", "failed", "canceled")
+
+
+@dataclass
+class DownloadJob:
+    """One queued item's download, processed sequentially by the background worker.
+
+    Byte transfer (this class's own fields) happens off the main thread; the
+    interactive "where should this go" placement step only runs once a job
+    reaches "awaiting_import", back on the main thread (see
+    finish_download_progress). That split is what lets search/browsing stay
+    live while bytes move in the background.
+    """
+
+    job_id: int
+    identifier: str
+    title: str
+    files: List[IAFile]
+    preview_prefix: str = ""
+    batch: Optional[Dict[str, str]] = None
+    is_youtube: bool = False
+    webpage_url: str = ""
+    video_id: str = ""
+    owner_item: Optional[SearchResult] = None
+    owner_metadata: Optional[Dict[str, Any]] = None
+    status: str = "queued"  # queued -> downloading -> awaiting_import -> done/failed/canceled
+    file_statuses: List[Dict[str, Any]] = field(default_factory=list)
+    current_file_name: str = ""
+    written: int = 0
+    total: int = 0
+    speed_bps: float = 0.0
+    eta_s: float = 0.0
+    cancel_requested: bool = False
+    error: str = ""
+    created_at: float = 0.0
+    finished_at: float = 0.0
+    bookkept: bool = False  # main-thread failed_queue/download_log/import bookkeeping done
+
+    def set_file_status(
+        self,
+        filename: str,
+        status: str,
+        detail: str = "",
+        size: Optional[int] = None,
+        real_name: Optional[str] = None,
+    ) -> None:
+        # real_name covers YouTube, where the file yt-dlp actually writes to
+        # staging (resolved after download) can differ from the planned name.
+        for row in self.file_statuses:
+            if row.get("name") == filename:
+                row["status"] = status
+                row["detail"] = detail
+                if size is not None:
+                    row["size"] = int(size or 0)
+                if real_name is not None:
+                    row["real_name"] = real_name
+                return
+        row = {"name": filename, "status": status, "detail": detail, "size": int(size or 0)}
+        if real_name is not None:
+            row["real_name"] = real_name
+        self.file_statuses.append(row)
+
+    def files_needing_import(self) -> List[Dict[str, Any]]:
+        return [row for row in self.file_statuses if row.get("status") == "downloaded"]
+
+    def summary_label(self) -> str:
+        total = len(self.files)
+        done = sum(1 for row in self.file_statuses if row.get("status") in ("done", "staged", "skipped"))
+        return f"{done}/{total} file(s)" if total > 1 else (self.files[0].name if self.files else "")
+
+
+@dataclass
+class FailedDownload:
+    """A failed file together with the item state that authorized its job."""
+
+    file: IAFile
+    owner_item: Optional[SearchResult]
+    owner_metadata: Optional[Dict[str, Any]] = None
+    error: str = ""
+
+
 class RetroWaveIA:
     def __init__(self, stdscr):
         self.stdscr = stdscr
@@ -345,6 +429,8 @@ class RetroWaveIA:
         self.query_built = ""
         self.filter = str(APP_CONFIG["default_filter"])
         self.title_only = bool(APP_CONFIG["title_only"])
+        self.hide_small_items = bool(APP_CONFIG["hide_small_items"])
+        self.min_item_size_mb = int(APP_CONFIG["min_item_size_mb"])
         self.enforce_license_gate = bool(APP_CONFIG["license_gate"])
         self.sort_by = str(APP_CONFIG["default_sort"])
         self.page = 1
@@ -375,6 +461,10 @@ class RetroWaveIA:
         self.sel_r = 0
 
         self.files: List[IAFile] = []
+        # Files and metadata must stay bound to the item that supplied them;
+        # result prefetch can otherwise change selected_result() underneath a
+        # FILES view.
+        self.file_owner_item: Optional[SearchResult] = None
         self.sel_f = 0
         self.file_kw = ""
         self.video_only = False
@@ -389,8 +479,9 @@ class RetroWaveIA:
 
         self.last_bucket = str(APP_CONFIG["default_bucket"])  # TV/Movies/Music/Other
         self.download_log: List[str] = []
-        self.queue_status: List[Dict[str, Any]] = []
-        self.failed_queue: List[IAFile] = []
+        self.failed_queue: List[FailedDownload] = []
+        self._retry_failed_entries: List[FailedDownload] = []
+        self._retry_failed_metadata: Optional[Dict[str, Any]] = None
         self.show_welcome = True
         self.theme_name = "Retro"
 
@@ -415,16 +506,14 @@ class RetroWaveIA:
         self.preview_destinations: List[str] = []
         self.last_error_detail: str = ""
 
-        self.dl_current_name: str = ""
-        self.dl_current_written: int = 0
-        self.dl_current_total: int = 0
-        self.dl_speed_bps: float = 0.0
-        self.dl_eta_s: float = 0.0
-        self.dl_overall_written: int = 0
-        self.dl_overall_total: int = 0
-        self.dl_cancel_requested: bool = False
-        self.dl_complete_notice: str = ""
         self.jellyfin_rescan_needed: bool = False
+
+        self.download_queue: List[DownloadJob] = []
+        self._download_lock = threading.RLock()
+        self._download_job_seq: int = 0
+        self._download_worker_thread: Optional[threading.Thread] = None
+        self.queue_sel: int = 0
+        self.queue_return_mode: str = "RESULTS"
 
         if not self.ia_present:
             self.mode = "ERROR"
@@ -443,6 +532,8 @@ class RetroWaveIA:
             {
                 "filter": getattr(self, "filter", "any"),
                 "title_only": getattr(self, "title_only", False),
+                "hide_small_items": getattr(self, "hide_small_items", True),
+                "min_item_size_mb": getattr(self, "min_item_size_mb", 0),
                 "sort_by": getattr(self, "sort_by", ""),
                 "enforce_license_gate": getattr(self, "enforce_license_gate", False),
                 "search_history": getattr(self, "search_history", [])[:MAX_HISTORY],
@@ -457,6 +548,11 @@ class RetroWaveIA:
             if data.get("filter") in FILTERS:
                 self.filter = data["filter"]
             self.title_only = bool(data.get("title_only", False))
+            self.hide_small_items = bool(data.get("hide_small_items", APP_CONFIG["hide_small_items"]))
+            try:
+                self.min_item_size_mb = max(0, int(data.get("min_item_size_mb", APP_CONFIG["min_item_size_mb"])))
+            except (TypeError, ValueError):
+                self.min_item_size_mb = int(APP_CONFIG["min_item_size_mb"])
             sort_val = str(data.get("sort_by") or "")
             if any(v == sort_val for _, v in SORT_OPTIONS):
                 self.sort_by = sort_val
@@ -695,8 +791,8 @@ class RetroWaveIA:
             header = "Favorites"
         elif self.mode == "HELP":
             header = "Help"
-        elif self.mode == "DOWNLOADING":
-            header = "Downloading..."
+        elif self.mode == "QUEUE":
+            header = "Download queue"
         elif self.mode == "PREVIEW_DL":
             header = "Confirm download"
         elif self.mode == "ERROR":
@@ -734,8 +830,8 @@ class RetroWaveIA:
             crumbs.append(f"Favorites:{self.favs_tab}")
         elif self.mode == "PREVIEW_DL":
             crumbs += ["Files", "Preview"]
-        elif self.mode == "DOWNLOADING":
-            crumbs.append("Downloading")
+        elif self.mode == "QUEUE":
+            crumbs.append("Queue")
         elif self.mode == "HELP":
             crumbs.append("Help")
         elif self.mode == "ERROR":
@@ -1132,14 +1228,39 @@ class RetroWaveIA:
             merged.append(item)
         return merged
 
+    def _passes_size_filter(self, r: SearchResult) -> bool:
+        if not getattr(self, "hide_small_items", False):
+            return True
+        min_bytes = int(getattr(self, "min_item_size_mb", 0) or 0) * 1024 * 1024
+        if min_bytes <= 0:
+            return True
+        size = int(getattr(r, "item_size", 0) or 0)
+        # Unknown size (0, e.g. some YouTube/collection results never carry
+        # item_size) fails open rather than hiding results we can't judge.
+        return size <= 0 or size >= min_bytes
+
     def get_visible_results(self) -> List[SearchResult]:
         needle = self.result_filter.strip().lower()
         results = getattr(self, "results", [])
         if not needle:
-            return list(results)
+            return [r for r in results if self._passes_size_filter(r)]
         terms = [t for t in needle.split() if t]
         scope = self._load_all_search_results()
-        return [r for r in scope if all(t in self.result_filter_blob(r) for t in terms)]
+        visible = [
+            r
+            for r in scope
+            if all(t in self.result_filter_blob(r) for t in terms) and self._passes_size_filter(r)
+        ]
+        # The local filter merges in extra results from a separate year
+        # refinement query (see load_year_refinement_for_local_filter) that
+        # are appended in raw IA order, not ranked. Re-rank the whole filtered
+        # view against the original search text so the merge doesn't bury a
+        # strong title match under already-loaded, unranked items.
+        rerank_text = str(getattr(self, "_active_rerank_text", "") or getattr(self, "query_text", "") or "")
+        if rerank_text.strip():
+            rerank_filter = str(getattr(self, "_active_rerank_filter", "") or getattr(self, "filter", "any") or "any")
+            visible = ia_ranking.rerank(visible, rerank_text, rerank_filter)
+        return visible
 
     def selected_result(self) -> Optional[SearchResult]:
         visible = self.get_visible_results()
@@ -1293,6 +1414,7 @@ class RetroWaveIA:
         return [f"{coll} ({count})" for coll, count in ordered[:limit]]
 
     def results_state_chips(self) -> List[str]:
+        self._ensure_download_state()
         chips: List[str] = []
         if bool(getattr(self, "_search_load_loading", False)):
             chips.append("Searching...")
@@ -1314,6 +1436,8 @@ class RetroWaveIA:
                 chips.append(self.local_filter_progress_label() or "Scanning local scope...")
             elif self.result_filter and self._all_results_loaded_pages and self._all_results_total_pages and self._all_results_loaded_pages < self._all_results_total_pages:
                 chips.append(self.local_filter_progress_label())
+        if self.download_queue:
+            chips.append(f"{self.download_queue_summary()}  (Q to view)")
         return chips
 
     def effective_search_total(self, page: int, results: List[SearchResult], reported_total: int) -> int:
@@ -1473,6 +1597,7 @@ class RetroWaveIA:
                 ("Open", "open"),
                 (fav_label, "fav_item"),
                 ("Favs", "favs"),
+                (self.queue_menu_label(), "queue_view"),
                 ("Help", "help"),
                 ("Quit", "quit"),
             ]
@@ -1507,11 +1632,20 @@ class RetroWaveIA:
                 (fav_file_label, "fav_file"),
                 (f"Theme: {theme}", "theme"),
                 ("Favs", "favs"),
+                (self.queue_menu_label(), "queue_view"),
                 ("Help", "help"),
                 ("Quit", "quit"),
             ]
         if self.mode == "PREVIEW_DL":
             return [("Confirm", "confirm_download"), ("Cancel", "cancel_preview"), (f"Theme: {theme}", "theme")]
+        if self.mode == "QUEUE":
+            return [
+                ("Back", "back"),
+                ("Cancel", "queue_cancel"),
+                ("Remove", "queue_remove"),
+                ("Help", "help"),
+                ("Quit", "quit"),
+            ]
         if self.mode == "FAVS":
             return [
                 ("Back", "back"),
@@ -1596,17 +1730,19 @@ class RetroWaveIA:
             return "Confirm Enter   Cancel Esc/Backspace   Help ?   Quit q"
         if self.mode == "FAVS":
             return "Open Enter/o   Tab switch   Remove Del   Help ?   Quit q"
+        if self.mode == "QUEUE":
+            return "Cancel c   Remove x   Back Esc/Backspace/q   Help ?"
         return "j/k navigate   Enter select   a actions   ? help   q quit"
 
     def hint_bar(self, include_overlay_state: bool = True) -> str:
         if include_overlay_state and self.help_overlay:
             return "?/Esc closes help  |  Backspace back  |  q quit"
-        if self.mode == "DOWNLOADING":
-            return "c cancel  |  q quit after cancel  |  progress updates live"
+        if self.mode == "QUEUE":
+            return "c cancel  |  x remove  |  j/k select  |  Backspace/q back  |  progress updates live"
         if self.mode in ("RESULTS", "SEARCH"):
-            return "Enter/o open  |  / search  |  l/f local filter  |  L/F clear local  |  a actions  |  n/p page  |  ? help  |  q quit"
+            return "Enter/o open  |  / search  |  l/f local filter  |  L/F clear local  |  a actions  |  n/p page  |  Q queue  |  ? help  |  q quit"
         if self.mode == "FILES":
-            return "Enter/p preview  |  o folder  |  Space mark+next  |  m range  |  d marked  |  D all visible  |  f filter  |  ? help"
+            return "Enter/p preview  |  o folder  |  Space mark+next  |  m range  |  d marked  |  D all visible  |  f filter  |  Q queue  |  ? help"
         if self.mode == "FAVS":
             return "Enter/o open  |  Tab tab  |  Backspace back  |  ? help  |  q quit"
         if self.mode == "PREVIEW_DL":
@@ -1638,14 +1774,25 @@ class RetroWaveIA:
 
     def prompt(self, label: str, default: str = "", history: Optional[List[str]] = None) -> Optional[str]:
         h, w = self.stdscr.getmaxyx()
-        if h < 6 or w < 10:
+        if h < 6 or w < 20:
             return None
 
-        y = h - 5
+        box_h = 3
+        box_w = min(max(0, w - 4), max(40, int(w * 0.6)))
+        box_w = max(box_w, min(max(0, w - 4), len(label) + 12))
+        top = max(1, (h - box_h) // 2)
+        left = max(1, (w - box_w) // 2)
+        inner_w = max(1, box_w - 4)
+
+        title = label.strip()
+        if title.endswith(":"):
+            title = title[:-1].strip()
+
         buf = list(default)
         pos = len(buf)
         hist_idx = -1
         saved_buf = ""
+        view_start = 0
         self.stdscr.nodelay(False)
         try:
             try:
@@ -1658,14 +1805,34 @@ class RetroWaveIA:
                 pass
             while True:
                 text = "".join(buf)
-                bar = f"{label}{text}"
-                hint = ""
+                if pos < view_start:
+                    view_start = pos
+                if pos > view_start + inner_w - 1:
+                    view_start = pos - inner_w + 1
+                visible_text = text[view_start : view_start + inner_w]
+
+                for row in range(top, top + box_h):
+                    self.safe_addstr(row, left, " " * max(0, box_w), curses.color_pair(6))
+
+                top_border = "┌" + "─" * max(0, box_w - 2) + "┐"
+                self.safe_addstr(top, left, top_border, curses.color_pair(2))
+                t = f" {title} "
+                self.safe_addstr(top, left + 2, t[: max(0, box_w - 4)], curses.color_pair(1) | curses.A_BOLD)
+
+                self.safe_addstr(top + 1, left, "│", curses.color_pair(2))
+                self.safe_addstr(top + 1, left + box_w - 1, "│", curses.color_pair(2))
+                self.safe_addstr(top + 1, left + 2, visible_text.ljust(inner_w), curses.color_pair(8))
+
+                bottom_border = "└" + "─" * max(0, box_w - 2) + "┘"
+                self.safe_addstr(top + box_h - 1, left, bottom_border, curses.color_pair(2))
+                hint = "Enter confirm  Esc cancel"
                 if history:
-                    hint = "  (Up/Down for history)"
-                self.safe_addstr(y, 0, " " * max(0, w - 1), curses.color_pair(8))
-                self.safe_addstr(y, 0, (bar + hint)[: max(0, w - 1)], curses.color_pair(8))
+                    hint += "  Up/Down history"
+                hint_text = f" {hint} "
+                self.safe_addstr(top + box_h - 1, left + 2, hint_text[: max(0, box_w - 4)], curses.color_pair(3))
+
                 try:
-                    self.stdscr.move(y, min(w - 2, len(label) + pos))
+                    self.stdscr.move(top + 1, left + 2 + (pos - view_start))
                 except curses.error:
                     pass
                 self.stdscr.refresh()
@@ -1951,6 +2118,13 @@ class RetroWaveIA:
             ("Filter / media type (movies audio texts software any)", "filter", None),
             ("Filter / local result refine (loaded results)", "result_filter", "l/f"),
             ("Filter / title-only mode (title exact)", "title", None),
+            (
+                f"Filter / hide small items ({'on' if getattr(self, 'hide_small_items', False) else 'off'}, "
+                f"<{getattr(self, 'min_item_size_mb', 0)}MB)",
+                "toggle_hide_small_items",
+                None,
+            ),
+            ("Filter / min item size (MB)", "edit_min_item_size", None),
             ("Filter / license gate (rights license block)", "license_gate", None),
             ("Sort / result order (date downloads title relevance)", "sort", None),
             ("App / audit summary (library health counts)", "audit", "y"),
@@ -2093,8 +2267,22 @@ class RetroWaveIA:
         self.search_history = [q] + [h for h in self.search_history if h != q]
         self.search_history = self.search_history[:MAX_HISTORY]
 
+    def search_hint_text(self, used_label: str, results: List[SearchResult]) -> str:
+        if used_label == "title-any-type":
+            # The exact title only turned up outside the requested media
+            # filter -- say so plainly instead of silently falling back to a
+            # bag-of-words match still scoped to the (wrong) filter, which
+            # for common-word titles returns near-random results.
+            mediatypes = sorted({r.mediatype for r in results[:5] if r.mediatype and r.mediatype != self.filter})
+            found_as = f" as {'/'.join(mediatypes)}" if mediatypes else ""
+            return f" (not found in '{self.filter}' — matched{found_as}; switch Filter to see it)"
+        if used_label in ("", "title", "custom", "advanced"):
+            return ""
+        return f" ({used_label} match)"
+
     def do_search(self, reset_page: bool = True, built_query: Optional[str] = None) -> None:
         self.cancel_file_load()
+        self.cancel_result_prefetch()
         self.search_source = "ia"
         if reset_page:
             self.page = 1
@@ -2155,7 +2343,7 @@ class RetroWaveIA:
         self.focus = "LIST"
         self.last_search_text = self.query_text
         self.last_search_used_label = used_label or ""
-        search_hint = "" if used_label in ("", "title", "custom", "advanced") else f" ({used_label} match)"
+        search_hint = self.search_hint_text(used_label, self.results)
         if self.total_results > 0:
             total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
             self.status = f"Page {self.page}/{total_pages} — {self.total_results} total results{search_hint}. Arrows to select, Enter to open."
@@ -2171,6 +2359,7 @@ class RetroWaveIA:
     ) -> None:
         self._ensure_search_load_state()
         self.cancel_file_load()
+        self.cancel_result_prefetch()
         self.search_source = "ia"
         if reset_page:
             self.page = 1
@@ -2263,6 +2452,7 @@ class RetroWaveIA:
             self.status = "Combined search canceled."
             return
 
+        self.cancel_result_prefetch()
         self.search_source = "all"
         self.page = 1
         self.query_text = terms
@@ -2344,6 +2534,7 @@ class RetroWaveIA:
     def start_youtube_search_async(self, query_text: str) -> None:
         self._ensure_search_load_state()
         self.cancel_file_load()
+        self.cancel_result_prefetch()
         self.search_source = "youtube"
         self.page = 1
         self.query_text = query_text
@@ -2382,6 +2573,7 @@ class RetroWaveIA:
     def start_youtube_url_async(self, url: str) -> None:
         self._ensure_search_load_state()
         self.cancel_file_load()
+        self.cancel_result_prefetch()
         self.search_source = "youtube_url"
         self.page = 1
         self.query_text = url
@@ -2451,7 +2643,7 @@ class RetroWaveIA:
             current_key = self._search_cache_key()
             total_pages = max(1, (self.total_results + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE) if self.total_results else 1
             self._prime_search_cache(current_key, int(result.get("page") or self.page or 1), self.results, total_pages)
-            search_hint = "" if self.last_search_used_label in ("", "title", "custom", "advanced") else f" ({self.last_search_used_label} match)"
+            search_hint = self.search_hint_text(self.last_search_used_label, self.results)
             if self.total_results > 0:
                 self.status = f"Page {self.page}/{total_pages} — {self.total_results} total results{search_hint}. Arrows to select, Enter to open."
             else:
@@ -2479,6 +2671,7 @@ class RetroWaveIA:
 
     def do_youtube_search(self, query_text: str) -> None:
         self.cancel_file_load()
+        self.cancel_result_prefetch()
         self.search_source = "youtube"
         self.page = 1
         self.query_text = query_text
@@ -2508,6 +2701,7 @@ class RetroWaveIA:
 
     def do_youtube_url(self, url: str) -> None:
         self.cancel_file_load()
+        self.cancel_result_prefetch()
         self.search_source = "youtube_url"
         self.page = 1
         self.query_text = url
@@ -2609,10 +2803,11 @@ class RetroWaveIA:
             self._file_load_token += 1
             token = self._file_load_token
             self._file_load_loading = True
-            self._file_load_result = {"identifier": ident, "title": title, "pending": True}
+            self._file_load_result = {"identifier": ident, "title": title, "item": replace(item), "pending": True}
 
         self.cur_meta = None
         self.files = []
+        self.file_owner_item = None
         self.sel_f = 0
         self.preview_item = item
         self.mode = "FILES"
@@ -2625,6 +2820,7 @@ class RetroWaveIA:
                 result: Dict[str, Any] = {
                     "identifier": ident,
                     "title": title,
+                    "item": replace(item),
                     "files": files,
                     "meta": meta,
                     "err": err,
@@ -2634,6 +2830,7 @@ class RetroWaveIA:
                 result = {
                     "identifier": ident,
                     "title": title,
+                    "item": replace(item),
                     "files": [],
                     "meta": None,
                     "err": f"File load failed for {ident}: {e}",
@@ -2670,6 +2867,11 @@ class RetroWaveIA:
         self.last_error_detail = ""
         self.cur_meta = result.get("meta")
         self.files = list(result.get("files") or [])
+        owner = result.get("item")
+        self.file_owner_item = owner if isinstance(owner, SearchResult) and owner.identifier == ident else None
+        if self.file_owner_item is None:
+            self.set_error_status("File list owner is unavailable; reload the item.")
+            return True
         self.restore_file_view_state(ident)
         self.mode = "FILES"
         self.focus = "LIST"
@@ -2687,6 +2889,7 @@ class RetroWaveIA:
             self.cancel_file_load()
             self.cur_meta = {"source": "youtube", "webpage_url": item.webpage_url, "id": item.video_id}
             self.files = [self.youtube_file_for_result(item)]
+            self.file_owner_item = replace(item)
             self.restore_file_view_state(item.identifier)
             self.mode = "FILES"
             self.focus = "LIST"
@@ -2711,6 +2914,7 @@ class RetroWaveIA:
         self.last_error_detail = ""
         self.cur_meta = meta
         self.files = files
+        self.file_owner_item = replace(item)
         self.restore_file_view_state(item.identifier)
         self.mode = "FILES"
         self.focus = "LIST"
@@ -2725,9 +2929,8 @@ class RetroWaveIA:
             return
         if not hasattr(self, "file_view_state"):
             return
-        try:
-            item = self.selected_result()
-        except Exception:
+        item = getattr(self, "file_owner_item", None)
+        if not item:
             return
         if not item:
             return
@@ -2902,6 +3105,7 @@ class RetroWaveIA:
         self.status = f"Marked {hi - lo + 1} file(s) from {lo + 1} to {hi + 1}; {len(self.selected_file_names)} total ({added} new)."
 
     def file_filter_chips(self) -> List[str]:
+        self._ensure_download_state()
         chips = []
         if bool(getattr(self, "_file_load_loading", False)):
             chips.append("Opening item")
@@ -2911,18 +3115,23 @@ class RetroWaveIA:
             chips.append("Video only: On")
         if self.selected_file_names:
             chips.append(f"Marked: {len(self.selected_file_names)}")
+        if self.download_queue:
+            chips.append(f"{self.download_queue_summary()}  (Q to view)")
         return chips
 
     def selected_item_header(self) -> str:
-        item = self.selected_result()
+        if bool(getattr(self, "_file_load_loading", False)):
+            item = self.selected_result()
+            if not item:
+                return "Opening item | waiting for IA file metadata"
+            return f"Opening item | {item.title or '(no title)'} | {item.identifier} | waiting for IA file metadata"
+        item = getattr(self, "file_owner_item", None)
         if not item:
-            return "No item selected"
+            return "File list owner unavailable; reload the item"
         if self.is_youtube_result(item):
             title = item.title or "(no title)"
             channel = item.uploader or item.creator or "unknown channel"
             return f"[YT] {title} | {channel} | {item.video_id or item.identifier} | single video"
-        if bool(getattr(self, "_file_load_loading", False)):
-            return f"Opening item | {item.title or '(no title)'} | {item.identifier} | waiting for IA file metadata"
         license_status, _why = self.current_license_status()
         title = item.title or "(no title)"
         total = sum(int(f.size or 0) for f in self.files)
@@ -3576,53 +3785,167 @@ class RetroWaveIA:
         self.preview_existing = existing
         self.preview_destinations = destinations
 
-    def init_queue_status(self, queue: List[IAFile]) -> None:
-        self.queue_status = [
-            {"name": f.name, "status": "pending", "detail": "", "size": int(f.size or 0)}
-            for f in queue
-        ]
+    def _ensure_download_state(self) -> None:
+        if not hasattr(self, "_download_lock") or getattr(self, "_download_lock", None) is None:
+            self._download_lock = threading.RLock()
+        if not hasattr(self, "download_queue"):
+            self.download_queue = []
+        if not hasattr(self, "_download_job_seq"):
+            self._download_job_seq = 0
+        if not hasattr(self, "_download_worker_thread"):
+            self._download_worker_thread = None
+        if not hasattr(self, "queue_sel"):
+            self.queue_sel = 0
+        if not hasattr(self, "queue_return_mode"):
+            self.queue_return_mode = "RESULTS"
 
-    def set_queue_status(self, filename: str, status: str, detail: str = "", size: Optional[int] = None) -> None:
-        for row in self.queue_status:
-            if row.get("name") == filename:
-                row["status"] = status
-                row["detail"] = detail
-                if size is not None:
-                    row["size"] = int(size or 0)
-                return
-        self.queue_status.append({"name": filename, "status": status, "detail": detail, "size": int(size or 0)})
+    def _next_job_id(self) -> int:
+        self._ensure_download_state()
+        self._download_job_seq += 1
+        return self._download_job_seq
 
-    def queue_summary(self) -> str:
+    def _queue_display_order(self) -> List[DownloadJob]:
+        self._ensure_download_state()
+        with self._download_lock:
+            jobs = list(self.download_queue)
+        # Active/queued/awaiting-import first (in the order they were created),
+        # finished ones sink to the bottom -- that's the whole point of the view.
+        return sorted(jobs, key=lambda j: (j.status in JOB_TERMINAL_STATUSES, j.job_id))
+
+    def _download_queue_counts(self) -> Dict[str, int]:
+        self._ensure_download_state()
         counts: Dict[str, int] = {}
-        for row in self.queue_status:
-            status = str(row.get("status") or "pending")
-            counts[status] = counts.get(status, 0) + 1
+        with self._download_lock:
+            for job in self.download_queue:
+                counts[job.status] = counts.get(job.status, 0) + 1
+        return counts
+
+    def download_queue_summary(self) -> str:
+        counts = self._download_queue_counts()
         if not counts:
             return "Queue: empty"
-        order = ["pending", "downloading", "done", "staged", "skipped", "failed", "canceled"]
+        order = ["downloading", "queued", "awaiting_import", "done", "failed", "canceled"]
         parts = [f"{k}:{counts[k]}" for k in order if k in counts]
         return "Queue: " + " ".join(parts)
 
-    def show_download_complete(self, message: str) -> None:
-        self.dl_complete_notice = message
-        self.mode = "DOWNLOADING"
+    def queue_menu_label(self) -> str:
+        self._ensure_download_state()
+        return f"Queue ({len(self.download_queue)})" if self.download_queue else "Queue"
+
+    def _downloads_panel_lines(self, right_w: int) -> List[Any]:
+        """Compact, always-visible download status for the right-hand panel --
+        so progress is visible from RESULTS/FILES without opening the queue."""
+        self._ensure_download_state()
+        active = None
+        with self._download_lock:
+            for job in self.download_queue:
+                if job.status == "downloading":
+                    active = job
+                    break
+
+        lines: List[Any] = []
+        if active is not None:
+            with self._download_lock:
+                written, total = active.written, active.total
+                speed_bps = active.speed_bps
+                title = active.title
+                current_file = active.current_file_name
+            name = title or current_file or "(untitled)"
+            if len(name) > right_w:
+                name = name[: max(0, right_w - 1)] + "…"
+            lines.append(name)
+            bar_w = max(8, min(24, right_w - 4))
+            if total > 0:
+                pct = int((written * 100) / total)
+                lines.append(f"[{shaded_progress_bar(written, total, bar_w)}] {pct}%")
+                speed = f"  {human_size(int(speed_bps))}/s" if speed_bps > 0 else ""
+                lines.append(f"{human_size(written)}/{human_size(total)}{speed}")
+            else:
+                lines.append(f"{human_size(written)} downloaded" if written > 0 else "Starting...")
+        lines.append((f"{self.download_queue_summary()}  (Q queue)", curses.color_pair(3)))
+        return lines
+
+    def open_download_queue(self) -> None:
+        self._ensure_download_state()
+        if self.mode != "QUEUE":
+            self.queue_return_mode = self.mode if self.mode in ("RESULTS", "SEARCH", "FILES", "FAVS") else "RESULTS"
+        self.mode = "QUEUE"
         self.focus = "LIST"
-        self.status = message
-        self.render()
+        self.queue_sel = 0
+        self.status = self.download_queue_summary()
 
-    def clear_download_complete(self) -> None:
-        self.dl_complete_notice = ""
+    def selected_queue_job(self) -> Optional[DownloadJob]:
+        jobs = self._queue_display_order()
+        if not jobs:
+            return None
+        idx = max(0, min(self.queue_sel, len(jobs) - 1))
+        return jobs[idx]
 
-    def handle_download_complete_key(self, ch: int) -> bool:
-        if self.mode != "DOWNLOADING" or not self.dl_complete_notice:
-            return False
-        if is_enter_key(ch) or ch in (curses.KEY_BACKSPACE, 127, 8, 27, ord(" ")):
-            self.clear_download_complete()
-            self.mode = "FILES"
-            self.focus = "LIST"
-            self.status = "Back to files"
+    def cancel_selected_queue_job(self) -> None:
+        job = self.selected_queue_job()
+        if not job:
+            self.status = "Queue is empty."
+            return
+        if job.status not in ("queued", "downloading"):
+            self.status = f"\"{job.title}\" is already {job.status}."
+            return
+        with self._download_lock:
+            job.cancel_requested = True
+            if job.status == "queued":
+                job.status = "canceled"
+                job.error = "Canceled."
+                job.finished_at = time.time()
+        self.status = f"Canceling \"{job.title}\"..."
+
+    def request_quit(self) -> bool:
+        """Cancel and reap queue work before allowing the TUI process to exit."""
+        self._ensure_download_state()
+        with self._download_lock:
+            active = [job for job in self.download_queue if job.status == "downloading"]
+            queued = [job for job in self.download_queue if job.status == "queued"]
+        if not active and not queued:
+            self.exit_requested = True
             return True
+
+        answer = self.prompt(
+            f"Cancel {len(active)} active and {len(queued)} queued download(s) before quitting? Type CANCEL: ",
+            "",
+        )
+        if answer != "CANCEL":
+            self.status = "Quit canceled; downloads are still active."
+            return False
+
+        with self._download_lock:
+            for job in active:
+                job.cancel_requested = True
+            for job in queued:
+                job.cancel_requested = True
+                job.status = "canceled"
+                job.error = "Canceled on exit."
+                job.finished_at = time.time()
+
+        worker = self._download_worker_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=5)
+        if worker is not None and worker.is_alive():
+            self.status = "Still stopping active download; wait and quit again."
+            return False
+
+        self.exit_requested = True
         return True
+
+    def remove_selected_queue_job(self) -> None:
+        job = self.selected_queue_job()
+        if not job:
+            self.status = "Queue is empty."
+            return
+        if job.status == "downloading":
+            self.status = "Cancel the active download before removing it."
+            return
+        with self._download_lock:
+            self.download_queue = [j for j in self.download_queue if j.job_id != job.job_id]
+        self.queue_sel = max(0, self.queue_sel - 1)
+        self.status = f"Removed \"{job.title}\" from the queue."
 
     def handle_mouse_event(self) -> bool:
         try:
@@ -3669,11 +3992,11 @@ class RetroWaveIA:
         status_l = (status or "").lower()
         if active or status_l in ("downloading", "active"):
             return curses.color_pair(2) | curses.A_BOLD
-        if status_l in ("failed", "error", "blocked"):
+        if status_l in ("failed", "error", "blocked", "canceled"):
             return curses.color_pair(5) | curses.A_BOLD
         if status_l in ("unclear", "warning", "skipped", "staged"):
             return curses.color_pair(3)
-        if status_l in ("marked", "pending"):
+        if status_l in ("marked", "pending", "queued", "awaiting_import"):
             return curses.color_pair(1) | curses.A_BOLD
         return curses.color_pair(6)
 
@@ -3708,43 +4031,90 @@ class RetroWaveIA:
     def import_left_in_staging(self, msg: str) -> bool:
         return self.import_queue_status(msg) == "staged"
 
-    def queue_table_rows(self, width: int, limit: int = 8) -> List[Tuple[str, int]]:
+    def job_file_table_rows(self, job: DownloadJob, width: int, limit: int = 8) -> List[Tuple[str, int]]:
         if width <= 0:
             return []
+        self._ensure_download_state()
+        with self._download_lock:
+            file_rows = list(job.file_statuses)
+            current_name = job.current_file_name
         rows: List[Tuple[str, int]] = [("STATUS      SIZE       FILE", curses.color_pair(3) | curses.A_BOLD)]
         name_w = max(8, width - 22)
-        for row in self.queue_status[:limit]:
+        for row in file_rows[:limit]:
             status = str(row.get("status") or "pending")
             size = display_size(row.get("size"))
             name = str(row.get("name") or "")
             if len(name) > name_w:
                 name = name[: max(0, name_w - 1)] + "…"
-            active = bool(self.dl_current_name and row.get("name") == self.dl_current_name)
+            active = bool(current_name and row.get("name") == current_name)
             line = f"{status:<11} {size:>8}  {name}"
             rows.append((line[:width], self.queue_row_attr(status, active)))
-        if len(self.queue_status) > limit:
-            rows.append((f"... and {len(self.queue_status) - limit} more", curses.color_pair(6) | curses.A_DIM))
+        if len(file_rows) > limit:
+            rows.append((f"... and {len(file_rows) - limit} more", curses.color_pair(6) | curses.A_DIM))
         return rows
 
-    def record_failed_file(self, f: IAFile, err: str) -> None:
-        if all(existing.name != f.name for existing in self.failed_queue):
-            self.failed_queue.append(f)
-        self.set_queue_status(f.name, "failed", err)
+    def record_failed_file(
+        self,
+        f: IAFile,
+        err: str,
+        owner_item: Optional[SearchResult],
+        owner_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        owner = replace(owner_item) if isinstance(owner_item, SearchResult) and owner_item.identifier else None
+        metadata = deepcopy(owner_metadata) if isinstance(owner_metadata, dict) else None
+        entry = FailedDownload(file=f, owner_item=owner, owner_metadata=metadata, error=err)
+        for index, existing in enumerate(self.failed_queue):
+            if not isinstance(existing, FailedDownload):
+                continue
+            existing_owner = existing.owner_item
+            if (
+                existing.file.name == f.name
+                and existing_owner
+                and owner
+                and existing_owner.identifier == owner.identifier
+            ):
+                self.failed_queue[index] = entry
+                return
+        self.failed_queue.append(entry)
+
+    def file_owner(self) -> Tuple[Optional[SearchResult], str]:
+        """Return the item that supplied the current FILES list, never its mutable selection."""
+        item = getattr(self, "file_owner_item", None)
+        if not isinstance(item, SearchResult) or not item.identifier:
+            return None, "File list owner is unavailable; reload the item before downloading."
+        return item, ""
+
+    def _clear_retry_failed_preview(self) -> None:
+        self._retry_failed_entries = []
+        self._retry_failed_metadata = None
 
     def retry_failed_downloads(self) -> None:
         if not self.failed_queue:
             self.status = "No failed files to retry."
             return
-        item = self.selected_result() or self.preview_item
-        if not item:
-            self.status = "No item selected for retry."
+
+        entries = list(self.failed_queue)
+        if not all(
+            isinstance(entry, FailedDownload)
+            and isinstance(entry.owner_item, SearchResult)
+            and entry.owner_item.identifier
+            for entry in entries
+        ):
+            self.status = "Failed download owner is unavailable; retry cannot safely choose an item."
             return
-        self.preview_item = item
+
+        owner = entries[0].owner_item
+        retry_entries = [entry for entry in entries if entry.owner_item.identifier == owner.identifier]
+        other_count = len(entries) - len(retry_entries)
+        self.preview_item = replace(owner)
         self.preview_file = None
-        self.preview_files = list(self.failed_queue)
+        self.preview_files = [entry.file for entry in retry_entries]
         self.preview_prefix = "__SELECTED__"
+        self._retry_failed_entries = retry_entries
+        self._retry_failed_metadata = deepcopy(retry_entries[0].owner_metadata)
         self.refresh_preview_import_info()
-        self.preview_msg = f"Retrying {len(self.failed_queue)} failed file(s)."
+        remaining = f" {other_count} failed file(s) from other items will remain queued for retry." if other_count else ""
+        self.preview_msg = f"Retrying {len(retry_entries)} failed file(s) from {owner.identifier}.{remaining}"
         self.mode = "PREVIEW_DL"
         self.focus = "MENU"
         self.menu_idx = 0
@@ -3757,9 +4127,10 @@ class RetroWaveIA:
         self.resume_pending_download()
     
     def set_preview_for_selected(self) -> None:
-        item = self.selected_result()
+        self._clear_retry_failed_preview()
+        item, owner_err = self.file_owner()
         if not item:
-            self.status = "No item selected."
+            self.status = owner_err
             return
         visible = self.get_visible_files()
         if not visible or not (0 <= self.sel_f < len(visible)):
@@ -3793,9 +4164,10 @@ class RetroWaveIA:
         self.status = "Preview (no changes)."
 
     def set_preview_for_marked(self) -> None:
-        item = self.selected_result()
+        self._clear_retry_failed_preview()
+        item, owner_err = self.file_owner()
         if not item:
-            self.status = "No item selected."
+            self.status = owner_err
             return
         marked = self.get_marked_visible_files()
         if not marked:
@@ -3830,9 +4202,10 @@ class RetroWaveIA:
         self.status = "Preview (no changes)."
 
     def set_preview_for_prefix(self) -> None:
-        item = self.selected_result()
+        self._clear_retry_failed_preview()
+        item, owner_err = self.file_owner()
         if not item:
-            self.status = "No item selected."
+            self.status = owner_err
             return
         if self.is_youtube_result(item):
             self.status = "YouTube supports single-video downloads only."
@@ -3890,9 +4263,10 @@ class RetroWaveIA:
         self.status = "Preview (no changes)."
 
     def set_preview_for_item(self) -> None:
-        item = self.selected_result()
+        self._clear_retry_failed_preview()
+        item, owner_err = self.file_owner()
         if not item:
-            self.status = "No item selected."
+            self.status = owner_err
             return
         if self.is_youtube_result(item):
             self.set_preview_for_selected()
@@ -3944,190 +4318,326 @@ class RetroWaveIA:
     def _is_stall_error(self, msg: str) -> bool:
         return "download stalled" in (msg or "").lower()
 
-    def _wait_before_stall_retry(self, attempt_num: int, max_attempts: int) -> bool:
+    def _background_wait_before_stall_retry(self, job: DownloadJob, attempt_num: int, max_attempts: int) -> bool:
+        # No curses access here (background thread): show progress via job.error
+        # instead of self.status/self.render(), and poll job.cancel_requested
+        # (set by the main thread) instead of reading stdscr directly.
         for remaining in range(STALL_RETRY_DELAY_S, 0, -1):
-            self.status = f"Download stalled. Auto-retry {attempt_num}/{max_attempts} in {remaining}s. Press c to cancel."
-            self.render()
-            try:
-                if self.stdscr.getch() in (ord("c"), ord("C")):
-                    self.dl_cancel_requested = True
+            with self._download_lock:
+                job.error = f"Stalled. Auto-retry {attempt_num}/{max_attempts} in {remaining}s."
+                if job.cancel_requested:
                     return False
-            except Exception:
-                pass
             time.sleep(1)
         return True
 
-    def _download_one_with_progress(self, identifier: str, filename: str, expected_size: int) -> Tuple[bool, str]:
+    def _background_download_file(self, job: DownloadJob, identifier: str, filename: str, expected_size: int) -> Tuple[bool, str]:
+        """Curses-free rewrite of the old _download_one_with_progress, safe to run
+        on the background worker thread: progress/cancel flow through `job`
+        (guarded by self._download_lock) instead of self.status/self.render()/stdscr."""
         path, err = safe_staging_file_path(identifier, filename)
         if err or not path:
             return False, err
         os.makedirs(STAGING_ROOT, exist_ok=True)
+        target_lock, lock_err = ia_downloads.acquire_target_download_lock(identifier, filename)
+        if not target_lock:
+            return False, lock_err
 
-        item = getattr(self, "preview_item", None)
-        is_youtube = self.is_youtube_result(item)
-        if is_youtube:
-            if not item or not getattr(item, "webpage_url", ""):
-                return False, "YouTube URL is missing."
-            os.makedirs(yt_downloads.youtube_staging_dir(identifier), exist_ok=True)
-            cmd = yt_downloads.single_video_download_cmd(APP_CONFIG["yt_dlp_path"], item.webpage_url, identifier)
-            read_written = lambda: ia_downloads.dir_total_size(yt_downloads.youtube_staging_dir(identifier))
-        else:
-            cmd = ia_downloads.single_download_cmd(identifier, filename, IA_NO_CHANGE_TIMESTAMP)
-            read_written = lambda: ia_downloads.safe_getsize(path)
-        log_line(f"DL_CMD: {shlex.join(cmd)}")
-        ia_minotaur_events.emit_archive_started(f"{identifier} {filename}")
-        log_fh = ia_downloads.open_process_log()
         try:
-            self.dl_cancel_requested = False
-            self.dl_current_name = filename
-            self.dl_current_total = int(expected_size or 0)
-            self.dl_current_written = 0
-            self.dl_speed_bps = 0.0
-            self.dl_eta_s = 0.0
-            self.stdscr.nodelay(True)
+            if job.is_youtube:
+                if not job.webpage_url:
+                    return False, "YouTube URL is missing."
+                os.makedirs(yt_downloads.youtube_staging_dir(identifier), exist_ok=True)
+                cmd = yt_downloads.single_video_download_cmd(APP_CONFIG["yt_dlp_path"], job.webpage_url, identifier)
+                read_written = lambda: ia_downloads.dir_total_size(yt_downloads.youtube_staging_dir(identifier))
+            else:
+                cmd = ia_downloads.single_download_cmd(identifier, filename, IA_NO_CHANGE_TIMESTAMP)
+                read_written = lambda: ia_downloads.safe_getsize(path)
+            log_line(f"DL_CMD: {shlex.join(cmd)}")
+            ia_minotaur_events.emit_archive_started(f"{identifier} {filename}")
+            log_fh = ia_downloads.open_process_log()
+            try:
+                with self._download_lock:
+                    job.current_file_name = filename
+                    job.total = int(expected_size or 0)
+                    job.written = 0
+                    job.speed_bps = 0.0
+                    job.eta_s = 0.0
+                    job.error = ""
 
-            def check_cancel() -> bool:
-                ch = self.stdscr.getch()
-                if ch in (ord("c"), ord("C")):
-                    self.dl_cancel_requested = True
-                return self.dl_cancel_requested
+                def check_cancel() -> bool:
+                    with self._download_lock:
+                        return job.cancel_requested
 
-            def update_progress(progress: ia_downloads.DownloadProgress) -> None:
-                self.dl_current_written = progress.written
-                self.dl_current_total = progress.total
-                self.dl_speed_bps = progress.speed_bps
-                self.dl_eta_s = progress.eta_s
-                if progress.total > 0:
-                    pct = int((progress.written * 100) / progress.total) if progress.total else 0
-                    sp = human_size(int(progress.speed_bps)) + "/s" if progress.speed_bps > 0 else "?/s"
-                    eta = f"{int(progress.eta_s)}s" if progress.eta_s > 0 else "?"
-                    self.status = f"{filename}  {pct}%  {human_size(progress.written)}/{human_size(progress.total)}  {sp}  ETA {eta}  (c cancels)"
-                elif progress.written > 0:
-                    self.status = f"{filename}  {human_size(progress.written)} downloaded  (c cancels)"
-                else:
-                    self.status = f"{filename}  downloaded size unknown  (c cancels)"
-                self.render()
+                def update_progress(progress: ia_downloads.DownloadProgress) -> None:
+                    with self._download_lock:
+                        job.written = progress.written
+                        job.total = progress.total
+                        job.speed_bps = progress.speed_bps
+                        job.eta_s = progress.eta_s
 
-            max_stall_retries = STALL_AUTO_RETRIES
-            attempt = 0
-            while True:
-                if attempt > 0:
-                    self.status = f"Retrying stalled download {attempt}/{max_stall_retries}: {filename}"
-                    self.render()
-                    log_line(f"DL_STALL_RETRY: {filename} attempt {attempt}/{max_stall_retries}")
+                max_stall_retries = STALL_AUTO_RETRIES
+                attempt = 0
+                while True:
+                    if attempt > 0:
+                        log_line(f"DL_STALL_RETRY: {filename} attempt {attempt}/{max_stall_retries}")
 
-                ok, msg = ia_downloads.run_download_with_progress(
-                    cmd,
-                    target=filename,
-                    expected_total=int(expected_size or 0),
-                    read_written=read_written,
-                    log_fh=log_fh,
-                    stall_timeout_s=STALL_TIMEOUT_S,
-                    is_cancel_requested=check_cancel,
-                    on_progress=update_progress,
-                    log_path=LOG_PATH,
-                )
-                if ok:
-                    break
+                    ok, msg = ia_downloads.run_download_with_progress(
+                        cmd,
+                        target=filename,
+                        expected_total=int(expected_size or 0),
+                        read_written=read_written,
+                        log_fh=log_fh,
+                        stall_timeout_s=STALL_TIMEOUT_S,
+                        is_cancel_requested=check_cancel,
+                        on_progress=update_progress,
+                        log_path=LOG_PATH,
+                    )
+                    if ok:
+                        break
 
-                if msg.startswith("download failed:"):
-                    log_line(f"DL_POPEN_ERR: {msg}")
+                    if msg.startswith("download failed:"):
+                        log_line(f"DL_POPEN_ERR: {msg}")
+                        ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg}")
+                        return False, msg
+
+                    if self._is_stall_error(msg):
+                        if self._staged_file_complete(identifier, filename, int(expected_size or 0)):
+                            log_line(f"DL_STALL_COMPLETE: {filename}")
+                            break
+                        if check_cancel():
+                            ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: Canceled.")
+                            return False, "Canceled."
+                        if attempt < max_stall_retries:
+                            attempt += 1
+                            if not self._background_wait_before_stall_retry(job, attempt, max_stall_retries):
+                                ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: Canceled.")
+                                return False, "Canceled."
+                            continue
+                        err = f"{msg} Auto-retry limit reached."
+                        ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {err}")
+                        return False, err
+
                     ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg}")
                     return False, msg
 
-                if self._is_stall_error(msg):
-                    if self._staged_file_complete(identifier, filename, int(expected_size or 0)):
-                        log_line(f"DL_STALL_COMPLETE: {filename}")
-                        break
-                    if self.dl_cancel_requested:
-                        ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: Canceled.")
-                        return False, "Canceled."
-                    if attempt < max_stall_retries:
-                        attempt += 1
-                        if not self._wait_before_stall_retry(attempt, max_stall_retries):
-                            ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: Canceled.")
-                            return False, "Canceled."
-                        continue
-                    err = f"{msg} Auto-retry limit reached."
-                    ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {err}")
-                    return False, err
-
-                ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg}")
-                return False, msg
-
-            if not is_youtube:
-                ok_sz, msg_sz = self._verify_expected_size(identifier, filename, int(expected_size or 0))
-                if not ok_sz:
-                    ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg_sz}")
-                    return False, msg_sz
-            ia_minotaur_events.emit_archive_completed(f"{identifier} {filename}")
-            return True, ""
+                if not job.is_youtube:
+                    ok_target, msg_target = ia_downloads.verify_download_target(identifier, filename)
+                    if not ok_target:
+                        ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg_target}")
+                        return False, msg_target
+                    ok_sz, msg_sz = self._verify_expected_size(identifier, filename, int(expected_size or 0))
+                    if not ok_sz:
+                        ia_minotaur_events.emit_archive_failed(f"{identifier} {filename}: {msg_sz}")
+                        return False, msg_sz
+                ia_minotaur_events.emit_archive_completed(f"{identifier} {filename}")
+                return True, ""
+            finally:
+                log_fh.close()
         finally:
-            self.stdscr.nodelay(False)
-            log_fh.close()
+            target_lock.release()
 
-    def _download_glob_with_progress(self, identifier: str, glob_pat: str, expected_total: int) -> Tuple[bool, str]:
-        os.makedirs(STAGING_ROOT, exist_ok=True)
-        os.makedirs(ia_downloads.staging_dir_for_identifier(identifier), exist_ok=True)
+    # ---------- background download queue ----------
+    def _ensure_download_worker_running(self) -> None:
+        self._ensure_download_state()
+        with self._download_lock:
+            thread = self._download_worker_thread
+            if thread is not None and thread.is_alive():
+                return
+            thread = threading.Thread(target=self._download_worker_loop, daemon=True)
+            self._download_worker_thread = thread
+        thread.start()
 
-        cmd = ia_downloads.glob_download_cmd(identifier, glob_pat, IA_NO_CHANGE_TIMESTAMP)
-        log_line(f"DL_GLOB_CMD: {shlex.join(cmd)}")
-        ia_minotaur_events.emit_archive_started(f"{identifier} {glob_pat}")
-        log_fh = ia_downloads.open_process_log()
-        try:
-            self.dl_cancel_requested = False
-            self.dl_current_name = f"--glob {glob_pat}"
-            self.dl_current_total = int(expected_total or 0)
-            self.dl_current_written = 0
-            self.dl_speed_bps = 0.0
-            self.dl_eta_s = 0.0
-            self.stdscr.nodelay(True)
+    def _next_queued_job(self) -> Optional[DownloadJob]:
+        self._ensure_download_state()
+        with self._download_lock:
+            for job in self.download_queue:
+                if job.status == "queued":
+                    return job
+        return None
 
-            base_dir = ia_downloads.staging_dir_for_identifier(identifier)
+    def _download_worker_loop(self) -> None:
+        while True:
+            job = self._next_queued_job()
+            if job is None:
+                return
+            with self._download_lock:
+                job.status = "downloading"
+            self._run_job_downloads(job)
 
-            def check_cancel() -> bool:
-                ch = self.stdscr.getch()
-                if ch in (ord("c"), ord("C")):
-                    self.dl_cancel_requested = True
-                return self.dl_cancel_requested
+    def _run_job_downloads(self, job: DownloadJob) -> None:
+        with self._download_lock:
+            already_handled = {row["name"] for row in job.file_statuses}
+            completed_names = [row["name"] for row in job.file_statuses if row.get("status") in ("done", "skipped")]
+        remaining = [f for f in job.files if f.name not in already_handled]
 
-            def update_progress(progress: ia_downloads.DownloadProgress) -> None:
-                self.dl_current_written = progress.written
-                self.dl_current_total = progress.total
-                self.dl_speed_bps = progress.speed_bps
-                self.dl_eta_s = progress.eta_s
-                if progress.total > 0:
-                    pct = int((progress.written * 100) / progress.total) if progress.total else 0
-                    sp = human_size(int(progress.speed_bps)) + "/s" if progress.speed_bps > 0 else "?/s"
-                    eta = f"{int(progress.eta_s)}s" if progress.eta_s > 0 else "?"
-                    self.status = f"{identifier}  {pct}%  {human_size(progress.written)}/{human_size(progress.total)}  {sp}  ETA {eta}  (c cancels)"
-                elif progress.written > 0:
-                    self.status = f"{identifier}  {human_size(progress.written)} downloaded  (c cancels)"
-                else:
-                    self.status = f"{identifier}  downloaded size unknown  (c cancels)"
-                self.render()
+        for f in remaining:
+            with self._download_lock:
+                if job.cancel_requested:
+                    job.set_file_status(f.name, "canceled", "Canceled.")
+                    job.status = "canceled"
+                    job.finished_at = time.time()
+                    self._save_pending(job.identifier, job.title, job.files, job.preview_prefix, "", completed_names)
+                    return
+                job.set_file_status(f.name, "downloading")
 
-            ok, msg = ia_downloads.run_download_with_progress(
-                cmd,
-                target=f"--glob {glob_pat}",
-                expected_total=int(expected_total or 0),
-                read_written=lambda: ia_downloads.dir_total_size(base_dir),
-                log_fh=log_fh,
-                stall_timeout_s=STALL_TIMEOUT_S,
-                is_cancel_requested=check_cancel,
-                on_progress=update_progress,
-                log_path=LOG_PATH,
-            )
-            if not ok and msg.startswith("download failed:"):
-                log_line(f"DL_GLOB_POPEN_ERR: {msg}")
-            if ok:
-                ia_minotaur_events.emit_archive_completed(f"{identifier} {glob_pat}")
-            else:
-                ia_minotaur_events.emit_archive_failed(f"{identifier} {glob_pat}: {msg}")
-            return ok, msg
-        finally:
-            self.stdscr.nodelay(False)
-            log_fh.close()
+            ok, err = self._background_download_file(job, job.identifier, f.name, int(f.size or 0))
+            if not ok:
+                status = "canceled" if "cancel" in err.lower() else "failed"
+                with self._download_lock:
+                    job.set_file_status(f.name, status, err)
+                    job.status = status
+                    job.error = err
+                    job.finished_at = time.time()
+                self._save_pending(job.identifier, job.title, job.files, job.preview_prefix, "", completed_names)
+                return
+
+            real_name = f.name
+            if job.is_youtube:
+                found = yt_downloads.find_downloaded_video_file(job.identifier, job.video_id)
+                if not found:
+                    err = "yt-dlp finished, but downloaded file was not found in staging."
+                    with self._download_lock:
+                        job.set_file_status(f.name, "failed", err)
+                        job.status = "failed"
+                        job.error = err
+                        job.finished_at = time.time()
+                    return
+                real_name = found
+                found_path, found_err = safe_staging_file_path(job.identifier, found)
+                if not found_err and found_path:
+                    f.size = ia_downloads.safe_getsize(found_path)
+
+            with self._download_lock:
+                job.set_file_status(f.name, "downloaded", size=int(f.size or 0), real_name=real_name)
+
+        with self._download_lock:
+            job.status = "awaiting_import"
+            job.current_file_name = ""
+            job.error = ""
+        self._clear_pending()
+
+    def _enqueue_download_job(
+        self,
+        identifier: str,
+        title: str,
+        files: List[IAFile],
+        *,
+        preview_prefix: str = "",
+        batch: Optional[Dict[str, str]] = None,
+        is_youtube: bool = False,
+        webpage_url: str = "",
+        video_id: str = "",
+        pre_resolved: Optional[List[Tuple[IAFile, str]]] = None,
+        owner_item: Optional[SearchResult] = None,
+        owner_metadata: Optional[Dict[str, Any]] = None,
+    ) -> DownloadJob:
+        """Queue a job for the background worker. `pre_resolved` are files the
+        main thread already handled via _handle_already_complete (already
+        staged/skipped/failed) before the job was built -- they're recorded as
+        already-done so the worker only downloads what's actually left."""
+        job = DownloadJob(
+            job_id=self._next_job_id(),
+            identifier=identifier,
+            title=title,
+            files=list(files),
+            preview_prefix=preview_prefix,
+            batch=batch,
+            is_youtube=is_youtube,
+            webpage_url=webpage_url,
+            video_id=video_id,
+            owner_item=replace(owner_item) if isinstance(owner_item, SearchResult) and owner_item.identifier else None,
+            owner_metadata=deepcopy(owner_metadata) if isinstance(owner_metadata, dict) else None,
+            created_at=time.time(),
+        )
+        for f, msg in (pre_resolved or []):
+            status = self.import_queue_status(msg)
+            self.note_import_status(status)
+            job.set_file_status(f.name, status, msg, size=int(f.size or 0))
+            if status == "failed":
+                self.record_failed_file(f, msg, job.owner_item, job.owner_metadata)
+            self.download_log.insert(0, msg)
+        if pre_resolved:
+            self.download_log = self.download_log[:8]
+        with self._download_lock:
+            self.download_queue.append(job)
+        self._ensure_download_worker_running()
+        return job
+
+    def finish_download_progress(self) -> bool:
+        """Polled once per main-loop tick, alongside finish_search_load_if_ready/
+        finish_file_load_if_ready. Byte transfer already happened in the
+        background; this does the interactive "where does this go" placement
+        step (and failure/cancel bookkeeping) for whichever job finished
+        downloading, one job at a time, without ever running while another
+        prompt is open."""
+        self._ensure_download_state()
+        with self._download_lock:
+            target = None
+            for job in self.download_queue:
+                if job.status in ("awaiting_import", "failed", "canceled") and not job.bookkept:
+                    target = job
+                    break
+        if target is None:
+            return False
+        self._process_finished_job(target)
+        self._prune_download_queue()
+        return True
+
+    def _process_finished_job(self, job: DownloadJob) -> None:
+        if job.status in ("failed", "canceled"):
+            with self._download_lock:
+                failed_row = next((r for r in job.file_statuses if r.get("status") in ("failed", "canceled")), None)
+                err = job.error
+                job.bookkept = True
+            if job.status == "failed" and failed_row:
+                f = next((x for x in job.files if x.name == failed_row.get("name")), None)
+                if f:
+                    self.record_failed_file(f, err, job.owner_item, job.owner_metadata)
+            suffix = "  (press R to resume)" if job.status == "canceled" else ""
+            self.status = f"{err}{suffix}"
+            self.download_log.insert(0, f"Error: {err}")
+            self.download_log = self.download_log[:8]
+            return
+
+        # awaiting_import: place every file whose bytes finished downloading.
+        # Non-interactive when job.batch was chosen up front; otherwise this
+        # is the same per-file bucket/folder prompt flow as before, just
+        # deferred until we're back at the main loop instead of forced the
+        # instant bytes land.
+        with self._download_lock:
+            to_import = list(job.files_needing_import())
+        for row in to_import:
+            name = str(row["name"])
+            real_name = str(row.get("real_name") or name)
+            msg = self.choose_bucket_and_path(job.identifier, real_name, job.title, batch=job.batch)
+            import_status = self.import_queue_status(msg)
+            self.note_import_status(import_status)
+            with self._download_lock:
+                job.set_file_status(name, import_status, msg)
+            if import_status == "failed":
+                f = next((x for x in job.files if x.name == name), None)
+                if f:
+                    self.record_failed_file(f, msg, job.owner_item, job.owner_metadata)
+            self.download_log.insert(0, msg)
+            self.download_log = self.download_log[:8]
+
+        with self._download_lock:
+            staged_count = sum(1 for r in job.file_statuses if r.get("status") == "staged")
+            total_files = len(job.files)
+            job.status = "done"
+            job.finished_at = time.time()
+            job.bookkept = True
+        if staged_count:
+            self.status = f"Downloaded {total_files} file(s); {staged_count} import pending. ({self.download_queue_summary()})"
+        else:
+            self.status = f"Done. Downloaded {total_files} file(s). ({self.download_queue_summary()})"
+
+    def _prune_download_queue(self, keep_terminal: int = 20) -> None:
+        with self._download_lock:
+            active = [j for j in self.download_queue if j.status not in JOB_TERMINAL_STATUSES]
+            terminal = [j for j in self.download_queue if j.status in JOB_TERMINAL_STATUSES]
+            terminal.sort(key=lambda j: j.finished_at)
+            self.download_queue = active + terminal[-keep_terminal:]
 
     def resume_pending_download(self) -> None:
         pending = self._load_pending()
@@ -4197,12 +4707,15 @@ class RetroWaveIA:
             self.results.insert(0, stub_item)
             self.sel_r = 0
 
-        self.mode = "DOWNLOADING"
-        self.focus = "MENU"
+        self.mode = "FILES"
+        self.focus = "LIST"
         os.makedirs(STAGING_ROOT, exist_ok=True)
 
         new_completed = completed_names_list
 
+        # Files already downloaded (staged) just need the interactive
+        # placement step -- quick, so it still runs right away on the main
+        # thread, same as before.
         for f in staged_ready:
             msg = self.choose_bucket_and_path(identifier, f.name, item_title)
             import_status = self.import_queue_status(msg)
@@ -4211,48 +4724,24 @@ class RetroWaveIA:
                 new_completed.append(f.name)
             self.download_log.insert(0, msg)
             self.download_log = self.download_log[:8]
-            self.status = msg
-            self.render()
 
-        if remaining:
-            # Resume per file, even for original glob/prefix downloads, so already
-            # complete staged files are imported without being downloaded again.
-            for idx, f in enumerate(remaining):
-                self.status = f"Resuming {idx+1}/{len(remaining)}: {f.name}"
-                self.render()
-                ok2, err = self._download_one_with_progress(identifier, f.name, int(f.size or 0))
-                if not ok2:
-                    self._save_pending(identifier, item_title, all_files, preview_prefix, glob_pat, new_completed)
-                    self.mode = "FILES"
-                    self.focus = "LIST"
-                    self.status = f"{err}  (press R to retry)"
-                    self.download_log.insert(0, f"Resume error: {err}")
-                    self.download_log = self.download_log[:8]
-                    return
-                msg = self.choose_bucket_and_path(identifier, f.name, item_title)
-                import_status = self.import_queue_status(msg)
-                self.note_import_status(import_status)
-                if import_status == "done" or import_status == "skipped":
-                    new_completed.append(f.name)
-                self.download_log.insert(0, msg)
-                self.download_log = self.download_log[:8]
-                self.status = msg
-                self.render()
-
-        if len(new_completed) < len(all_files):
-            self._save_pending(identifier, item_title, all_files, preview_prefix, glob_pat, new_completed)
-            self.mode = "FILES"
-            self.focus = "LIST"
-            self.status = "Resume paused with files left."
+        if not remaining:
+            if skipped_existing:
+                self.status = f"Skipped {skipped_existing} existing file(s)."
+            self._clear_pending()
+            self.status = f"Resume complete. {n} file(s) handled."
             return
 
-        if skipped_existing:
-            self.status = f"Skipped {skipped_existing} existing file(s)."
-
-        self._clear_pending()
-        self.mode = "FILES"
-        self.focus = "LIST"
-        self.status = f"Resume complete. {n} file(s) handled."
+        # Anything still needing bytes goes to the background queue so search
+        # and browsing stay available while it downloads.
+        self._enqueue_download_job(
+            identifier,
+            item_title,
+            remaining,
+            preview_prefix=preview_prefix,
+            owner_item=stub_item,
+        )
+        self.status = f"Resuming {len(remaining)} file(s) in the background ({self.download_queue_summary()})."
 
     def perform_download_plan(self) -> None:
         if not self.preview_item:
@@ -4261,12 +4750,37 @@ class RetroWaveIA:
             self.focus = "LIST"
             return
 
+        retry_entries = list(getattr(self, "_retry_failed_entries", []))
+        if retry_entries:
+            if not all(
+                isinstance(entry, FailedDownload)
+                and isinstance(entry.owner_item, SearchResult)
+                and entry.owner_item.identifier == self.preview_item.identifier
+                for entry in retry_entries
+            ):
+                self.status = "Failed download owner is inconsistent; retry cannot safely choose an item."
+                self.mode = "FILES"
+                self.focus = "LIST"
+                return
+            metadata = getattr(self, "_retry_failed_metadata", None)
+        # A normal app instance always has this attribute. Refuse any preview
+        # whose item no longer matches the FILES view that supplied its files.
+        elif hasattr(self, "file_owner_item"):
+            owner, owner_err = self.file_owner()
+            if not owner or owner.identifier != self.preview_item.identifier:
+                self.status = owner_err or "File list owner does not match this download preview; reload the item."
+                self.mode = "FILES"
+                self.focus = "LIST"
+                return
+            metadata = self.cur_meta or {}
+        else:
+            metadata = self.cur_meta or {}
+
         is_youtube_plan = self.is_youtube_result(self.preview_item)
         if is_youtube_plan:
             ok, why = True, "YouTube single video via yt-dlp."
         else:
-            meta = self.cur_meta or {}
-            ok, why = is_openly_licensed(meta) if meta else (False, "No metadata loaded")
+            ok, why = is_openly_licensed(metadata) if metadata else (False, "No metadata loaded")
         if not ok and self.enforce_license_gate:
             self.status = f"Blocked. {why}"
             self.mode = "FILES"
@@ -4282,106 +4796,48 @@ class RetroWaveIA:
                 return
 
         item = self.preview_item
-        self.failed_queue = []
+        if retry_entries:
+            retry_entry_ids = {id(entry) for entry in retry_entries}
+            self.failed_queue = [entry for entry in self.failed_queue if id(entry) not in retry_entry_ids]
+            self._clear_retry_failed_preview()
+        else:
+            self.failed_queue = []
 
         # single file
         if self.preview_file:
-            queue = [self.preview_file]
-            self.init_queue_status(queue)
-            self.dl_overall_total = sum(int(f.size or 0) for f in queue)
-            self.dl_overall_written = 0
-
-            self.mode = "DOWNLOADING"
-            self.focus = "MENU"
-
-            f = queue[0]
+            f = self.preview_file
             complete_msg = self._handle_already_complete(item.identifier, f, item.title)
-            if complete_msg:
-                status = self.import_queue_status(complete_msg)
-                self.note_import_status(status)
-                self.set_queue_status(f.name, status, complete_msg)
-                if status == "staged":
-                    self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
-                self.mode = "FILES"
-                self.focus = "LIST"
-                self.preview_item = None
-                self.preview_file = None
-                self.preview_files = []
-                self.preview_prefix = ""
-                self.status = complete_msg
-                self.download_log.insert(0, complete_msg)
-                self.download_log = self.download_log[:8]
-                return
-            self.set_queue_status(f.name, "downloading")
-            self.status = f"Downloading: {f.name}"
-            self.render()
-
-            ok2, err = self._download_one_with_progress(item.identifier, f.name, int(f.size or 0))
-            if not ok2:
-                status = "canceled" if "cancel" in err.lower() else "failed"
-                self.set_queue_status(f.name, status, err)
-                if "cancel" in err.lower() and not self.is_youtube_result(item):
-                    self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
-                if not self.is_youtube_result(item):
-                    self.record_failed_file(f, err)
-                self.mode = "FILES"
-                self.focus = "LIST"
-                self.preview_item = None
-                self.preview_file = None
-                self.preview_files = []
-                self.preview_prefix = ""
-                self.status = f"{err}  (press R to resume)" if "cancel" in err.lower() else err
-                self.download_log.insert(0, f"Error: {err}")
-                self.download_log = self.download_log[:8]
-                return
-
-            import_name = f.name
-            downloaded_size = int(f.size or 0)
-            if self.is_youtube_result(item):
-                found = yt_downloads.find_downloaded_video_file(item.identifier, item.video_id)
-                if not found:
-                    err = "yt-dlp finished, but downloaded file was not found in staging."
-                    self.record_failed_file(f, err)
-                    self.mode = "FILES"
-                    self.focus = "LIST"
-                    self.preview_item = None
-                    self.preview_file = None
-                    self.preview_files = []
-                    self.preview_prefix = ""
-                    self.status = err
-                    self.download_log.insert(0, f"Error: {err}")
-                    self.download_log = self.download_log[:8]
-                    return
-                import_name = found
-                found_path, found_err = safe_staging_file_path(item.identifier, found)
-                if not found_err and found_path:
-                    downloaded_size = ia_downloads.safe_getsize(found_path)
-                    f.size = downloaded_size
-            msg = self.choose_bucket_and_path(item.identifier, import_name, item.title)
-            import_status = self.import_queue_status(msg)
-            self.note_import_status(import_status)
-            self.set_queue_status(f.name, import_status, msg, size=downloaded_size)
-            if import_status == "staged":
-                self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", [])
-            self.download_log.insert(0, msg)
-            self.download_log = self.download_log[:8]
             self.preview_item = None
             self.preview_file = None
             self.preview_files = []
             self.preview_prefix = ""
-            if import_status == "staged":
-                self.show_download_complete("Downloaded 1 file; import pending. Press R after returning to import from staging.")
-            elif import_status == "failed":
-                self.show_download_complete("Downloaded 1 file; import failed.")
-            else:
-                size_note = f" ({display_size(downloaded_size)})" if self.is_youtube_result(item) and downloaded_size > 0 else ""
-                self.show_download_complete(f"Done. Downloaded 1 file{size_note}.")
+            self.mode = "FILES"
+            self.focus = "LIST"
+
+            if complete_msg:
+                status = self.import_queue_status(complete_msg)
+                self.note_import_status(status)
+                self.download_log.insert(0, complete_msg)
+                self.download_log = self.download_log[:8]
+                self.status = complete_msg
+                return
+
+            self._enqueue_download_job(
+                item.identifier,
+                item.title,
+                [f],
+                is_youtube=self.is_youtube_result(item),
+                webpage_url=getattr(item, "webpage_url", ""),
+                video_id=getattr(item, "video_id", ""),
+                owner_item=item,
+                owner_metadata=metadata,
+            )
+            self.status = f"Queued: {item.title} — {f.name} ({self.download_queue_summary()})"
             return
 
         # prefix or full item
         if self.preview_files:
             queue = list(self.preview_files)
-            self.init_queue_status(queue)
             total_expected = sum(int(f.size or 0) for f in queue)
             batch_import = self.choose_batch_import_options(item.title) if len(queue) > 1 else None
 
@@ -4396,159 +4852,20 @@ class RetroWaveIA:
                     self.focus = "LIST"
                     return
 
-            self.mode = "DOWNLOADING"
-            self.focus = "MENU"
-
-            # Prefix plans are resolved to the logical queue above. Keep the
-            # IA server-side glob path disabled: it could also fetch a hidden
-            # .ia variant that is absent from the queue.
-            if (
-                self.preview_prefix
-                and self.preview_prefix not in ("__FULL_ITEM__", "__SELECTED__")
-                and getattr(self, "_allow_server_glob_for_logical_queue", False)
-            ):
-                remaining_for_glob: List[IAFile] = []
-                completed_names: List[str] = []
-                for f in queue:
-                    complete_msg = self._handle_already_complete(item.identifier, f, item.title, batch=batch_import)
-                    if complete_msg:
-                        status = self.import_queue_status(complete_msg)
-                        self.note_import_status(status)
-                        self.set_queue_status(f.name, status, complete_msg)
-                        if status == "done" or status == "skipped":
-                            completed_names.append(f.name)
-                        self.download_log.insert(0, complete_msg)
-                        self.download_log = self.download_log[:8]
-                    else:
-                        remaining_for_glob.append(f)
-                if not remaining_for_glob:
-                    self.mode = "FILES"
-                    self.focus = "LIST"
-                    self.status = f"All {len(queue)} file(s) were already complete."
-                    return
-                queue = remaining_for_glob
-                # Use ia --glob for prefix downloads.
-                # NOTE: IA globs are matched against the "name" field (including folder paths).
-                # Using prefix* matches "prefix..." including subpaths if prefix includes a folder/ path.
-                glob_pat = f"{self.preview_prefix}*"
-                self.status = f"Downloading prefix via --glob: {glob_pat}"
-                self.render()
-
-                ok2, err = self._download_glob_with_progress(item.identifier, glob_pat, int(total_expected))
-                if not ok2:
-                    for f in queue:
-                        self.record_failed_file(f, err)
-                    self._save_pending(item.identifier, item.title, queue,
-                                       self.preview_prefix, glob_pat, completed_names)
-                    self.mode = "FILES"
-                    self.focus = "LIST"
-                    self.preview_item = None
-                    self.preview_file = None
-                    self.preview_files = []
-                    self.preview_prefix = ""
-                    self.status = f"{err}  (press R to resume)"
-                    self.download_log.insert(0, f"Error: {err}")
-                    self.download_log = self.download_log[:8]
-                    return
-
-                # Import each expected file (now that the glob run finished).
-                for f in queue:
-                    ok_sz, msg_sz = self._verify_expected_size(item.identifier, f.name, int(f.size or 0))
-                    if not ok_sz:
-                        self._save_pending(item.identifier, item.title, queue,
-                                           self.preview_prefix, glob_pat, completed_names)
-                        self.record_failed_file(f, msg_sz)
-                        self.mode = "FILES"
-                        self.focus = "LIST"
-                        self.preview_item = None
-                        self.preview_file = None
-                        self.preview_files = []
-                        self.preview_prefix = ""
-                        self.status = f"{msg_sz}  (press R to resume)"
-                        self.download_log.insert(0, f"Error: {msg_sz}")
-                        self.download_log = self.download_log[:8]
-                        return
-
-                    msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, batch=batch_import)
-                    import_status = self.import_queue_status(msg)
-                    self.note_import_status(import_status)
-                    self.set_queue_status(f.name, import_status, msg)
-                    if import_status == "done" or import_status == "skipped":
-                        completed_names.append(f.name)
-                    self.download_log.insert(0, msg)
-                    self.download_log = self.download_log[:8]
-                    self.status = msg
-                    self.render()
-
-                self._clear_pending()
-                was_selected_plan = self.preview_prefix == "__SELECTED__"
-                self.preview_item = None
-                self.preview_file = None
-                self.preview_files = []
-                self.preview_prefix = ""
-                if was_selected_plan:
-                    self.selected_file_names.clear()
-                    self.save_current_file_view_state()
-                staged_count = sum(1 for row in self.queue_status if row.get("status") == "staged")
-                if staged_count:
-                    self._save_pending(item.identifier, item.title, queue, self.preview_prefix, glob_pat, completed_names)
-                    self.show_download_complete(f"Downloaded {len(queue)} file(s); {staged_count} import pending.")
-                else:
-                    self.show_download_complete(f"Done. Downloaded {len(queue)} file(s).")
-                return
-
-            # Full item (visible set). Sequential download keeps progress accurate per-file and imports cleanly.
-            seq_completed: List[str] = []
-            for idx, f in enumerate(queue):
+            # Already-complete files are resolved here, on the main thread
+            # (interactive placement may be involved), before the rest goes
+            # to the background worker as a single job.
+            pre_resolved: List[Tuple[IAFile, str]] = []
+            remaining: List[IAFile] = []
+            for f in queue:
                 complete_msg = self._handle_already_complete(item.identifier, f, item.title, batch=batch_import)
                 if complete_msg:
-                    status = self.import_queue_status(complete_msg)
-                    self.note_import_status(status)
-                    self.set_queue_status(f.name, status, complete_msg)
-                    if status == "done" or status == "skipped":
-                        seq_completed.append(f.name)
-                    self.download_log.insert(0, complete_msg)
-                    self.download_log = self.download_log[:8]
-                    continue
-                self.dl_current_name = f.name
-                self.dl_current_total = int(f.size or 0)
-                self.dl_current_written = 0
+                    pre_resolved.append((f, complete_msg))
+                else:
+                    remaining.append(f)
 
-                self.status = f"Downloading {idx+1}/{len(queue)}: {f.name}"
-                self.set_queue_status(f.name, "downloading")
-                self.render()
-
-                ok2, err = self._download_one_with_progress(item.identifier, f.name, int(f.size or 0))
-                if not ok2:
-                    status = "canceled" if "cancel" in err.lower() else "failed"
-                    self.set_queue_status(f.name, status, err)
-                    self.record_failed_file(f, err)
-                    self._save_pending(item.identifier, item.title, queue,
-                                       self.preview_prefix, "", seq_completed)
-                    self.mode = "FILES"
-                    self.focus = "LIST"
-                    self.preview_item = None
-                    self.preview_file = None
-                    self.preview_files = []
-                    self.preview_prefix = ""
-                    self.status = f"{err}  (press R to resume)"
-                    self.download_log.insert(0, f"Error: {err}")
-                    self.download_log = self.download_log[:8]
-                    return
-
-                msg = self.choose_bucket_and_path(item.identifier, f.name, item.title, batch=batch_import)
-                import_status = self.import_queue_status(msg)
-                self.note_import_status(import_status)
-                self.set_queue_status(f.name, import_status, msg)
-                if import_status == "done" or import_status == "skipped":
-                    seq_completed.append(f.name)
-                self.download_log.insert(0, msg)
-                self.download_log = self.download_log[:8]
-                self.status = msg
-                self.render()
-
-            self._clear_pending()
             was_selected_plan = self.preview_prefix == "__SELECTED__"
+            preview_prefix = self.preview_prefix
             self.preview_item = None
             self.preview_file = None
             self.preview_files = []
@@ -4556,12 +4873,23 @@ class RetroWaveIA:
             if was_selected_plan:
                 self.selected_file_names.clear()
                 self.save_current_file_view_state()
-            staged_count = sum(1 for row in self.queue_status if row.get("status") == "staged")
-            if staged_count:
-                self._save_pending(item.identifier, item.title, queue, self.preview_prefix, "", seq_completed)
-                self.show_download_complete(f"Downloaded {len(queue)} file(s); {staged_count} import pending.")
+
+            self._enqueue_download_job(
+                item.identifier,
+                item.title,
+                queue,
+                preview_prefix=preview_prefix,
+                batch=batch_import,
+                pre_resolved=pre_resolved,
+                owner_item=item,
+                owner_metadata=metadata,
+            )
+            self.mode = "FILES"
+            self.focus = "LIST"
+            if not remaining:
+                self.status = f"All {len(queue)} file(s) were already complete."
             else:
-                self.show_download_complete(f"Done. Downloaded {len(queue)} file(s).")
+                self.status = f"Queued: {item.title} — {len(remaining)}/{len(queue)} file(s) ({self.download_queue_summary()})"
             return
 
         self.status = "Nothing selected."
@@ -4607,7 +4935,7 @@ class RetroWaveIA:
         return count >= BULK_CONFIRM_FILE_THRESHOLD or total_bytes >= BULK_CONFIRM_BYTES_THRESHOLD
 
     def current_license_status(self) -> Tuple[str, str]:
-        item = getattr(self, "preview_item", None) or self.selected_result()
+        item = getattr(self, "preview_item", None) or getattr(self, "file_owner_item", None) or self.selected_result()
         if self.is_youtube_result(item):
             return "open", "YouTube single video via yt-dlp."
         meta = self.cur_meta or {}
@@ -4836,7 +5164,7 @@ class RetroWaveIA:
             existing_rows.append(f"... and {len(self.preview_existing) - 5} more")
         y = box("Existing Files", existing_rows, y)
 
-        queue_rows = self.queue_table_rows(w - 6, limit=10) if self.queue_status else self.preview_queue_table_rows(w - 6, limit=10)
+        queue_rows = self.preview_queue_table_rows(w - 6, limit=10)
         if not files:
             queue_rows = ["No files in plan."]
         box("Queue", queue_rows, y)
@@ -4868,8 +5196,8 @@ class RetroWaveIA:
             left_title = f"FAVORITES ({self.favs_tab})"
         elif self.mode == "HELP":
             left_title = "HELP"
-        elif self.mode == "DOWNLOADING":
-            left_title = "DOWNLOADING"
+        elif self.mode == "QUEUE":
+            left_title = "DOWNLOAD QUEUE"
         elif self.mode == "ERROR":
             left_title = "ERROR"
         elif self.mode == "PREVIEW_DL":
@@ -5063,6 +5391,27 @@ class RetroWaveIA:
                         attr = (curses.color_pair(7) | curses.A_BOLD) if i == self.favs_idx else curses.color_pair(6)
                         self.safe_addstr(list_top + (i - start), 0, line, attr)
 
+        elif self.mode == "QUEUE":
+            jobs = self._queue_display_order()
+            self.safe_addstr(list_top, 0, self.download_queue_summary()[: max(0, left_w - 1)].ljust(max(0, left_w - 1)), curses.color_pair(3))
+            list_top += 1
+            max_rows = max(0, max_rows - 1)
+            if not jobs:
+                self.safe_addstr(list_top, 0, "Queue is empty. Download something from Files to add a job.".ljust(max(0, left_w - 1)), curses.color_pair(6))
+            else:
+                if self.queue_sel >= len(jobs):
+                    self.queue_sel = max(0, len(jobs) - 1)
+                start = max(0, self.queue_sel - max_rows + 1) if self.queue_sel >= max_rows else 0
+                for i in range(start, min(len(jobs), start + max_rows)):
+                    job = jobs[i]
+                    marker = ">" if i == self.queue_sel else " "
+                    title = (job.title[:37] + "…") if len(job.title) > 38 else job.title
+                    line = f"{marker} {i+1:02d} │ [{job.status:<14}] {title} — {job.summary_label()}"
+                    line = line[: max(0, left_w - 1)].ljust(max(0, left_w - 1))
+                    attr = self.queue_row_attr(job.status, active=(job.status == "downloading"))
+                    if i == self.queue_sel:
+                        attr |= curses.A_REVERSE
+                    self.safe_addstr(list_top + (i - start), 0, line, attr)
 
         ry = list_top
         details: List[str] = []
@@ -5198,44 +5547,42 @@ class RetroWaveIA:
                         short = query if len(query) <= max(18, right_w - 8) else (query[: max(15, right_w - 11)] + "...")
                         details.append(f"  {label}: {short}")
 
-        elif self.mode == "DOWNLOADING":
-            if self.dl_complete_notice:
-                details = [
-                    "Download complete:",
-                    f"  {self.dl_complete_notice}",
-                    "",
-                    "Press Enter or Backspace to return.",
-                ]
+        elif self.mode == "QUEUE":
+            job = self.selected_queue_job()
+            if not job:
+                details = ["No jobs queued.", "", "Download a file or item from Files to add one."]
             else:
-                details = [
-                    "Download progress:",
-                    f"  Target: {self.dl_current_name}",
-                    self.queue_summary(),
-                ]
-                if self.dl_current_total > 0:
-                    pct = int((self.dl_current_written * 100) / self.dl_current_total) if self.dl_current_total else 0
+                with self._download_lock:
+                    written, total = job.written, job.total
+                    speed_bps, eta_s = job.speed_bps, job.eta_s
+                    current_file = job.current_file_name
+                    error = job.error
+                details = [f"Job: {job.title}", f"  Status: {job.status}"]
+                if job.status == "downloading":
+                    details.append(f"  File: {current_file}")
                     bar_w = max(8, min(34, right_w - 4))
-                    details += [
-                        f"  [{shaded_progress_bar(self.dl_current_written, self.dl_current_total, bar_w)}]",
-                        f"  {pct}%  {human_size(self.dl_current_written)}/{human_size(self.dl_current_total)}",
-                    ]
-                else:
-                    bar_w = max(8, min(34, right_w - 4))
-                    details += [
-                        f"  [{shaded_progress_bar(self.dl_current_written, self.dl_current_total, bar_w)}]",
-                        f"  {human_size(self.dl_current_written)} downloaded" if self.dl_current_written > 0 else "  Size unknown",
-                    ]
-                if self.dl_speed_bps > 0:
-                    details += [f"  Speed: {human_size(int(self.dl_speed_bps))}/s"]
-                if self.dl_eta_s > 0:
-                    details += [f"  ETA: {int(self.dl_eta_s)}s"]
-                details += ["", "Press c to cancel"]
+                    if total > 0:
+                        pct = int((written * 100) / total) if total else 0
+                        details += [
+                            f"  [{shaded_progress_bar(written, total, bar_w)}]",
+                            f"  {pct}%  {human_size(written)}/{human_size(total)}",
+                        ]
+                    else:
+                        details += [
+                            f"  [{shaded_progress_bar(written, total, bar_w)}]",
+                            f"  {human_size(written)} downloaded" if written > 0 else "  Size unknown",
+                        ]
+                    if speed_bps > 0:
+                        details.append(f"  Speed: {human_size(int(speed_bps))}/s")
+                    if eta_s > 0:
+                        details.append(f"  ETA: {int(eta_s)}s")
+                elif error:
+                    details.append(f"  {error}")
+                details += ["", "Files:"]
+                details += self.job_file_table_rows(job, right_w, limit=8)
+            details += ["", "c cancel  |  x remove  |  Backspace/q back"]
 
-            if self.queue_status:
-                details += ["", "Queue:"]
-                details += self.queue_table_rows(right_w, limit=8)
-
-        if getattr(self, "last_error_detail", "") and self.mode != "DOWNLOADING":
+        if getattr(self, "last_error_detail", "") and self.mode != "QUEUE":
             wrap_w = max(12, right_w - 2)
             err_rows = ["Last error:"]
             for wrapped in textwrap.wrap(str(self.last_error_detail), width=wrap_w) or [str(self.last_error_detail)]:
@@ -5252,8 +5599,30 @@ class RetroWaveIA:
             self.safe_addstr(ry, right_x, text[: max(0, right_w)].ljust(max(0, right_w)), attr)
             ry += 1
 
-        if right_w > 10 and self.download_log and self.mode != "FAVS":
-            ry2 = body_bottom - min(8, len(self.download_log) + 1)
+        self._ensure_download_state()
+        show_downloads_panel = bool(self.download_queue) and self.mode != "QUEUE" and right_w > 10
+        activity_reserved = min(8, len(self.download_log) + 1) if (right_w > 10 and self.download_log and self.mode != "FAVS") else 0
+
+        if show_downloads_panel:
+            dl_lines = self._downloads_panel_lines(right_w)
+            downloads_reserved = min(6, len(dl_lines) + 1)
+            ry3 = body_bottom - activity_reserved - downloads_reserved
+            if ry3 > list_top + 2:
+                self.safe_addstr(ry3, right_x, " DOWNLOADS ".ljust(max(0, right_w), "─")[: max(0, right_w)], curses.color_pair(2))
+                ry3 += 1
+                bottom_limit = body_bottom - activity_reserved
+                for line in dl_lines:
+                    if ry3 >= bottom_limit:
+                        break
+                    if isinstance(line, tuple):
+                        text, attr = line
+                    else:
+                        text, attr = str(line), curses.color_pair(6)
+                    self.safe_addstr(ry3, right_x, text[: max(0, right_w)].ljust(max(0, right_w)), attr)
+                    ry3 += 1
+
+        if activity_reserved:
+            ry2 = body_bottom - activity_reserved
             if ry2 > list_top + 2:
                 self.safe_addstr(ry2, right_x, " ACTIVITY ".ljust(max(0, right_w), "─")[: max(0, right_w)], curses.color_pair(2))
                 ry2 += 1
@@ -5304,7 +5673,7 @@ class RetroWaveIA:
             return
 
         if action == "quit":
-            self.exit_requested = True
+            self.request_quit()
             return
 
         if action == "actions":
@@ -5341,6 +5710,11 @@ class RetroWaveIA:
             self.status = "Favorites. Use Tab for menu, or arrows for list."
             return
 
+        if action == "queue_view":
+            self.menu_idx = 0
+            self.open_download_queue()
+            return
+
         if action == "license_gate":
             self.enforce_license_gate = not self.enforce_license_gate
             self.status = "License gate: ON (blocks unclear rights)" if self.enforce_license_gate else "License gate: OFF (warns only)"
@@ -5363,6 +5737,19 @@ class RetroWaveIA:
                 self.mode = "FILES" if self.files else "RESULTS"
                 self.focus = "LIST"
                 self.status = "Back"
+                return
+            if self.mode == "QUEUE":
+                self.mode = self.queue_return_mode
+                self.focus = "LIST"
+                self.status = "Back"
+                return
+
+        if self.mode == "QUEUE":
+            if action == "queue_cancel":
+                self.cancel_selected_queue_job()
+                return
+            if action == "queue_remove":
+                self.remove_selected_queue_job()
                 return
 
         if self.mode in ("RESULTS", "SEARCH"):
@@ -5508,6 +5895,26 @@ class RetroWaveIA:
                 self.status = "Search mode: title" if self.title_only else "Search mode: broad"
                 if self.query_text:
                     self.start_search_async(reset_page=True)
+                return
+            if action == "toggle_hide_small_items":
+                self.hide_small_items = not self.hide_small_items
+                self._save_session()
+                state = "on" if self.hide_small_items else "off"
+                n = len(self.get_visible_results())
+                self.status = f"Hide small items: {state} (<{self.min_item_size_mb}MB) — {n} visible"
+                return
+            if action == "edit_min_item_size":
+                s = self.prompt("Minimum item size in MB (0 = no minimum): ", str(self.min_item_size_mb))
+                if s is not None:
+                    try:
+                        mb = max(0, int(str(s).strip() or 0))
+                    except ValueError:
+                        self.status = "Minimum item size must be a whole number of MB."
+                        return
+                    self.min_item_size_mb = mb
+                    self._save_session()
+                    n = len(self.get_visible_results())
+                    self.status = f"Minimum item size: {mb}MB — {n} visible"
                 return
             if action == "next_page":
                 self.next_page()
@@ -5765,6 +6172,7 @@ class RetroWaveIA:
         while not self.exit_requested:
             self.finish_search_load_if_ready()
             self.finish_file_load_if_ready()
+            self.finish_download_progress()
             self.render()
             ch = self.stdscr.getch()
             if ch == -1:
@@ -5783,22 +6191,25 @@ class RetroWaveIA:
                     continue
                 continue
 
-            if ch in (ord("q"), ord("Q")):
+            if ch == ord("q"):
                 if self.mode == "PREVIEW_DL":
                     self.mode = "FILES"
                     self.focus = "LIST"
                     self.status = "Canceled."
                     continue
-                break
+                if self.mode == "QUEUE":
+                    self.mode = self.queue_return_mode
+                    self.focus = "LIST"
+                    self.status = "Back"
+                    continue
+                self.request_quit()
+                continue
 
             if self.mode == "ERROR" or self.term_too_small():
                 continue
 
             if ch == ord('?'):
                 self.toggle_help_overlay()
-                continue
-
-            if self.handle_download_complete_key(ch):
                 continue
 
             if ch in (ord('T'),):
@@ -5834,6 +6245,30 @@ class RetroWaveIA:
                 self.show_audit_summary()
                 continue
 
+            if ch in (ord('Q'),) and self.mode in ("RESULTS", "SEARCH", "FILES", "FAVS"):
+                self.open_download_queue()
+                continue
+
+            if self.mode == "QUEUE" and self.focus == "LIST":
+                if ch in (curses.KEY_UP, ord('k')):
+                    self.queue_sel = max(0, self.queue_sel - 1)
+                    continue
+                if ch in (curses.KEY_DOWN, ord('j')):
+                    jobs = self._queue_display_order()
+                    self.queue_sel = min(max(0, len(jobs) - 1), self.queue_sel + 1)
+                    continue
+                if ch in (ord('c'), ord('C')):
+                    self.cancel_selected_queue_job()
+                    continue
+                if ch in (ord('x'), ord('X'), curses.KEY_DC):
+                    self.remove_selected_queue_job()
+                    continue
+                if ch in (27, curses.KEY_BACKSPACE, 127, 8):
+                    self.mode = self.queue_return_mode
+                    self.focus = "LIST"
+                    self.status = "Back"
+                    continue
+
             if ch in (ord('/'), ord('s'), ord('S')):
                 s = self.prompt("Search: ", self.query_text, history=self.search_history)
                 if s is not None:
@@ -5842,7 +6277,7 @@ class RetroWaveIA:
                     self.start_search_async(reset_page=True)
                 continue
 
-            if ch == ord('R') and self.mode not in ("DOWNLOADING", "PREVIEW_DL"):
+            if ch == ord('R') and self.mode not in ("PREVIEW_DL", "QUEUE"):
                 self.resume_or_retry_download()
                 continue
 

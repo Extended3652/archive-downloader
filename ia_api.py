@@ -111,6 +111,8 @@ def ia_search_via_curl(
         "--data-urlencode",
         "fl[]=downloads",
         "--data-urlencode",
+        "fl[]=item_size",
+        "--data-urlencode",
         "fl[]=date",
         "--data-urlencode",
         "fl[]=publicdate",
@@ -162,6 +164,10 @@ def ia_search_via_curl(
             downloads = int(downloads_raw or 0)
         except (TypeError, ValueError):
             downloads = 0
+        try:
+            item_size = int(d.get("item_size") or 0)
+        except (TypeError, ValueError):
+            item_size = 0
         collection_raw = d.get("collection", "")
         if isinstance(collection_raw, list):
             collection_raw = ", ".join(str(x) for x in collection_raw[:3])
@@ -180,6 +186,7 @@ def ia_search_via_curl(
                 mediatype=str(d.get("mediatype", "") or "").strip(),
                 formats=formats,
                 downloads=downloads,
+                item_size=item_size,
                 date=str(d.get("date", "") or "").strip(),
                 publicdate=str(d.get("publicdate", "") or "").strip(),
                 collection=str(collection_raw or "").strip(),
@@ -264,6 +271,13 @@ def ia_files(
     meta, err = ia_metadata_json(identifier, runner=runner)
     if err or not meta:
         return [], None, err or "metadata error"
+
+    # archive.org returns HTTP 200 with a stub payload (no "metadata"/"files"
+    # keys) for items that exist but are dark (taken down/restricted), rather
+    # than a 404. Left unchecked this looks like a normal item with zero
+    # files instead of the takedown/restriction it actually is.
+    if meta.get("is_dark"):
+        return [], meta, f"Item '{identifier}' is dark (restricted or taken down) on archive.org"
 
     files: List[IAFile] = []
     for f in meta.get("files", []) or []:

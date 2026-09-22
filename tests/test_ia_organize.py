@@ -213,7 +213,33 @@ class TestBuildQuery:
         attempts = build_query_attempts("Fargo 1996", "movies", False)
 
         assert attempts[0] == ("title/year", 'title:("Fargo") AND year:1996 AND mediatype:movies')
-        assert attempts[1] == ("title", '(title:("Fargo") OR Fargo) AND year:1996 AND mediatype:movies')
+        assert attempts[1] == ("title-strict", 'title:("Fargo") AND mediatype:movies')
+        assert attempts[2] == ("title-any-type", 'title:("Fargo")')
+        assert attempts[3] == ("title", '(title:("Fargo") OR Fargo) AND year:1996 AND mediatype:movies')
+
+    def test_title_any_type_attempt_precedes_loose_fallback_when_filter_set(self):
+        # A title that only exists under a different media type (e.g. a song
+        # with no matching "movies" item) must be checked for *before* the
+        # loose OR-with-raw-text fallback, which ANDs unquoted terms across
+        # every field within the (wrong) filter and returns near-random junk
+        # for common-word titles.
+        attempts = build_query_attempts("Two Sleepy People", "movies", False)
+        labels = [label for label, _query in attempts]
+
+        # "title" itself already bakes in a loose "OR raw_text" clause
+        # (build_query), so the any-type check must precede it too, not just
+        # "fields"/"plain".
+        assert labels.index("title-any-type") < labels.index("title")
+        assert labels.index("title-any-type") < labels.index("fields")
+        assert labels.index("title-any-type") < labels.index("plain")
+        any_type = dict(attempts)["title-any-type"]
+        assert any_type == 'title:("Two Sleepy People")'
+        assert "mediatype" not in any_type
+
+    def test_title_any_type_attempt_skipped_when_filter_is_any(self):
+        attempts = build_query_attempts("Two Sleepy People", "any", False)
+
+        assert all(label != "title-any-type" for label, _query in attempts)
 
     def test_fielded_query_searches_ia_metadata_fields(self):
         assert build_fielded_query("Chaplin", "movies") == (
@@ -274,6 +300,15 @@ class TestQueryHelpers:
     def test_looks_like_identifier(self):
         assert looks_like_identifier("prelinger-123")
         assert not looks_like_identifier("prelinger 123")
+
+    def test_looks_like_identifier_rejects_plain_words(self):
+        # A bare dictionary word (e.g. a movie title typed with no year/spaces)
+        # should not be treated as an identifier lookup just because it has no
+        # spaces -- it might coincidentally collide with an unrelated
+        # identifier on archive.org (a clip, a trailer, ...) and short-circuit
+        # the real title search.
+        assert not looks_like_identifier("tenet")
+        assert not looks_like_identifier("chaplin")
 
     def test_normalize_collection_identifier_uses_first_identifier(self):
         assert normalize_collection_identifier("prelinger, feature_films") == "prelinger"

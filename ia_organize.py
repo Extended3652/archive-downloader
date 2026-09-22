@@ -214,7 +214,15 @@ def looks_like_identifier(text: str) -> bool:
     s = (text or "").strip()
     if not s or " " in s:
         return False
-    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,}", s))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,}", s):
+        return False
+    # Require a digit or identifier-style punctuation so a single plain word
+    # (e.g. "tenet", "alien") isn't treated as an identifier lookup. A bare
+    # dictionary word that happens to collide with an unrelated archive.org
+    # identifier (a trailer, a clip, ...) would otherwise short-circuit the
+    # whole search on that one coincidental match instead of running the
+    # actual title search.
+    return bool(re.search(r"[0-9._-]", s))
 
 
 def archive_query_preset_labels() -> List[Tuple[str, str]]:
@@ -394,6 +402,26 @@ def build_query_attempts(user_text: str, media_filter: str, title_only: bool) ->
     title_year = build_title_year_query(s, media_filter)
     if title_year:
         attempts.append(("title/year", title_year))
+    # Try the strict title-field-only match before the broad OR-with-raw-text
+    # query below. IA's parser turns an unquoted multi-word OR clause into a
+    # loose per-word match across every field, which can bury an exact title
+    # hit under thousands of barely-related documents (e.g. a transcript that
+    # happens to contain "all", "the", and "fair"). Since a strict title match
+    # is cheap and usually sufficient, try it first and only fall back to the
+    # noisier broad query when it comes up empty.
+    title, _year = split_title_year(s)
+    attempts.append(("title-strict", add_media_filter(quote_title(title), media_filter)))
+    # If the exact title doesn't exist under the requested media type, check
+    # whether it exists at all before trying "title" (next) or "fields"/
+    # "plain" (further below) -- all three of those AND unquoted raw-text
+    # terms across every field within the (possibly wrong) media filter,
+    # which for a common-word title whose real match lives in a different
+    # media type (e.g. a song with no matching "movies" item) returns
+    # near-random results instead of nothing. This has to run before "title",
+    # not just before "fields"/"plain": build_query() already bakes the same
+    # loose "OR raw_text" clause into the "title" attempt itself.
+    if media_filter and media_filter != "any":
+        attempts.append(("title-any-type", quote_title(title)))
     attempts.append(("title", first))
     attempts.append(("fields", build_fielded_query(s, media_filter)))
     attempts.append(("plain", add_media_filter(s, media_filter)))

@@ -108,6 +108,8 @@ class TestRetroWaveIAState:
                 "license_gate": True,
                 "no_change_timestamp": False,
                 "rows_per_page": 30,
+                "hide_small_items": True,
+                "min_item_size_mb": 250,
                 "media_root": "/tmp/unused",
             },
         )
@@ -121,6 +123,8 @@ class TestRetroWaveIAState:
         assert app.sort_by == "downloads desc"
         assert app.title_only is True
         assert app.enforce_license_gate is True
+        assert app.hide_small_items is True
+        assert app.min_item_size_mb == 250
         assert app.mode == "RESULTS"
 
     def test_music_folder_favorites_stay_in_music_bucket(self):
@@ -632,7 +636,7 @@ class TestRetroWaveIAState:
         app.selected_file_order = ["two.mp4"]
         app.cur_meta = {"metadata": {"licenseurl": "https://creativecommons.org/licenses/by/4.0/"}}
         app.enforce_license_gate = False
-        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Title")
+        app.file_owner_item = ia_minotaur.SearchResult("item1", "Title")
 
         app.set_preview_for_marked()
 
@@ -656,7 +660,7 @@ class TestRetroWaveIAState:
         app.selected_file_order = ["three.mp4", "one.mp4"]
         app.cur_meta = {"metadata": {"licenseurl": "https://creativecommons.org/licenses/by/4.0/"}}
         app.enforce_license_gate = False
-        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Title")
+        app.file_owner_item = ia_minotaur.SearchResult("item1", "Title")
 
         app.set_preview_for_marked()
 
@@ -752,24 +756,27 @@ class TestRetroWaveIAState:
         assert not app.requires_strong_bulk_confirm("__SELECTED__", 1000, ia_minotaur.BULK_CONFIRM_BYTES_THRESHOLD * 2)
         assert not app.requires_strong_bulk_confirm("__FULL_ITEM__", 1, 1)
 
-    def test_queue_status_summary_counts_states(self):
+    def test_download_queue_summary_counts_job_states(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
-        app.queue_status = []
+        app._ensure_download_state()
+        app.download_queue = [
+            ia_minotaur.DownloadJob(job_id=1, identifier="a", title="A", files=[], status="done"),
+            ia_minotaur.DownloadJob(job_id=2, identifier="b", title="B", files=[], status="failed"),
+        ]
 
-        app.init_queue_status([ia_minotaur.IAFile("one.mp4", 10), ia_minotaur.IAFile("two.mp4", 20)])
-        app.set_queue_status("one.mp4", "done")
-        app.set_queue_status("two.mp4", "failed", "network")
+        assert app.download_queue_summary() == "Queue: done:1 failed:1"
 
-        assert app.queue_summary() == "Queue: done:1 failed:1"
-
-    def test_queue_status_renders_unknown_instead_of_zero_bytes(self, monkeypatch):
+    def test_job_file_table_rows_renders_unknown_instead_of_zero_bytes(self, monkeypatch):
         monkeypatch.setattr(curses, "color_pair", lambda _n: 0)
         app = RetroWaveIA.__new__(RetroWaveIA)
-        app.queue_status = []
-        app.dl_current_name = ""
+        app._ensure_download_state()
+        job = ia_minotaur.DownloadJob(
+            job_id=1, identifier="item1", title="Item",
+            files=[ia_minotaur.IAFile("yt-video.mp4", 0, "YouTube video")],
+        )
+        job.set_file_status("yt-video.mp4", "pending", size=0)
 
-        app.init_queue_status([ia_minotaur.IAFile("yt-video.mp4", 0, "YouTube video")])
-        rows = app.queue_table_rows(80)
+        rows = app.job_file_table_rows(job, 80)
 
         assert "unknown" in rows[1][0]
         assert "0B" not in rows[1][0]
@@ -912,9 +919,10 @@ class TestRetroWaveIAState:
 
     def test_retry_failed_downloads_builds_selected_preview(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
-        app.failed_queue = [ia_minotaur.IAFile("one.mp4", 10)]
+        owner = ia_minotaur.SearchResult("item1", "Title")
+        app.failed_queue = [ia_minotaur.FailedDownload(ia_minotaur.IAFile("one.mp4", 10), owner)]
         app.preview_item = ia_minotaur.SearchResult("item1", "Title")
-        app.selected_result = lambda: None
+        app.file_owner_item = ia_minotaur.SearchResult("item1", "Title")
         app.refresh_preview_import_info = lambda: None
         app.status = ""
 
@@ -923,6 +931,113 @@ class TestRetroWaveIAState:
         assert app.mode == "PREVIEW_DL"
         assert app.preview_prefix == "__SELECTED__"
         assert [f.name for f in app.preview_files] == ["one.mp4"]
+
+    def test_retry_failed_download_uses_original_owner_after_files_view_changes(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        owner_a = ia_minotaur.SearchResult("item-a", "Item A")
+        owner_b = ia_minotaur.SearchResult("item-b", "Item B")
+        app.failed_queue = []
+        app.record_failed_file(
+            ia_minotaur.IAFile("from-a.mp4", 4),
+            "download failed",
+            owner_a,
+            {"metadata": {"licenseurl": "https://creativecommons.org/licenses/by/4.0/"}},
+        )
+        # The user has since loaded item B's FILES view. Retry must not use it.
+        app.file_owner_item = owner_b
+        app.cur_meta = {"metadata": {"rights": "not an open license"}}
+        app.enforce_license_gate = True
+        app.preview_item = None
+        app.selected_file_names = set()
+        app.download_queue = []
+        app.save_current_file_view_state = lambda: None
+        app.refresh_preview_import_info = lambda: None
+        app.status = ""
+
+        app.retry_failed_downloads()
+
+        assert app.preview_item.identifier == "item-a"
+        assert [f.name for f in app.preview_files] == ["from-a.mp4"]
+
+        queued = []
+        app.prompt = lambda *_args, **_kwargs: ""
+        app._handle_already_complete = lambda *_args, **_kwargs: None
+        app._enqueue_download_job = lambda identifier, _title, _files, **_kwargs: queued.append(identifier)
+        app.perform_download_plan()
+
+        assert queued == ["item-a"]
+        assert app.failed_queue == []
+
+    def test_retry_failed_downloads_groups_owners_and_removes_only_retried_group(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        owner_a = ia_minotaur.SearchResult("item-a", "Item A")
+        owner_b = ia_minotaur.SearchResult("item-b", "Item B")
+        open_meta = {"metadata": {"licenseurl": "https://creativecommons.org/licenses/by/4.0/"}}
+        app.failed_queue = [
+            ia_minotaur.FailedDownload(ia_minotaur.IAFile("from-a.mp4", 4), owner_a, open_meta),
+            ia_minotaur.FailedDownload(ia_minotaur.IAFile("from-b.mp4", 4), owner_b, open_meta),
+        ]
+        app.file_owner_item = owner_b
+        app.cur_meta = {}
+        app.enforce_license_gate = True
+        app.preview_item = None
+        app.selected_file_names = set()
+        app.download_queue = []
+        app.save_current_file_view_state = lambda: None
+        app.refresh_preview_import_info = lambda: None
+        app.prompt = lambda *_args, **_kwargs: ""
+        app._handle_already_complete = lambda *_args, **_kwargs: None
+        queued = []
+        app._enqueue_download_job = lambda identifier, _title, _files, **_kwargs: queued.append(identifier)
+
+        app.retry_failed_downloads()
+        app.perform_download_plan()
+
+        assert queued == ["item-a"]
+        assert [entry.owner_item.identifier for entry in app.failed_queue] == ["item-b"]
+
+        app.retry_failed_downloads()
+        app.perform_download_plan()
+
+        assert queued == ["item-a", "item-b"]
+        assert app.failed_queue == []
+
+    def test_retry_failed_download_without_owner_fails_without_current_selection(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.failed_queue = [ia_minotaur.FailedDownload(ia_minotaur.IAFile("orphan.mp4", 4), None)]
+        app.file_owner_item = ia_minotaur.SearchResult("item-b", "Item B")
+        app.preview_item = None
+        app.status = ""
+
+        app.retry_failed_downloads()
+
+        assert app.preview_item is None
+        assert "owner is unavailable" in app.status
+
+    def test_failed_job_records_its_owner_for_later_retry(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
+        owner = ia_minotaur.SearchResult("item-a", "Item A")
+        job = ia_minotaur.DownloadJob(
+            job_id=1,
+            identifier="item-a",
+            title="Item A",
+            files=[ia_minotaur.IAFile("from-a.mp4", 4)],
+            owner_item=owner,
+            owner_metadata={"metadata": {"licenseurl": "https://creativecommons.org/licenses/by/4.0/"}},
+            status="failed",
+            error="download failed",
+        )
+        job.set_file_status("from-a.mp4", "failed", "download failed")
+        app.download_queue = [job]
+        app.failed_queue = []
+        app.download_log = []
+        app.status = ""
+
+        assert app.finish_download_progress() is True
+
+        assert len(app.failed_queue) == 1
+        assert app.failed_queue[0].owner_item.identifier == "item-a"
 
     def test_resume_or_retry_prefers_failed_queue(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -972,7 +1087,7 @@ class TestRetroWaveIAState:
         app.selected_file_names = {"one.mp4"}
         app.selected_file_order = ["one.mp4"]
         app.file_view_state = {}
-        app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Title")
+        app.file_owner_item = ia_minotaur.SearchResult("item1", "Title")
 
         app.save_current_file_view_state()
 
@@ -1467,6 +1582,49 @@ class TestRetroWaveIAState:
 
         assert app.mode == "FILES"
         assert [f.name for f in app.files] == ["one.mp4"]
+        assert app.file_owner_item.identifier == "item1"
+
+    def test_file_preview_pins_loaded_owner_when_search_selection_changes(self, monkeypatch):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        owner = ia_minotaur.SearchResult("item-a", "Item A")
+        app.file_owner_item = owner
+        app.files = [ia_minotaur.IAFile("from-a.mp4", 4, "MPEG4")]
+        app.sel_f = 0
+        app.get_visible_files = lambda: app.files
+        app.selected_result = lambda: ia_minotaur.SearchResult("item-b", "Item B")
+        app.cur_meta = {"metadata": {}}
+        app.enforce_license_gate = False
+        app.refresh_preview_import_info = lambda: None
+        app.mode = "FILES"
+        app.focus = "LIST"
+        app.menu_idx = 0
+        app.status = ""
+
+        app.set_preview_for_selected()
+
+        assert app.preview_item.identifier == "item-a"
+        assert app.preview_file.name == "from-a.mp4"
+
+        queued = {}
+        app.prompt = lambda *_args, **_kwargs: ""
+        app._handle_already_complete = lambda *_args, **_kwargs: None
+        app._enqueue_download_job = lambda identifier, _title, _files, **_kwargs: queued.update(identifier=identifier)
+        app.perform_download_plan()
+
+        assert queued["identifier"] == "item-a"
+
+    def test_file_preview_without_owner_fails_without_using_current_selection(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("orphan.mp4", 4, "MPEG4")]
+        app.sel_f = 0
+        app.get_visible_files = lambda: app.files
+        app.selected_result = lambda: ia_minotaur.SearchResult("item-b", "Item B")
+        app.status = ""
+
+        app.set_preview_for_selected()
+
+        assert getattr(app, "preview_item", None) is None
+        assert "owner is unavailable" in app.status
 
     def test_async_file_load_error_remains_visible(self, monkeypatch):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -1614,10 +1772,28 @@ class TestRetroWaveIAState:
 
         app.do_search()
 
-        assert len(calls) == 3
-        assert calls[0] == "identifier:chaplin AND mediatype:movies"
+        assert len(calls) == 4
+        assert calls[0] == 'title:("chaplin") AND mediatype:movies'
+        assert calls[1] == 'title:("chaplin")'  # any-media-type check before the loose fallback
         assert "creator" in app.query_built
         assert "fields match" in app.status
+
+    def test_search_hint_reports_media_type_mismatch(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.filter = "movies"
+        results = [ia_minotaur.SearchResult("id1", "Two Sleepy People", mediatype="audio")]
+
+        hint = app.search_hint_text("title-any-type", results)
+
+        assert "not found in 'movies'" in hint
+        assert "audio" in hint
+
+    def test_search_hint_empty_for_confident_labels(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.filter = "movies"
+
+        assert app.search_hint_text("title", []) == ""
+        assert app.search_hint_text("title-strict", []) == " (title-strict match)"
 
     def test_collection_search_action_builds_collection_query(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -1672,7 +1848,7 @@ class TestRetroWaveIAState:
         app.do_search(reset_page=True)
 
         assert app.result_filter == "silent"
-        assert app.last_search_used_label in {"title", "identifier", "fields", "plain"}
+        assert app.last_search_used_label in {"title-strict", "title", "identifier", "fields", "plain"}
         assert app.last_search_attempts
 
     def test_do_search_clears_local_filter_for_new_query(self, monkeypatch):
@@ -1701,6 +1877,65 @@ class TestRetroWaveIAState:
         app.do_search(reset_page=True)
 
         assert app.result_filter == ""
+
+    def test_get_visible_results_hides_small_items_when_enabled(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.result_filter = ""
+        app.hide_small_items = True
+        app.min_item_size_mb = 250
+        app.results = [
+            ia_minotaur.SearchResult("big", "Big Movie", item_size=500 * 1024 * 1024),
+            ia_minotaur.SearchResult("small", "Tiny Clip", item_size=5 * 1024 * 1024),
+            ia_minotaur.SearchResult("unknown", "No Size Info", item_size=0),
+        ]
+
+        visible = app.get_visible_results()
+
+        assert [r.identifier for r in visible] == ["big", "unknown"]
+
+    def test_get_visible_results_shows_everything_when_filter_off(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.result_filter = ""
+        app.hide_small_items = False
+        app.min_item_size_mb = 250
+        app.results = [
+            ia_minotaur.SearchResult("big", "Big Movie", item_size=500 * 1024 * 1024),
+            ia_minotaur.SearchResult("small", "Tiny Clip", item_size=5 * 1024 * 1024),
+        ]
+
+        visible = app.get_visible_results()
+
+        assert [r.identifier for r in visible] == ["big", "small"]
+
+    def test_toggle_hide_small_items_action_flips_and_persists(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "RESULTS"
+        app.hide_small_items = False
+        app.min_item_size_mb = 250
+        app.result_filter = ""
+        app.results = []
+        app._save_session = lambda: None
+        app.focus = "MENU"
+
+        app.activate_menu_action("toggle_hide_small_items")
+
+        assert app.hide_small_items is True
+        assert "on" in app.status
+
+    def test_edit_min_item_size_action_updates_threshold(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "RESULTS"
+        app.hide_small_items = True
+        app.min_item_size_mb = 250
+        app.result_filter = ""
+        app.results = []
+        app._save_session = lambda: None
+        app.focus = "MENU"
+        app.prompt = lambda _label, _default="", history=None: "500"
+
+        app.activate_menu_action("edit_min_item_size")
+
+        assert app.min_item_size_mb == 500
 
     def test_jump_to_result_number_without_total_results(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -1806,6 +2041,9 @@ class TestRetroWaveIAState:
             def timeout(self, _ms):
                 pass
 
+            def getmaxyx(self):
+                return (30, 100)
+
             def getch(self):
                 return ord("q")
 
@@ -1821,6 +2059,7 @@ class TestRetroWaveIAState:
         app.exit_requested = False
         app.help_overlay = False
         app.mode = "RESULTS"
+        app.focus = "LIST"
         app.init_colors = lambda: None
         app.render = lambda: None
         app.finish_file_load_if_ready = lambda: None
@@ -1832,6 +2071,52 @@ class TestRetroWaveIAState:
         app.loop()
 
         assert app.status == "Ready (ia: ia 1.0). Choose [Search]."
+
+    def test_uppercase_q_opens_queue_before_lowercase_q_quits(self, monkeypatch):
+        class FakeScreen:
+            def __init__(self):
+                self.keys = iter([ord("Q"), ord("q")])
+
+            def keypad(self, _flag):
+                pass
+
+            def timeout(self, _ms):
+                pass
+
+            def getmaxyx(self):
+                return (30, 100)
+
+            def getch(self):
+                return next(self.keys)
+
+        monkeypatch.setattr(ia_minotaur, "ensure_dirs", lambda: None)
+        monkeypatch.setattr(curses, "curs_set", lambda *_args, **_kwargs: None)
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.stdscr = FakeScreen()
+        app.ia_present = True
+        app.ia_version = "ia 1.0"
+        app.query_text = ""
+        app.search_source = "ia"
+        app.exit_requested = False
+        app.help_overlay = False
+        app.mode = "RESULTS"
+        app.focus = "LIST"
+        app.init_colors = lambda: None
+        app.render = lambda: None
+        app.finish_search_load_if_ready = lambda: None
+        app.finish_file_load_if_ready = lambda: None
+        app.finish_download_progress = lambda: None
+        app._load_pending = lambda: None
+        app._save_session = lambda: None
+        app._restore_session = lambda: None
+        app.get_menu_items = lambda: []
+        opened = []
+        app.open_download_queue = lambda: opened.append(True)
+
+        app.loop()
+
+        assert opened == [True]
+        assert app.exit_requested is True
 
     def test_do_search_saves_history_immediately(self, monkeypatch, tmp_path):
         session_path = tmp_path / "session.json"
@@ -1930,8 +2215,53 @@ class TestRetroWaveIAState:
         app.start_search_async()
 
         assert app._search_load_loading is True
-        assert app.query_built == "identifier:noir AND mediatype:movies"
+        assert app.query_built == 'title:("noir") AND mediatype:movies'
         assert app.status.startswith("Searching...")
+
+    def test_start_search_async_cancels_stale_result_prefetch(self, monkeypatch):
+        # A previous search's "load every page for local filtering" background
+        # loader must not keep firing requests once a new search starts, or it
+        # races the new search's own requests against archive.org.
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.query_text = "noir"
+        app.query_built = "identifier:noir"
+        app.filter = "movies"
+        app.title_only = False
+        app.sort_by = ""
+        app.search_history = []
+        app.page = 1
+        app.sel_r = 0
+        app.result_filter = "1999"
+        app.last_search_text = ""
+        app.focus = "MENU"
+        app.enforce_license_gate = False
+        app.show_welcome = True
+        app.cancel_file_load = lambda: None
+        app._save_session = lambda: None
+
+        app._ensure_search_cache_state()
+        app._all_results_loader_token = 1
+        app._all_results_loading = True
+        app._all_results_cache_key = app._search_cache_key()
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=False):
+                self._target = target
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(ia_minotaur.threading, "Thread", FakeThread)
+        monkeypatch.setattr(
+            ia_minotaur,
+            "ia_search_via_curl",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("search ran inline")),
+        )
+
+        app.start_search_async()
+
+        assert app._all_results_loading is False
+        assert app._all_results_loader_token == 2
 
     def test_choose_search_attempt_reruns_selected_attempt_and_keeps_attempts(self, monkeypatch):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -2339,6 +2669,23 @@ class TestChooseBucketAndPath:
         with open(path, "wb") as fh:
             fh.write(content)
         return path
+
+    def run_queue_worker_synchronously(self, monkeypatch):
+        """The download queue normally runs its worker on a daemon thread; for
+        deterministic tests, make Thread.start() run the target immediately
+        in-line instead of on a real background thread."""
+        class SyncThread:
+            def __init__(self, target=None, daemon=False):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+            def is_alive(self):
+                return False
+
+        monkeypatch.setattr(ia_minotaur.threading, "Thread", SyncThread)
 
     def test_movie_import_uses_clean_folder_and_filename(self, monkeypatch, tmp_path):
         root = self.set_roots(monkeypatch, tmp_path)
@@ -2766,8 +3113,10 @@ class TestChooseBucketAndPath:
         self.set_roots(monkeypatch, tmp_path)
         pending_path = tmp_path / "pending.json"
         monkeypatch.setattr(ia_minotaur, "PENDING_PATH", str(pending_path))
+        self.run_queue_worker_synchronously(monkeypatch)
 
         app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
         app.status = ""
         app.results = []
         app.sel_r = 0
@@ -2787,11 +3136,9 @@ class TestChooseBucketAndPath:
         app.preview_files = []
         app.prompt = lambda _label, _default="": ""
         app.render = lambda: None
-        app.choose_bucket_and_path = lambda *_args, **_kwargs: "imported"
-        app.record_failed_file = lambda *_args, **_kwargs: None
-        app.init_queue_status = lambda *_args, **_kwargs: None
-        app.set_queue_status = lambda *_args, **_kwargs: None
-        app._download_one_with_progress = lambda *_args: (False, "Canceled.")
+        # Byte transfer now happens on the (synchronous, for this test) background
+        # worker, so cancellation is simulated at that layer.
+        app._background_download_file = lambda job, identifier, filename, expected_size: (False, "Canceled.")
 
         app.perform_download_plan()
 
@@ -2800,12 +3147,18 @@ class TestChooseBucketAndPath:
         assert pending["identifier"] == "item1"
         assert [f["name"] for f in pending["files"]] == ["one.mp4"]
         assert pending["completed_names"] == []
+
+        # The interactive/failure bookkeeping step runs on the next main-loop
+        # tick, not inline with the download itself.
+        app.finish_download_progress()
         assert app.status == "Canceled.  (press R to resume)"
 
-    def test_successful_download_stays_on_completion_screen_until_dismissed(self, monkeypatch, tmp_path):
+    def test_successful_download_completes_without_blocking_the_ui(self, monkeypatch, tmp_path):
         self.set_roots(monkeypatch, tmp_path)
+        self.run_queue_worker_synchronously(monkeypatch)
 
         app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
         app.status = ""
         app.results = []
         app.sel_r = 0
@@ -2826,29 +3179,32 @@ class TestChooseBucketAndPath:
         app.prompt = lambda _label, _default="": ""
         app.render = lambda: None
         app.choose_bucket_and_path = lambda *_args, **_kwargs: "imported"
-        app.record_failed_file = lambda *_args, **_kwargs: None
-        app.init_queue_status = lambda *_args, **_kwargs: None
-        app.set_queue_status = lambda *_args, **_kwargs: None
-        app._download_one_with_progress = lambda *_args: (True, "")
+        app._background_download_file = lambda job, identifier, filename, expected_size: (True, "")
 
         app.perform_download_plan()
 
-        assert app.mode == "DOWNLOADING"
-        assert app.dl_complete_notice == "Done. Downloaded 1 file."
-        assert app.status == "Done. Downloaded 1 file."
-
-        handled = app.handle_download_complete_key(curses.KEY_ENTER)
-
-        assert handled is True
+        # Enqueuing returns to FILES immediately -- no more full-screen
+        # blocking "DOWNLOADING" mode while bytes transfer.
         assert app.mode == "FILES"
-        assert app.dl_complete_notice == ""
-        assert app.status == "Back to files"
+        assert app.preview_item is None
+
+        changed = app.finish_download_progress()
+
+        assert changed is True
+        assert app.status == "Done. Downloaded 1 file(s). (Queue: done:1)"
+        assert app.download_log[0] == "imported"
 
     def test_youtube_download_stats_final_staged_file_size(self, monkeypatch, tmp_path):
         self.set_roots(monkeypatch, tmp_path)
         staged = self.stage_file("yt-abc123", "Video [abc123].mp4", b"1234567")
+        self.run_queue_worker_synchronously(monkeypatch)
+        monkeypatch.setattr(
+            ia_minotaur.yt_downloads, "find_downloaded_video_file",
+            lambda _identifier, _video_id: "Video [abc123].mp4",
+        )
 
         app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
         app.status = ""
         app.results = []
         app.sel_r = 0
@@ -2870,22 +3226,25 @@ class TestChooseBucketAndPath:
         app.preview_files = []
         app.prompt = lambda _label, _default="": ""
         app.render = lambda: None
-        app.choose_bucket_and_path = lambda identifier, filename, title: f"Saved: {staged}"
-        app.record_failed_file = lambda *_args, **_kwargs: None
-        app._download_one_with_progress = lambda *_args: (True, "")
+        app.choose_bucket_and_path = lambda identifier, filename, title, batch=None: f"Saved: {staged}"
+        app._background_download_file = lambda job, identifier, filename, expected_size: (True, "")
 
         app.perform_download_plan()
 
-        assert app.queue_status[0]["size"] == 7
+        job = app.download_queue[0]
+        assert job.file_statuses[0]["size"] == 7
+
+        app.finish_download_progress()
+
         assert app.preview_file is None
-        assert app.dl_complete_notice == "Done. Downloaded 1 file (7B)."
+        assert app.status == "Done. Downloaded 1 file(s). (Queue: done:1)"
 
     def test_download_left_in_staging_is_pending_import_not_done(self, monkeypatch, tmp_path):
         self.set_roots(monkeypatch, tmp_path)
-        pending_path = tmp_path / "pending.json"
-        monkeypatch.setattr(ia_minotaur, "PENDING_PATH", str(pending_path))
+        self.run_queue_worker_synchronously(monkeypatch)
 
         app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
         app.status = ""
         app.results = []
         app.sel_r = 0
@@ -2906,18 +3265,149 @@ class TestChooseBucketAndPath:
         app.prompt = lambda _label, _default="": ""
         app.render = lambda: None
         app.choose_bucket_and_path = lambda *_args, **_kwargs: "Left in staging: /tmp/root/.ia_staging/item1/one.mp4"
-        app.record_failed_file = lambda *_args, **_kwargs: None
-        app._download_one_with_progress = lambda *_args: (True, "")
+        app._background_download_file = lambda job, identifier, filename, expected_size: (True, "")
 
         app.perform_download_plan()
+        app.finish_download_progress()
 
-        assert app.queue_status[0]["status"] == "staged"
-        assert app.dl_complete_notice.startswith("Downloaded 1 file; import pending")
-        pending = ia_minotaur.ia_state.load_pending(str(pending_path))
-        assert pending is not None
-        assert pending["identifier"] == "item1"
-        assert [f["name"] for f in pending["files"]] == ["one.mp4"]
-        assert pending["completed_names"] == []
+        job = app.download_queue[0]
+        assert job.file_statuses[0]["status"] == "staged"
+        assert app.status.startswith("Downloaded 1 file(s); 1 import pending")
+
+    def test_queue_display_order_sinks_terminal_jobs_to_bottom(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
+        app.download_queue = [
+            ia_minotaur.DownloadJob(job_id=1, identifier="a", title="A", files=[], status="done"),
+            ia_minotaur.DownloadJob(job_id=2, identifier="b", title="B", files=[], status="queued"),
+            ia_minotaur.DownloadJob(job_id=3, identifier="c", title="C", files=[], status="downloading"),
+            ia_minotaur.DownloadJob(job_id=4, identifier="d", title="D", files=[], status="failed"),
+        ]
+
+        ordered = app._queue_display_order()
+
+        # Active/queued jobs stay on top (in creation order); finished ones
+        # (done/failed/canceled) sink to the bottom -- the whole point of the view.
+        assert [j.job_id for j in ordered] == [2, 3, 1, 4]
+
+    def test_perform_download_plan_enqueues_second_job_while_first_is_active(self, monkeypatch, tmp_path):
+        self.set_roots(monkeypatch, tmp_path)
+
+        class NeverFinishesThread:
+            """Simulates a worker thread that's still busy with the first job."""
+            def __init__(self, target=None, daemon=False):
+                pass
+
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return True
+
+        monkeypatch.setattr(ia_minotaur.threading, "Thread", NeverFinishesThread)
+
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
+        app.status = ""
+        app.results = []
+        app.sel_r = 0
+        app.mode = "FILES"
+        app.focus = "LIST"
+        app.download_log = []
+        app.failed_queue = []
+        app.preview_prefix = ""
+        app.cur_meta = {"licenseurl": "https://creativecommons.org/licenses/by/4.0/", "rights": ""}
+        app.enforce_license_gate = False
+        app.prompt = lambda _label, _default="": ""
+        app.render = lambda: None
+
+        app.preview_item = ia_minotaur.SearchResult(
+            "item1", "Title One", licenseurl="https://creativecommons.org/licenses/by/4.0/",
+        )
+        app.preview_file = ia_minotaur.IAFile("one.mp4", 4, "MPEG4")
+        app.preview_files = []
+        app.perform_download_plan()
+
+        # Second item queued while the first is still (per the fake thread)
+        # actively downloading -- search/browsing were never blocked to get here.
+        assert app.mode == "FILES"
+        app.preview_item = ia_minotaur.SearchResult(
+            "item2", "Title Two", licenseurl="https://creativecommons.org/licenses/by/4.0/",
+        )
+        app.preview_file = ia_minotaur.IAFile("two.mp4", 4, "MPEG4")
+        app.preview_files = []
+        app.perform_download_plan()
+
+        assert [job.identifier for job in app.download_queue] == ["item1", "item2"]
+        assert app.mode == "FILES"
+
+    def test_cancel_active_job_vs_remove_queued_job(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
+        active = ia_minotaur.DownloadJob(job_id=1, identifier="a", title="Active", files=[], status="downloading")
+        queued = ia_minotaur.DownloadJob(job_id=2, identifier="b", title="Queued", files=[], status="queued")
+        app.download_queue = [active, queued]
+
+        app.queue_sel = 0
+        app.cancel_selected_queue_job()
+        assert active.cancel_requested is True
+        assert active.status == "downloading"  # worker notices the flag; not flipped synchronously
+
+        app.queue_sel = 1
+        app.remove_selected_queue_job()
+        assert [j.job_id for j in app.download_queue] == [1]
+
+        # Can't remove the still-active job directly -- must cancel it first.
+        app.queue_sel = 0
+        app.remove_selected_queue_job()
+        assert [j.job_id for j in app.download_queue] == [1]
+
+    def test_batch_mode_multi_file_job_imports_without_prompting(self, monkeypatch, tmp_path):
+        self.set_roots(monkeypatch, tmp_path)
+        self.run_queue_worker_synchronously(monkeypatch)
+
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
+        app.status = ""
+        app.results = []
+        app.sel_r = 0
+        app.mode = "FILES"
+        app.focus = "LIST"
+        app.download_log = []
+        app.failed_queue = []
+        app.cur_meta = {"metadata": {"licenseurl": "https://creativecommons.org/licenses/by/4.0/", "rights": ""}}
+        app.enforce_license_gate = False
+        app.preview_item = ia_minotaur.SearchResult(
+            "item1", "Title", licenseurl="https://creativecommons.org/licenses/by/4.0/",
+        )
+        app.preview_file = None
+        app.preview_files = [ia_minotaur.IAFile("one.mp4", 4, "MPEG4"), ia_minotaur.IAFile("two.mp4", 4, "MPEG4")]
+        app.preview_prefix = "__FULL_ITEM__"
+        app.requires_strong_bulk_confirm = lambda *_args, **_kwargs: False
+        app.render = lambda: None
+
+        def fail_if_prompted(*_args, **_kwargs):
+            raise AssertionError("should not prompt once a batch destination is pre-selected")
+        app.prompt = fail_if_prompted
+
+        batch = {"bucket": "Movies", "folder": "MyMovie"}
+        app.choose_batch_import_options = lambda _title: batch
+
+        moved = []
+
+        def fake_choose_bucket_and_path(identifier, filename, title, batch=None):
+            assert batch == {"bucket": "Movies", "folder": "MyMovie"}
+            moved.append(filename)
+            return f"Saved: /media/Movies/MyMovie/{filename}"
+
+        app.choose_bucket_and_path = fake_choose_bucket_and_path
+        app._background_download_file = lambda job, identifier, filename, expected_size: (True, "")
+
+        app.perform_download_plan()
+        app.finish_download_progress()
+
+        assert sorted(moved) == ["one.mp4", "two.mp4"]
+        assert app.status.startswith("Done. Downloaded 2 file")
 
     def test_import_done_requests_jellyfin_rescan_on_exit(self, monkeypatch):
         calls = []
@@ -2964,17 +3454,9 @@ class TestChooseBucketAndPath:
         monkeypatch.setattr(ia_minotaur.ia_downloads, "open_process_log", lambda: io.StringIO())
         monkeypatch.setattr(ia_minotaur, "STALL_RETRY_DELAY_S", 0)
 
-        class FakeScreen:
-            def nodelay(self, _flag):
-                pass
-
-            def getch(self):
-                return -1
-
         app = RetroWaveIA.__new__(RetroWaveIA)
-        app.stdscr = FakeScreen()
-        app.render = lambda: None
-        app.status = ""
+        app._ensure_download_state()
+        job = ia_minotaur.DownloadJob(job_id=1, identifier="item1", title="Title", files=[])
 
         calls = []
 
@@ -2990,10 +3472,85 @@ class TestChooseBucketAndPath:
 
         monkeypatch.setattr(ia_minotaur.ia_downloads, "run_download_with_progress", fake_run)
 
-        ok, msg = app._download_one_with_progress("item1", "file.mp4", 4)
+        ok, msg = app._background_download_file(job, "item1", "file.mp4", 4)
 
         assert (ok, msg) == (True, "")
         assert len(calls) == 2
+
+    def test_zero_exit_without_staged_target_is_a_distinct_failure(self, monkeypatch, tmp_path):
+        self.set_roots(monkeypatch, tmp_path)
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "STAGING_ROOT", ia_minotaur.STAGING_ROOT)
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "open_process_log", lambda: io.StringIO())
+
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
+        job = ia_minotaur.DownloadJob(job_id=1, identifier="item1", title="Title", files=[])
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "run_download_with_progress", lambda *_args, **_kwargs: (True, ""))
+
+        ok, msg = app._background_download_file(job, "item1", "missing.mp4", 4)
+
+        assert not ok
+        assert "did not create the requested file" in msg
+        assert "Size mismatch" not in msg
+
+    def test_background_download_refuses_target_locked_by_another_instance(self, monkeypatch, tmp_path):
+        self.set_roots(monkeypatch, tmp_path)
+        monkeypatch.setattr(ia_minotaur.ia_downloads, "STAGING_ROOT", ia_minotaur.STAGING_ROOT)
+        held, msg = ia_minotaur.ia_downloads.acquire_target_download_lock("item1", "same.mp4")
+        assert held is not None
+        assert msg == ""
+        try:
+            app = RetroWaveIA.__new__(RetroWaveIA)
+            app._ensure_download_state()
+            job = ia_minotaur.DownloadJob(job_id=1, identifier="item1", title="Title", files=[])
+            calls = []
+            monkeypatch.setattr(
+                ia_minotaur.ia_downloads,
+                "run_download_with_progress",
+                lambda *_args, **_kwargs: calls.append(True) or (True, ""),
+            )
+
+            ok, message = app._background_download_file(job, "item1", "same.mp4", 4)
+
+            assert not ok
+            assert "Already downloading" in message
+            assert calls == []
+        finally:
+            held.release()
+
+    def test_request_quit_requires_cancel_and_waits_for_worker(self):
+        class FakeWorker:
+            def __init__(self):
+                self.join_calls = []
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def join(self, timeout=None):
+                self.join_calls.append(timeout)
+                self.alive = False
+
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app._ensure_download_state()
+        active = ia_minotaur.DownloadJob(job_id=1, identifier="item", title="Active", files=[], status="downloading")
+        queued = ia_minotaur.DownloadJob(job_id=2, identifier="item", title="Queued", files=[], status="queued")
+        app.download_queue = [active, queued]
+        app._download_worker_thread = FakeWorker()
+        app.exit_requested = False
+        app.status = ""
+        app.prompt = lambda *_args, **_kwargs: ""
+
+        assert app.request_quit() is False
+        assert app.exit_requested is False
+        assert active.cancel_requested is False
+
+        app.prompt = lambda *_args, **_kwargs: "CANCEL"
+        assert app.request_quit() is True
+        assert active.cancel_requested is True
+        assert queued.status == "canceled"
+        assert app._download_worker_thread.join_calls == [5]
+        assert app.exit_requested is True
 
     def test_download_treats_complete_staged_file_as_success_after_stall(self, monkeypatch, tmp_path):
         self.set_roots(monkeypatch, tmp_path)
@@ -3002,17 +3559,9 @@ class TestChooseBucketAndPath:
         monkeypatch.setattr(ia_minotaur, "STALL_RETRY_DELAY_S", 0)
         self.stage_file("item1", "file.mp4", b"abcd")
 
-        class FakeScreen:
-            def nodelay(self, _flag):
-                pass
-
-            def getch(self):
-                return -1
-
         app = RetroWaveIA.__new__(RetroWaveIA)
-        app.stdscr = FakeScreen()
-        app.render = lambda: None
-        app.status = ""
+        app._ensure_download_state()
+        job = ia_minotaur.DownloadJob(job_id=1, identifier="item1", title="Title", files=[])
         calls = []
 
         def fake_run(*_args, **_kwargs):
@@ -3021,7 +3570,7 @@ class TestChooseBucketAndPath:
 
         monkeypatch.setattr(ia_minotaur.ia_downloads, "run_download_with_progress", fake_run)
 
-        ok, msg = app._download_one_with_progress("item1", "file.mp4", 4)
+        ok, msg = app._background_download_file(job, "item1", "file.mp4", 4)
 
         assert (ok, msg) == (True, "")
         assert len(calls) == 1

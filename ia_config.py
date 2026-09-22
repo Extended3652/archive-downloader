@@ -16,6 +16,8 @@ DEFAULT_CONFIG = {
     "license_gate": False,
     "no_change_timestamp": True,
     "rows_per_page": 30,
+    "hide_small_items": True,
+    "min_item_size_mb": 250,
     "radarr_enabled": False,
     "radarr_url": "http://192.168.86.70:7878",
     "radarr_api_key": "",
@@ -138,6 +140,8 @@ def load_config(
     cfg["license_gate"] = parse_bool(data.get("license_gate"), cfg["license_gate"])
     cfg["no_change_timestamp"] = parse_bool(data.get("no_change_timestamp"), cfg["no_change_timestamp"])
     cfg["rows_per_page"] = positive_int(data.get("rows_per_page"), cfg["rows_per_page"])
+    cfg["hide_small_items"] = parse_bool(data.get("hide_small_items"), cfg["hide_small_items"])
+    cfg["min_item_size_mb"] = non_negative_int(data.get("min_item_size_mb"), cfg["min_item_size_mb"])
     cfg["radarr_enabled"] = parse_bool(data.get("radarr_enabled"), cfg["radarr_enabled"])
     cfg["radarr_url"] = clean_string(data.get("radarr_url"), cfg["radarr_url"]) or cfg["radarr_url"]
     cfg["radarr_api_key"] = clean_string(data.get("radarr_api_key"), cfg["radarr_api_key"])
@@ -175,6 +179,10 @@ def load_config(
         cfg["no_change_timestamp"] = parse_bool(env["IA_NO_CHANGE_TIMESTAMP"], cfg["no_change_timestamp"])
     if env.get("IA_ROWS_PER_PAGE"):
         cfg["rows_per_page"] = positive_int(env["IA_ROWS_PER_PAGE"], cfg["rows_per_page"])
+    if env.get("IA_HIDE_SMALL_ITEMS"):
+        cfg["hide_small_items"] = parse_bool(env["IA_HIDE_SMALL_ITEMS"], cfg["hide_small_items"])
+    if env.get("IA_MIN_ITEM_SIZE_MB"):
+        cfg["min_item_size_mb"] = non_negative_int(env["IA_MIN_ITEM_SIZE_MB"], cfg["min_item_size_mb"])
     if env.get("IA_RADARR_ENABLED"):
         cfg["radarr_enabled"] = parse_bool(env["IA_RADARR_ENABLED"], cfg["radarr_enabled"])
     if env.get("IA_RADARR_URL"):
@@ -271,6 +279,10 @@ def normalize_config_value(key: str, value: str) -> Tuple[Any, str]:
         if rows < 1:
             raise ValueError("rows_per_page must be >= 1")
         return rows, "rows_per_page"
+    if key == "hide_small_items":
+        return parse_bool(value, True), "hide_small_items"
+    if key == "min_item_size_mb":
+        return non_negative_int(value, 0), "min_item_size_mb"
     if key == "radarr_enabled":
         return parse_bool(value, False), "radarr_enabled"
     if key == "radarr_url":

@@ -23,6 +23,7 @@ class SearchResult:
     mediatype: str = ""
     formats: str = ""
     downloads: int = 0
+    item_size: int = 0
     date: str = ""
     publicdate: str = ""
     collection: str = ""

@@ -1,4 +1,6 @@
 """Download command, staging-size, and progress helpers."""
+import errno
+import fcntl
 import os
 import subprocess
 import time
@@ -21,6 +23,56 @@ class DownloadProgress:
     total: int
     speed_bps: float
     eta_s: float
+
+
+class TargetDownloadLock:
+    """An advisory lock held for one exact staging target while it downloads."""
+
+    def __init__(self, path: str, fh) -> None:
+        self.path = path
+        self._fh = fh
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+
+def acquire_target_download_lock(identifier: str, filename: str) -> Tuple[Optional[TargetDownloadLock], str]:
+    """Acquire a crash-safe, cross-process lock for one requested staging file."""
+    target, err = safe_staging_file_path(identifier, filename)
+    if err or not target:
+        return None, err
+    lock_path = f"{target}.ia-download.lock"
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fh = open(lock_path, "a", encoding="utf-8")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            fh.close()
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return None, f"Already downloading: {filename} is being downloaded by another Archive Downloader instance."
+            return None, f"Could not lock download target {filename}: {exc}"
+    except OSError as exc:
+        return None, f"Could not prepare download lock for {filename}: {exc}"
+    return TargetDownloadLock(lock_path, fh), ""
+
+
+def _kill_and_wait(proc: subprocess.Popen) -> None:
+    """Terminate and reap a child without allowing a zombie/orphan on exit paths."""
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
 
 
 def download_base_args(no_change_timestamp: bool) -> List[str]:
@@ -136,10 +188,7 @@ def run_download_with_progress(
             last_progress_t = current_t
             last_progress_bytes = written
         elif rc is None and current_t - last_progress_t > stall_timeout_s:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _kill_and_wait(proc)
             return False, f"Download stalled — no progress for {stall_timeout_s}s. Try again."
 
         dt = current_t - last_t
@@ -156,10 +205,8 @@ def run_download_with_progress(
 
         if is_cancel_requested():
             canceled = True
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            _kill_and_wait(proc)
+            return False, "Canceled."
 
         if on_progress:
             on_progress(DownloadProgress(target, written, total, speed_bps, eta_s))
@@ -184,6 +231,16 @@ def verify_expected_size(identifier: str, filename: str, expected_size: int) -> 
     actual = safe_getsize(p)
     if actual != int(expected_size):
         return False, f"Size mismatch for {filename}: got {human_size(actual)} expected {human_size(int(expected_size))}"
+    return True, ""
+
+
+def verify_download_target(identifier: str, filename: str) -> Tuple[bool, str]:
+    """Confirm a zero-exit download command actually created its target."""
+    p, err = safe_staging_file_path(identifier, filename)
+    if err or not p:
+        return False, err
+    if not os.path.isfile(p):
+        return False, f"Download command completed but did not create the requested file: {filename}"
     return True, ""
 
 

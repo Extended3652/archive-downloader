@@ -68,6 +68,26 @@ def test_verify_expected_size_matches_and_mismatches(monkeypatch, tmp_path):
     assert "Size mismatch" in msg
 
 
+def test_verify_download_target_distinguishes_missing_and_zero_byte_files(monkeypatch, tmp_path):
+    root = tmp_path / "media"
+    for module in (ia_paths, ia_downloads):
+        monkeypatch.setattr(module, "STAGING_ROOT", str(root / ".ia_staging"))
+
+    ok, msg = ia_downloads.verify_download_target("item", "file.mp4")
+    assert not ok
+    assert "did not create the requested file" in msg
+    assert "Size mismatch" not in msg
+
+    path = ia_paths.staging_file_path("item", "file.mp4")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "wb").close()
+
+    assert ia_downloads.verify_download_target("item", "file.mp4") == (True, "")
+    ok, msg = ia_downloads.verify_expected_size("item", "file.mp4", 1)
+    assert not ok
+    assert "Size mismatch" in msg
+
+
 def test_verify_expected_size_rejects_escaping_staging_path(monkeypatch, tmp_path):
     root = tmp_path / "media"
     for module in (ia_paths, ia_downloads):
@@ -141,6 +161,7 @@ class FakeProcess:
     def __init__(self, poll_values):
         self.poll_values = list(poll_values)
         self.killed = False
+        self.wait_calls = 0
 
     def poll(self):
         if self.killed:
@@ -150,6 +171,7 @@ class FakeProcess:
         return self.poll_values[0]
 
     def wait(self, timeout=2):
+        self.wait_calls += 1
         return self.poll()
 
     def kill(self):
@@ -222,6 +244,7 @@ def test_run_download_with_progress_can_cancel_running_process():
 
     assert (ok, msg) == (False, "Canceled.")
     assert proc.killed
+    assert proc.wait_calls == 1
 
 
 def test_run_download_with_progress_stops_stalled_download():
@@ -244,3 +267,25 @@ def test_run_download_with_progress_stops_stalled_download():
     assert not ok
     assert msg == "Download stalled — no progress for 5s. Try again."
     assert proc.killed
+    assert proc.wait_calls == 1
+
+
+def test_target_download_lock_blocks_duplicates_and_leftover_lock_file_is_safe(monkeypatch, tmp_path):
+    root = tmp_path / "media"
+    for module in (ia_paths, ia_downloads):
+        monkeypatch.setattr(module, "STAGING_ROOT", str(root / ".ia_staging"))
+
+    first, msg = ia_downloads.acquire_target_download_lock("item", "file.mp4")
+    assert first is not None
+    assert msg == ""
+    second, msg = ia_downloads.acquire_target_download_lock("item", "file.mp4")
+    assert second is None
+    assert "Already downloading" in msg
+
+    lock_path = ia_paths.staging_file_path("item", "file.mp4") + ".ia-download.lock"
+    first.release()
+    assert os.path.exists(lock_path)  # A crash/exit can leave the inode behind.
+    third, msg = ia_downloads.acquire_target_download_lock("item", "file.mp4")
+    assert third is not None
+    assert msg == ""
+    third.release()
