@@ -8,6 +8,7 @@ import io
 import os
 import curses
 import stat
+import time
 
 import ia_minotaur
 import ia_paths
@@ -810,6 +811,9 @@ class TestRetroWaveIAState:
         assert app._completed_download_location("item1", "Disc One.ISO", 4) == str(staged)
 
     def test_choose_bucket_and_path_scans_iso_without_import_prompt(self, monkeypatch, tmp_path):
+        # ISO scanning (lsdvd/HandBrakeCLI) can take minutes, so it must not
+        # block the caller -- choose_bucket_and_path should return immediately
+        # with a "scanning in background" message rather than the scan result.
         root = tmp_path / "media"
         staging = root / ".ia_staging"
         for module in (ia_paths, ia_minotaur):
@@ -824,7 +828,32 @@ class TestRetroWaveIAState:
         app.prompt = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not prompt"))
         app.prompt_list = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not prompt"))
 
-        assert app.choose_bucket_and_path("item1", "Disc One.ISO", "Show") == f"scanned {staged}"
+        msg = app.choose_bucket_and_path("item1", "Disc One.ISO", "Show")
+        assert str(staged) in msg
+        assert "background" in msg.lower()
+
+    def test_begin_dvd_scan_runs_in_background_and_reports_via_finish(self, tmp_path):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.download_log = []
+        app.status = ""
+        app.scan_staged_dvd_iso = lambda path: f"scanned {path}"
+        staging_path = str(tmp_path / "Disc One.ISO")
+
+        immediate = app.begin_dvd_scan(staging_path)
+        assert staging_path in immediate
+        assert "background" in immediate.lower()
+
+        for _ in range(200):
+            if app.finish_dvd_scans_if_ready():
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("background DVD scan never completed")
+
+        assert app.download_log[0] == f"scanned {staging_path}"
+        assert app.status == f"scanned {staging_path}"
+        # Nothing left pending.
+        assert app.finish_dvd_scans_if_ready() is False
 
     def test_batch_destination_path_uses_single_folder(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -1937,6 +1966,99 @@ class TestRetroWaveIAState:
 
         assert app.min_item_size_mb == 500
 
+    def test_toggle_hide_small_items_reruns_search_when_query_active(self):
+        # Filtering now happens at fetch time (with backfill), so self.results
+        # no longer carries small items to reveal locally -- toggling with an
+        # active query must re-run the search rather than just re-filtering.
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "RESULTS"
+        app.hide_small_items = False
+        app.min_item_size_mb = 250
+        app.result_filter = ""
+        app.results = []
+        app.query_text = "keaton"
+        app._save_session = lambda: None
+        app.focus = "MENU"
+        calls = []
+        app.start_search_async = lambda reset_page=False: calls.append(reset_page)
+
+        app.activate_menu_action("toggle_hide_small_items")
+
+        assert app.hide_small_items is True
+        assert calls == [True]
+
+    def test_edit_min_item_size_reruns_search_when_query_active(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "RESULTS"
+        app.hide_small_items = True
+        app.min_item_size_mb = 250
+        app.result_filter = ""
+        app.results = []
+        app.query_text = "keaton"
+        app._save_session = lambda: None
+        app.focus = "MENU"
+        app.prompt = lambda _label, _default="", history=None: "500"
+        calls = []
+        app.start_search_async = lambda reset_page=False: calls.append(reset_page)
+
+        app.activate_menu_action("edit_min_item_size")
+
+        assert app.min_item_size_mb == 500
+        assert calls == [True]
+
+    def test_search_min_item_size_bytes_converts_mb_and_respects_toggle(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.hide_small_items = True
+        app.min_item_size_mb = 250
+        assert app._search_min_item_size_bytes() == 250 * 1024 * 1024
+
+        app.hide_small_items = False
+        assert app._search_min_item_size_bytes() == 0
+
+    def test_do_search_passes_min_item_size_bytes_to_fetch(self, monkeypatch):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.hide_small_items = True
+        app.min_item_size_mb = 250
+        app.query_text = "keaton"
+        app.filter = "movies"
+        app.title_only = False
+        app.sort_by = ""
+        app.search_history = []
+        app.page = 1
+        app.sel_r = 0
+        app.result_filter = ""
+        app.focus = "MENU"
+        app.render = lambda: None
+
+        seen = {}
+
+        def fake_search(query, rows, page, sort="", **kwargs):
+            seen["min_item_size_bytes"] = kwargs.get("min_item_size_bytes")
+            return [ia_minotaur.SearchResult("one", "One")], 1, ""
+
+        monkeypatch.setattr(ia_minotaur, "ia_search_via_curl", fake_search)
+
+        app.do_search(reset_page=True)
+
+        assert seen["min_item_size_bytes"] == 250 * 1024 * 1024
+
+    def test_effective_search_total_trusts_raw_total_when_size_filter_active(self):
+        # A short page normally means we've hit the true end of IA's results,
+        # so effective_search_total shrinks the total to match. With the size
+        # filter on, a short page can just mean the candidate pool/page ran
+        # low on *eligible* items -- not that IA is out of raw results -- so
+        # shrinking the total there made it bounce around while paging deep
+        # into a real search (observed via smoke test). It should stay put.
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.hide_small_items = True
+        app.min_item_size_mb = 250
+        short_page = [ia_minotaur.SearchResult("one", "One")]
+
+        assert app.effective_search_total(6, short_page, 243) == 243
+
+        app.hide_small_items = False
+        assert app.effective_search_total(6, short_page, 243) == 151
+
     def test_jump_to_result_number_without_total_results(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
         app.results = [ia_minotaur.SearchResult("one", "One"), ia_minotaur.SearchResult("two", "Two")]
@@ -2726,13 +2848,19 @@ class TestChooseBucketAndPath:
         assert final_path.read_bytes() == b"x"
 
     def test_movie_import_invokes_radarr_after_final_move(self, monkeypatch, tmp_path):
+        # Radarr/Bazarr now run on a background thread (Bazarr's subtitle wait
+        # can take minutes) so choose_bucket_and_path returns before they run.
+        # run_queue_worker_synchronously makes the background thread execute
+        # inline, keeping this test deterministic.
         root = self.set_roots(monkeypatch, tmp_path)
         self.stage_file("item1", "Metropolis.1927.mp4")
         calls = []
         app = self.build_app(["Movies", ""])
         app.download_log = []
+        app.status = ""
         app.cur_meta = {"metadata": {"external-identifier": "tmdb:19"}}
         app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Metropolis", year="1927", mediatype="movies")
+        self.run_queue_worker_synchronously(monkeypatch)
 
         def fake_register(path, **kwargs):
             calls.append((path, kwargs))
@@ -2742,11 +2870,13 @@ class TestChooseBucketAndPath:
         monkeypatch.setattr(ia_minotaur.ia_radarr, "register_completed_movie", fake_register)
 
         msg = app.choose_bucket_and_path("item1", "Metropolis.1927.mp4", "Metropolis")
+        app.finish_post_import_integrations_if_ready()
 
         final_path = root / "Movies" / "Metropolis (1927)" / "Metropolis (1927).mp4"
         assert calls[0][0] == str(final_path)
         assert calls[0][1]["metadata"] == {"metadata": {"external-identifier": "tmdb:19"}}
-        assert msg == f"Saved: {final_path} | Radarr: Radarr movie added; refresh requested."
+        assert msg == f"Saved: {final_path}"
+        assert app.download_log[0] == "Radarr: Radarr movie added; refresh requested."
 
     def test_tv_import_does_not_invoke_radarr(self, monkeypatch, tmp_path):
         root = self.set_roots(monkeypatch, tmp_path)
@@ -2767,8 +2897,10 @@ class TestChooseBucketAndPath:
         self.stage_file("item1", "Metropolis.1927.mp4", b"done")
         app = self.build_app(["Movies", ""])
         app.download_log = []
+        app.status = ""
         app.cur_meta = {}
         app.selected_result = lambda: ia_minotaur.SearchResult("item1", "Metropolis", year="1927", mediatype="movies")
+        self.run_queue_worker_synchronously(monkeypatch)
         monkeypatch.setattr(
             ia_minotaur.ia_radarr,
             "register_completed_movie",
@@ -2776,10 +2908,12 @@ class TestChooseBucketAndPath:
         )
 
         msg = app.choose_bucket_and_path("item1", "Metropolis.1927.mp4", "Metropolis")
+        app.finish_post_import_integrations_if_ready()
 
         final_path = root / "Movies" / "Metropolis (1927)" / "Metropolis (1927).mp4"
         assert final_path.read_bytes() == b"done"
-        assert msg == f"Saved: {final_path} | Radarr: Radarr unavailable."
+        assert msg == f"Saved: {final_path}"
+        assert app.download_log[0] == "Radarr: Radarr unavailable."
 
     def test_movie_import_orders_radarr_bazarr_before_jellyfin(self, monkeypatch, tmp_path):
         root = self.set_roots(monkeypatch, tmp_path)
@@ -2812,16 +2946,20 @@ class TestChooseBucketAndPath:
             "request_library_rescan",
             lambda: events.append(("jellyfin",)) or (True, "Jellyfin library rescan requested."),
         )
+        self.run_queue_worker_synchronously(monkeypatch)
 
         msg = app.choose_bucket_and_path("item1", "Metropolis.1927.mp4", "Metropolis")
         app.note_import_status(app.import_queue_status(msg))
+        app.finish_post_import_integrations_if_ready()
         app.request_jellyfin_rescan_if_needed()
 
         final_path = root / "Movies" / "Metropolis (1927)" / "Metropolis (1927).mp4"
         assert final_path.exists()
         assert events == [("radarr", True), ("bazarr", 77, True), ("jellyfin",)]
-        assert msg == (
-            f"Saved: {final_path} | Radarr: Radarr movie added; refresh requested. | "
+        assert msg == f"Saved: {final_path}"
+        assert app.download_log[0] == "Jellyfin library rescan requested."
+        assert app.download_log[1] == (
+            "Radarr: Radarr movie added; refresh requested. | "
             "Bazarr: Bazarr subtitle found/downloaded; synchronization completed or delegated."
         )
 

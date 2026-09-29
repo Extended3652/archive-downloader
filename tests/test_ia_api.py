@@ -190,6 +190,110 @@ def test_rerank_deep_page_falls_back_to_raw_ia_paging():
     assert _cmd_has(cmd, "page=3")
 
 
+MB = 1024 * 1024
+
+
+def _sized_doc(identifier, item_size=None):
+    doc = {"identifier": identifier, "title": identifier}
+    if item_size is not None:
+        doc["item_size"] = item_size
+    return doc
+
+
+def test_min_item_size_excludes_small_and_keeps_unknown_and_large():
+    payload = {
+        "response": {
+            "numFound": 7,
+            "docs": [
+                _sized_doc("tiny44", 44 * MB),
+                _sized_doc("tiny87", 87 * MB),
+                _sized_doc("tiny180", 180 * MB),
+                _sized_doc("at-threshold", 250 * MB),
+                _sized_doc("big600", 600 * MB),
+                _sized_doc("big2_4g", int(2.4 * 1024 * MB)),
+                _sized_doc("unknown-size"),
+            ],
+        }
+    }
+    runner = runner_for(stdout=json.dumps(payload))
+
+    results, total, err = ia_api.ia_search_via_curl(
+        "q", 10, 1, runner=runner, min_item_size_bytes=250 * MB
+    )
+
+    assert err == ""
+    assert total == 7
+    assert [r.identifier for r in results] == ["at-threshold", "big600", "big2_4g", "unknown-size"]
+
+
+def test_min_item_size_zero_disables_filter():
+    payload = {
+        "response": {
+            "numFound": 2,
+            "docs": [_sized_doc("tiny44", 44 * MB), _sized_doc("big600", 600 * MB)],
+        }
+    }
+    runner = runner_for(stdout=json.dumps(payload))
+
+    results, _total, _err = ia_api.ia_search_via_curl("q", 10, 1, runner=runner, min_item_size_bytes=0)
+
+    assert [r.identifier for r in results] == ["tiny44", "big600"]
+
+
+def test_min_item_size_backfills_page_from_wider_pool_instead_of_shrinking_it():
+    # Page 1 asks for 3 rows. The first 3 raw docs are all below threshold, but
+    # the pool (fetched wider, like the reranker's candidate window) has three
+    # more eligible docs further down -- page 1 should come back full (3 items)
+    # rather than empty, and page 2 should pick up cleanly after it.
+    docs = [_sized_doc(f"small{i}", 10 * MB) for i in range(3)]
+    docs += [_sized_doc(f"big{i}", 600 * MB) for i in range(3)]
+    payload = {"response": {"numFound": len(docs), "docs": docs}}
+    runner = runner_for(stdout=json.dumps(payload))
+
+    page1, total1, err1 = ia_api.ia_search_via_curl("q", 3, 1, runner=runner, min_item_size_bytes=250 * MB)
+    page2, total2, err2 = ia_api.ia_search_via_curl("q", 3, 2, runner=runner, min_item_size_bytes=250 * MB)
+
+    assert err1 == err2 == ""
+    assert total1 == total2 == 6
+    assert [r.identifier for r in page1] == ["big0", "big1", "big2"]
+    assert page2 == []
+    cmd = runner.calls[0][0]
+    # Backfill fetches the wide candidate window from page 1, same as reranking.
+    assert _cmd_has(cmd, f"rows={ia_api.RANK_POOL_ROWS}")
+    assert _cmd_has(cmd, "page=1")
+
+
+def test_min_item_size_deep_page_falls_back_to_raw_paging_without_backfill():
+    docs = [_sized_doc("tiny", 10 * MB)]
+    payload = {"response": {"numFound": 1, "docs": docs}}
+    runner = runner_for(stdout=json.dumps(payload))
+
+    # Page far beyond the pool bound (200 // 5 rows = 40 pages): no backfill,
+    # filtered in place, same documented limitation the reranker already has.
+    results, _total, _err = ia_api.ia_search_via_curl("q", 5, 41, runner=runner, min_item_size_bytes=250 * MB)
+
+    assert results == []
+    cmd = runner.calls[0][0]
+    assert _cmd_has(cmd, "rows=5")
+    assert _cmd_has(cmd, "page=41")
+
+
+def test_min_item_size_filters_before_rerank_and_keeps_ranked_order():
+    payload = _rerank_payload()
+    # "exact" is the best title match but is below the size threshold; it
+    # should be dropped before ranking, not merely sorted last.
+    payload["response"]["docs"][1]["item_size"] = 10 * MB
+    payload["response"]["docs"][2]["item_size"] = 600 * MB
+    runner = runner_for(stdout=json.dumps(payload))
+
+    results, _total, err = ia_api.ia_search_via_curl(
+        "q", 30, 1, "", runner=runner, rerank_text="Toad Road", media_filter="movies", min_item_size_bytes=250 * MB
+    )
+
+    assert err == ""
+    assert [r.identifier for r in results] == ["prefix", "meta"]
+
+
 def test_search_handles_curl_failure_and_non_json():
     fail_runner = runner_for(returncode=22, stderr="bad request")
     json_runner = runner_for(stdout="not json")

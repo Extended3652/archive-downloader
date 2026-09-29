@@ -64,6 +64,16 @@ def curl_version(runner: Callable[..., Tuple[int, str, str]] = run_cmd) -> Tuple
     return code == 0, msg or "not available"
 
 
+def _passes_min_item_size(result: SearchResult, min_item_size_bytes: int) -> bool:
+    """A known size below the threshold is excluded; an unknown size (IA
+    omits item_size for some items, e.g. collections) is kept rather than
+    penalizing a result we can't judge."""
+    if min_item_size_bytes <= 0:
+        return True
+    size = int(getattr(result, "item_size", 0) or 0)
+    return size <= 0 or size >= min_item_size_bytes
+
+
 def ia_search_via_curl(
     query: str,
     rows: int,
@@ -73,14 +83,24 @@ def ia_search_via_curl(
     *,
     rerank_text: str = "",
     media_filter: str = "any",
+    min_item_size_bytes: int = 0,
 ) -> Tuple[List[SearchResult], int, str]:
     # Local re-ranking only applies to relevance ordering (empty sort); when the
     # user chose an explicit IA sort we honour it untouched. It also only kicks
     # in for the leading pages that the candidate window can cover.
     rows = max(1, int(rows or 1))
+    min_item_size_bytes = max(0, int(min_item_size_bytes or 0))
+    size_filter_active = min_item_size_bytes > 0
     pool_pages = max(1, RANK_POOL_ROWS // rows)
     do_rerank = bool((rerank_text or "").strip()) and not sort and page <= pool_pages
-    if do_rerank:
+    # A minimum-size filter can thin out a raw IA page (small items removed),
+    # which would otherwise hand back a partial page post-pagination. Fetch
+    # the same wide candidate window the reranker uses so filtered-out items
+    # get backfilled from later results in the pool instead of just vanishing
+    # from the page. Deep pages beyond the pool fall back to a raw per-page
+    # fetch and are filtered in place, same limitation the reranker already has.
+    use_pool = do_rerank or (size_filter_active and page <= pool_pages)
+    if use_pool:
         fetch_rows, fetch_page = RANK_POOL_ROWS, 1
     else:
         fetch_rows, fetch_page = rows, page
@@ -195,10 +215,15 @@ def ia_search_via_curl(
             )
         )
 
+    if size_filter_active:
+        results = [r for r in results if _passes_min_item_size(r, min_item_size_bytes)]
+
     if do_rerank:
-        ranked = ia_ranking.rerank(results, rerank_text, media_filter)
+        results = ia_ranking.rerank(results, rerank_text, media_filter)
+
+    if use_pool:
         start = (page - 1) * rows
-        results = ranked[start : start + rows]
+        results = results[start : start + rows]
 
     return results, num_found, ""
 

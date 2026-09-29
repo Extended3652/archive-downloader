@@ -303,6 +303,7 @@ def ia_search_via_curl(
     *,
     rerank_text: str = "",
     media_filter: str = "any",
+    min_item_size_bytes: int = 0,
 ) -> Tuple[List[SearchResult], int, str]:
     return ia_api.ia_search_via_curl(
         query,
@@ -312,6 +313,7 @@ def ia_search_via_curl(
         runner=run_cmd,
         rerank_text=rerank_text,
         media_filter=media_filter,
+        min_item_size_bytes=min_item_size_bytes,
     )
 
 
@@ -514,6 +516,12 @@ class RetroWaveIA:
         self._download_worker_thread: Optional[threading.Thread] = None
         self.queue_sel: int = 0
         self.queue_return_mode: str = "RESULTS"
+
+        self._dvd_scan_lock = threading.RLock()
+        self._dvd_scan_jobs: Dict[str, Dict[str, Any]] = {}
+
+        self._post_import_lock = threading.RLock()
+        self._post_import_jobs: Dict[str, Dict[str, Any]] = {}
 
         if not self.ia_present:
             self.mode = "ERROR"
@@ -1106,6 +1114,7 @@ class RetroWaveIA:
         current_page: int,
         rerank_text: str = "",
         media_filter: str = "any",
+        min_item_size_bytes: int = 0,
     ) -> None:
         self._ensure_search_cache_state()
         if total_pages <= 1:
@@ -1142,6 +1151,7 @@ class RetroWaveIA:
                     sort=sort_by,
                     rerank_text=rerank_text,
                     media_filter=media_filter,
+                    min_item_size_bytes=min_item_size_bytes,
                 )
                 if err:
                     with self._search_cache_lock:
@@ -1194,6 +1204,7 @@ class RetroWaveIA:
                 current_page,
                 getattr(self, "_active_rerank_text", ""),
                 getattr(self, "_active_rerank_filter", "any"),
+                self._search_min_item_size_bytes(),
             )
             return
 
@@ -1205,6 +1216,7 @@ class RetroWaveIA:
                 current_page,
                 getattr(self, "_active_rerank_text", ""),
                 getattr(self, "_active_rerank_filter", "any"),
+                self._search_min_item_size_bytes(),
             )
 
     def _load_all_search_results(self) -> List[SearchResult]:
@@ -1228,10 +1240,17 @@ class RetroWaveIA:
             merged.append(item)
         return merged
 
-    def _passes_size_filter(self, r: SearchResult) -> bool:
+    def _search_min_item_size_bytes(self) -> int:
+        """Bytes threshold for the configured min_item_size_mb, or 0 when the
+        hide-small-items filter is off. Centralizes the MB->bytes conversion
+        so search fetches (early filtering) and get_visible_results (display
+        safety net) can't drift out of sync."""
         if not getattr(self, "hide_small_items", False):
-            return True
-        min_bytes = int(getattr(self, "min_item_size_mb", 0) or 0) * 1024 * 1024
+            return 0
+        return max(0, int(getattr(self, "min_item_size_mb", 0) or 0)) * 1024 * 1024
+
+    def _passes_size_filter(self, r: SearchResult) -> bool:
+        min_bytes = self._search_min_item_size_bytes()
         if min_bytes <= 0:
             return True
         size = int(getattr(r, "item_size", 0) or 0)
@@ -1357,6 +1376,7 @@ class RetroWaveIA:
             rows=ROWS_PER_PAGE,
             page=1,
             sort=getattr(self, "sort_by", ""),
+            min_item_size_bytes=self._search_min_item_size_bytes(),
         )
         if err:
             log_line(f"LOCAL_FILTER_YEAR_REFINE_ERR: {err}")
@@ -1444,6 +1464,17 @@ class RetroWaveIA:
         page_num = max(1, int(page or 1))
         visible_count = len(results or [])
         reported = int(reported_total or 0)
+        # A page shorter than ROWS_PER_PAGE normally means we've reached the
+        # true end of IA's result list, so shrink the reported total to match.
+        # That assumption breaks when the min-item-size filter is active: a
+        # page can come back short simply because the fixed-size candidate
+        # pool (or, past the pool bound, that one raw IA page) didn't contain
+        # enough *eligible* items, not because IA is out of raw results. Doing
+        # the correction there was observed to make total_results/total_pages
+        # bounce around unpredictably while paging deep into a filtered
+        # search, so trust IA's raw total instead in that case.
+        if self._search_min_item_size_bytes() > 0:
+            return reported or visible_count
         if 0 < visible_count < ROWS_PER_PAGE:
             terminal_total = ((page_num - 1) * ROWS_PER_PAGE) + visible_count
             return min(reported, terminal_total) if reported > 0 else terminal_total
@@ -2317,6 +2348,7 @@ class RetroWaveIA:
                 sort=self.sort_by,
                 rerank_text=rerank_text,
                 media_filter=rerank_filter,
+                min_item_size_bytes=self._search_min_item_size_bytes(),
             )
             if err:
                 last_err = err
@@ -2397,6 +2429,7 @@ class RetroWaveIA:
         page = self.page
         sort_by = self.sort_by
         rerank_text, rerank_filter = self._rerank_args(custom=built_query is not None)
+        min_item_size_bytes = self._search_min_item_size_bytes()
 
         def worker() -> None:
             used_label = ""
@@ -2412,6 +2445,7 @@ class RetroWaveIA:
                     sort=sort_by,
                     rerank_text=rerank_text,
                     media_filter=rerank_filter,
+                    min_item_size_bytes=min_item_size_bytes,
                 )
                 if err:
                     last_err = err
@@ -2473,6 +2507,7 @@ class RetroWaveIA:
 
         sort_by = self.sort_by
         rerank_text, rerank_filter = self._rerank_args()
+        min_item_size_bytes = self._search_min_item_size_bytes()
 
         def worker() -> None:
             ia_results: List[SearchResult] = []
@@ -2488,6 +2523,7 @@ class RetroWaveIA:
                     sort=sort_by,
                     rerank_text=rerank_text,
                     media_filter=rerank_filter,
+                    min_item_size_bytes=min_item_size_bytes,
                 )
                 if err:
                     ia_err = err
@@ -3392,7 +3428,7 @@ class RetroWaveIA:
             return f"Downloaded, but staging file not found: {staging_path}"
 
         if is_dvd_iso_file(filename):
-            return self.scan_staged_dvd_iso(staging_path)
+            return self.begin_dvd_scan(staging_path)
 
         if batch:
             final_path = self.batch_destination_path(batch, filename, item_title)
@@ -3407,12 +3443,8 @@ class RetroWaveIA:
             shutil.move(staging_path, final_path)
             normalize_media_permissions(final_path, include_parents=True)
             msg = f"Saved: {final_path}"
-            self.last_radarr_result = None
-            note = self.register_radarr_movie_if_needed(final_path, batch.get("bucket", ""), item_title)
-            bazarr_note = self.notify_bazarr_if_needed(final_path, batch.get("bucket", ""), item_title)
-            notes = [note, bazarr_note]
-            notes = [value for value in notes if value]
-            return f"{msg} | {' | '.join(notes)}" if notes else msg
+            self.begin_post_import_integrations(final_path, batch.get("bucket", ""), item_title)
+            return msg
 
         def is_single_large_video(name: str) -> bool:
             try:
@@ -3544,12 +3576,8 @@ class RetroWaveIA:
         shutil.move(staging_path, final_path)
         normalize_media_permissions(final_path, include_parents=True)
         msg = f"Saved: {final_path}"
-        self.last_radarr_result = None
-        note = self.register_radarr_movie_if_needed(final_path, bucket, item_title)
-        bazarr_note = self.notify_bazarr_if_needed(final_path, bucket, item_title)
-        notes = [note, bazarr_note]
-        notes = [value for value in notes if value]
-        return f"{msg} | {' | '.join(notes)}" if notes else msg
+        self.begin_post_import_integrations(final_path, bucket, item_title)
+        return msg
 
     def register_radarr_movie_if_needed(self, final_path: str, bucket: str, item_title: str) -> str:
         self.last_radarr_result = None
@@ -3573,13 +3601,7 @@ class RetroWaveIA:
         self.last_radarr_result = result
         if result.status == "disabled":
             return ""
-        note = f"Radarr: {result.message}"
-        try:
-            self.download_log.insert(0, note)
-            self.download_log = self.download_log[:8]
-        except Exception:
-            pass
-        return note
+        return f"Radarr: {result.message}"
 
     def notify_bazarr_if_needed(self, final_path: str, bucket: str, item_title: str) -> str:
         if bucket not in ("Movies", "TV"):
@@ -3602,13 +3624,51 @@ class RetroWaveIA:
             )
         if result.status == "disabled":
             return ""
-        note = f"Bazarr: {result.message}"
-        try:
-            self.download_log.insert(0, note)
-            self.download_log = self.download_log[:8]
-        except Exception:
-            pass
-        return note
+        return f"Bazarr: {result.message}"
+
+    def _ensure_post_import_state(self) -> None:
+        if not hasattr(self, "_post_import_lock") or getattr(self, "_post_import_lock", None) is None:
+            self._post_import_lock = threading.RLock()
+        if not hasattr(self, "_post_import_jobs"):
+            self._post_import_jobs = {}
+
+    def begin_post_import_integrations(self, final_path: str, bucket: str, item_title: str) -> None:
+        """Radarr registration is a couple of quick HTTP calls, but Bazarr's
+        subtitle handoff can poll for up to bazarr_wait_timeout_s (2 minutes
+        by default) waiting for a subtitle to land. Running that inline in
+        choose_bucket_and_path used to freeze the curses main loop the same
+        way the DVD ISO scan did, so it runs on a background thread instead;
+        the result note surfaces later via finish_post_import_integrations_if_ready()."""
+        self._ensure_post_import_state()
+        with self._post_import_lock:
+            self._post_import_jobs[final_path] = {"status": "running", "note": ""}
+
+        def worker() -> None:
+            self.last_radarr_result = None
+            note = self.register_radarr_movie_if_needed(final_path, bucket, item_title)
+            bazarr_note = self.notify_bazarr_if_needed(final_path, bucket, item_title)
+            combined = " | ".join(value for value in (note, bazarr_note) if value)
+            with self._post_import_lock:
+                self._post_import_jobs[final_path] = {"status": "done", "note": combined}
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_post_import_integrations_if_ready(self) -> bool:
+        self._ensure_post_import_state()
+        with self._post_import_lock:
+            done_path = next(
+                (path for path, info in self._post_import_jobs.items() if info.get("status") == "done"),
+                None,
+            )
+            if done_path is None:
+                return False
+            note = self._post_import_jobs.pop(done_path).get("note", "")
+        if not note:
+            return True
+        self.download_log.insert(0, note)
+        self.download_log = self.download_log[:8]
+        self.status = note
+        return True
 
     def choose_batch_import_options(self, item_title: str) -> Optional[Dict[str, str]]:
         use_batch = self.prompt("Batch destination for this queue? Enter=yes, type n=no: ", "")
@@ -3742,6 +3802,50 @@ class RetroWaveIA:
             f"DVD ISO staged/scanned for manual review: {staging_path} | "
             f"{result.layout}: {result.reason} | logs: {result.logs_dir}"
         )
+
+    def _ensure_dvd_scan_state(self) -> None:
+        if not hasattr(self, "_dvd_scan_lock") or getattr(self, "_dvd_scan_lock", None) is None:
+            self._dvd_scan_lock = threading.RLock()
+        if not hasattr(self, "_dvd_scan_jobs"):
+            self._dvd_scan_jobs = {}
+
+    def begin_dvd_scan(self, staging_path: str) -> str:
+        """lsdvd/HandBrakeCLI scanning can take minutes on a full ISO. Run it on
+        a background thread instead of the curses main loop (which previously
+        froze -- no render(), no input -- for the whole scan) and surface the
+        result later via finish_dvd_scans_if_ready()."""
+        self._ensure_dvd_scan_state()
+        with self._dvd_scan_lock:
+            existing = self._dvd_scan_jobs.get(staging_path)
+            if existing is not None and existing.get("status") == "scanning":
+                return f"DVD ISO scan already running in background: {staging_path}"
+            self._dvd_scan_jobs[staging_path] = {"status": "scanning", "message": ""}
+
+        def worker() -> None:
+            message = self.scan_staged_dvd_iso(staging_path)
+            with self._dvd_scan_lock:
+                self._dvd_scan_jobs[staging_path] = {"status": "done", "message": message}
+
+        threading.Thread(target=worker, daemon=True).start()
+        return (
+            f"DVD ISO staged: {staging_path} -- scanning with lsdvd/HandBrakeCLI "
+            f"in the background, result will appear in the log shortly"
+        )
+
+    def finish_dvd_scans_if_ready(self) -> bool:
+        self._ensure_dvd_scan_state()
+        with self._dvd_scan_lock:
+            done_path = next(
+                (path for path, info in self._dvd_scan_jobs.items() if info.get("status") == "done"),
+                None,
+            )
+            if done_path is None:
+                return False
+            message = self._dvd_scan_jobs.pop(done_path).get("message", "")
+        self.download_log.insert(0, message)
+        self.download_log = self.download_log[:8]
+        self.status = message
+        return True
 
     def _completed_download_location(self, identifier: str, filename: str, expected_size: int = 0) -> Optional[str]:
         if self._staged_file_complete(identifier, filename, int(expected_size or 0)):
@@ -4610,6 +4714,11 @@ class RetroWaveIA:
             name = str(row["name"])
             real_name = str(row.get("real_name") or name)
             msg = self.choose_bucket_and_path(job.identifier, real_name, job.title, batch=job.batch)
+            if job.is_youtube and msg.startswith("Saved: "):
+                final_path = msg[len("Saved: ") :].split(" | ", 1)[0]
+                captions = yt_downloads.move_downloaded_captions(job.identifier, job.video_id, final_path)
+                if captions:
+                    msg = f"{msg} | Captions saved: {len(captions)}"
             import_status = self.import_queue_status(msg)
             self.note_import_status(import_status)
             with self._download_lock:
@@ -5900,8 +6009,16 @@ class RetroWaveIA:
                 self.hide_small_items = not self.hide_small_items
                 self._save_session()
                 state = "on" if self.hide_small_items else "off"
-                n = len(self.get_visible_results())
-                self.status = f"Hide small items: {state} (<{self.min_item_size_mb}MB) — {n} visible"
+                # The filter is now applied when results are fetched (so a
+                # filtered page still comes back full via backfill), so
+                # self.results no longer carries small items to reveal
+                # locally -- flipping the toggle re-runs the search instead.
+                if getattr(self, "query_text", ""):
+                    self.status = f"Hide small items: {state} (<{self.min_item_size_mb}MB) — refreshing results..."
+                    self.start_search_async(reset_page=True)
+                else:
+                    n = len(self.get_visible_results())
+                    self.status = f"Hide small items: {state} (<{self.min_item_size_mb}MB) — {n} visible"
                 return
             if action == "edit_min_item_size":
                 s = self.prompt("Minimum item size in MB (0 = no minimum): ", str(self.min_item_size_mb))
@@ -5913,8 +6030,12 @@ class RetroWaveIA:
                         return
                     self.min_item_size_mb = mb
                     self._save_session()
-                    n = len(self.get_visible_results())
-                    self.status = f"Minimum item size: {mb}MB — {n} visible"
+                    if getattr(self, "query_text", ""):
+                        self.status = f"Minimum item size: {mb}MB — refreshing results..."
+                        self.start_search_async(reset_page=True)
+                    else:
+                        n = len(self.get_visible_results())
+                        self.status = f"Minimum item size: {mb}MB — {n} visible"
                 return
             if action == "next_page":
                 self.next_page()
@@ -6173,6 +6294,8 @@ class RetroWaveIA:
             self.finish_search_load_if_ready()
             self.finish_file_load_if_ready()
             self.finish_download_progress()
+            self.finish_dvd_scans_if_ready()
+            self.finish_post_import_integrations_if_ready()
             self.render()
             ch = self.stdscr.getch()
             if ch == -1:
