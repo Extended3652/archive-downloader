@@ -433,6 +433,8 @@ class RetroWaveIA:
         self.title_only = bool(APP_CONFIG["title_only"])
         self.hide_small_items = bool(APP_CONFIG["hide_small_items"])
         self.min_item_size_mb = int(APP_CONFIG["min_item_size_mb"])
+        self.hide_small_video_files = bool(APP_CONFIG["hide_small_video_files"])
+        self.min_video_file_size_mb = int(APP_CONFIG["min_video_file_size_mb"])
         self.enforce_license_gate = bool(APP_CONFIG["license_gate"])
         self.sort_by = str(APP_CONFIG["default_sort"])
         self.page = 1
@@ -542,6 +544,8 @@ class RetroWaveIA:
                 "title_only": getattr(self, "title_only", False),
                 "hide_small_items": getattr(self, "hide_small_items", True),
                 "min_item_size_mb": getattr(self, "min_item_size_mb", 0),
+                "hide_small_video_files": getattr(self, "hide_small_video_files", True),
+                "min_video_file_size_mb": getattr(self, "min_video_file_size_mb", 0),
                 "sort_by": getattr(self, "sort_by", ""),
                 "enforce_license_gate": getattr(self, "enforce_license_gate", False),
                 "search_history": getattr(self, "search_history", [])[:MAX_HISTORY],
@@ -561,6 +565,13 @@ class RetroWaveIA:
                 self.min_item_size_mb = max(0, int(data.get("min_item_size_mb", APP_CONFIG["min_item_size_mb"])))
             except (TypeError, ValueError):
                 self.min_item_size_mb = int(APP_CONFIG["min_item_size_mb"])
+            self.hide_small_video_files = bool(data.get("hide_small_video_files", APP_CONFIG["hide_small_video_files"]))
+            try:
+                self.min_video_file_size_mb = max(
+                    0, int(data.get("min_video_file_size_mb", APP_CONFIG["min_video_file_size_mb"]))
+                )
+            except (TypeError, ValueError):
+                self.min_video_file_size_mb = int(APP_CONFIG["min_video_file_size_mb"])
             sort_val = str(data.get("sort_by") or "")
             if any(v == sort_val for _, v in SORT_OPTIONS):
                 self.sort_by = sort_val
@@ -2182,6 +2193,13 @@ class RetroWaveIA:
             ("Download / all visible files all", "item", "D"),
             ("Filter / file filter menu", "keyword", "f/F"),
             ("Filter / video only", "video_only", "v"),
+            (
+                f"Filter / hide small videos ({'on' if getattr(self, 'hide_small_video_files', False) else 'off'}, "
+                f"<{getattr(self, 'min_video_file_size_mb', 0)}MB)",
+                "toggle_hide_small_video_files",
+                None,
+            ),
+            ("Filter / min video file size (MB)", "edit_min_video_file_size", None),
             ("Download / save bucket folder", "bucket", None),
             ("App / audit summary (library health counts)", "audit", "y"),
             ("Filter / rights license", "license_gate", None),
@@ -2911,7 +2929,14 @@ class RetroWaveIA:
         self.restore_file_view_state(ident)
         self.mode = "FILES"
         self.focus = "LIST"
-        self.status = "Use arrows to choose a file, then [Preview], [Folder], [Item], or [Download]."
+        all_videos = self._all_recognized_video_files()
+        if all_videos and not self._eligible_video_files():
+            self.status = (
+                f"No video files meet the {self.min_video_file_size_mb}MB minimum "
+                f"({len(all_videos)} filtered -- toggle 'hide small videos' to show)."
+            )
+        else:
+            self.status = "Use arrows to choose a file, then [Preview], [Folder], [Item], or [Download]."
         return True
 
     def load_files(self, async_load: bool = False) -> None:
@@ -3033,10 +3058,43 @@ class RetroWaveIA:
         self.selected_file_names.clear()
         self.selected_file_order.clear()
 
+    def _min_video_file_size_bytes(self) -> int:
+        """Bytes threshold for the configured min_video_file_size_mb, or 0
+        when the hide-small-videos gate is off. Mirrors
+        _search_min_item_size_bytes so the MB->bytes conversion can't drift
+        out of sync between the two independent thresholds."""
+        if not getattr(self, "hide_small_video_files", False):
+            return 0
+        return max(0, int(getattr(self, "min_video_file_size_mb", 0) or 0)) * 1024 * 1024
+
+    def _passes_video_size_filter(self, f: "IAFile") -> bool:
+        """Non-video files (subtitles, metadata, thumbnails, images, audio,
+        etc.) are always eligible here -- this only gates recognized video
+        files. A known size below the threshold is excluded; an unknown/zero
+        size fails open rather than hiding a file we can't judge."""
+        if not is_video_file(f.name, f.fmt):
+            return True
+        min_bytes = self._min_video_file_size_bytes()
+        if min_bytes <= 0:
+            return True
+        size = int(getattr(f, "size", 0) or 0)
+        return size <= 0 or size >= min_bytes
+
+    def _all_recognized_video_files(self) -> List[IAFile]:
+        """All video files in this item after dedup, ignoring the
+        video_only/keyword view filters -- used to tell "no video in this
+        item" apart from "every video is below the size minimum"."""
+        files = deduplicate_file_variants(list(self.files))
+        return [f for f in files if is_video_file(f.name, f.fmt)]
+
+    def _eligible_video_files(self) -> List[IAFile]:
+        return [f for f in self._all_recognized_video_files() if self._passes_video_size_filter(f)]
+
     def get_visible_files(self) -> List[IAFile]:
         files = deduplicate_file_variants(list(self.files))
         if self.video_only:
             files = [f for f in files if is_video_file(f.name, f.fmt)]
+        files = [f for f in files if self._passes_video_size_filter(f)]
         kw = self.file_kw.strip()
         if kw:
             rx = re.compile(re.escape(kw), re.IGNORECASE)
@@ -5408,6 +5466,11 @@ class RetroWaveIA:
                     msg = "Loading file list..."
                 elif self.file_kw:
                     msg = f"No files match \"{self.file_kw}\"  |  f filter menu  |  U clear marks  |  v show all"
+                elif self._all_recognized_video_files() and not self._eligible_video_files():
+                    msg = (
+                        f"No video files meet the {self.min_video_file_size_mb}MB minimum  |  "
+                        "toggle 'hide small videos' to show  |  Backspace results"
+                    )
                 elif self.video_only:
                     msg = "No video files visible  |  v show all  |  f filter menu  |  Backspace results"
                 else:
@@ -6099,6 +6162,30 @@ class RetroWaveIA:
                 self.sel_f = 0
                 self.status = "Video only: ON" if self.video_only else "Video only: OFF (showing all files)"
                 self.save_current_file_view_state()
+                return
+
+            if action == "toggle_hide_small_video_files":
+                self.hide_small_video_files = not self.hide_small_video_files
+                self.sel_f = 0
+                self._save_session()
+                state = "on" if self.hide_small_video_files else "off"
+                n = len(self.get_visible_files())
+                self.status = f"Hide small videos: {state} (<{self.min_video_file_size_mb}MB) — {n} visible"
+                return
+
+            if action == "edit_min_video_file_size":
+                s = self.prompt("Minimum video file size in MB (0 = no minimum): ", str(self.min_video_file_size_mb))
+                if s is not None:
+                    try:
+                        mb = max(0, int(str(s).strip() or 0))
+                    except ValueError:
+                        self.status = "Minimum video file size must be a whole number of MB."
+                        return
+                    self.min_video_file_size_mb = mb
+                    self.sel_f = 0
+                    self._save_session()
+                    n = len(self.get_visible_files())
+                    self.status = f"Minimum video file size: {mb}MB — {n} visible"
                 return
 
             if action == "bucket":

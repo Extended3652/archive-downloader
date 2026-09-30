@@ -59,7 +59,7 @@ class IAFile:
 # ---- shared constants ----
 DEFAULT_MEDIA_ROOT = ia_config.DEFAULT_MEDIA_ROOT
 DVD_IMAGE_EXTS = {".iso"}
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"} | DVD_IMAGE_EXTS
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".ogv"} | DVD_IMAGE_EXTS
 VIDEO_FORMAT_HINTS = (
     "h.264",
     "h264",
@@ -69,6 +69,7 @@ VIDEO_FORMAT_HINTS = (
     "webm",
     "quicktime",
     "avi",
+    "ogg",
 )
 TORRENT_FORMAT_HINTS = (
     "archive bittorrent",

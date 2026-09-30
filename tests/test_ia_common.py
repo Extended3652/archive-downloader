@@ -163,6 +163,12 @@ class TestIsVideoFile:
     def test_format_hint_h264(self):
         assert is_video_file("data.bin", "h.264")
 
+    def test_ogv_extension(self):
+        assert is_video_file("movie.ogv")
+
+    def test_format_hint_ogg_video(self):
+        assert is_video_file("data.bin", "Ogg Video")
+
     def test_unrelated_format(self):
         assert not is_video_file("data.bin", "text")
 

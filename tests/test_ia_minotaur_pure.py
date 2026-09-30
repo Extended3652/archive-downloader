@@ -111,6 +111,8 @@ class TestRetroWaveIAState:
                 "rows_per_page": 30,
                 "hide_small_items": True,
                 "min_item_size_mb": 250,
+                "hide_small_video_files": True,
+                "min_video_file_size_mb": 250,
                 "media_root": "/tmp/unused",
             },
         )
@@ -126,6 +128,8 @@ class TestRetroWaveIAState:
         assert app.enforce_license_gate is True
         assert app.hide_small_items is True
         assert app.min_item_size_mb == 250
+        assert app.hide_small_video_files is True
+        assert app.min_video_file_size_mb == 250
         assert app.mode == "RESULTS"
 
     def test_music_folder_favorites_stay_in_music_bucket(self):
@@ -741,6 +745,154 @@ class TestRetroWaveIAState:
             "03 - Marty's First Date.mp4", "The Critic Webisodes.mp4"
         ]
         assert [f.name for f in app.get_marked_visible_files()] == app.selected_file_order
+
+    def test_get_visible_files_hides_undersized_video_below_threshold(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("tiny.mp4", 44 * 1024 * 1024, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert app.get_visible_files() == []
+
+    def test_get_visible_files_hides_video_one_mb_under_threshold(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("almost.mp4", 249 * 1024 * 1024, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert app.get_visible_files() == []
+
+    def test_get_visible_files_keeps_video_exactly_at_threshold(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("exact.mp4", 250 * 1024 * 1024, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert [f.name for f in app.get_visible_files()] == ["exact.mp4"]
+
+    def test_get_visible_files_keeps_video_above_threshold(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("big.mp4", 300 * 1024 * 1024, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert [f.name for f in app.get_visible_files()] == ["big.mp4"]
+
+    def test_get_visible_files_video_size_filter_fails_open_on_unknown_size(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("unknown.mp4", 0, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert [f.name for f in app.get_visible_files()] == ["unknown.mp4"]
+
+    def test_get_visible_files_keeps_non_video_files_regardless_of_size(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [
+            ia_minotaur.IAFile("subtitles.srt", 1024, "SubRip"),
+            ia_minotaur.IAFile("info.txt", 200, "Text"),
+            ia_minotaur.IAFile("cover.jpg", 5000, "JPEG"),
+            ia_minotaur.IAFile("commentary.mp3", 2 * 1024 * 1024, "VBR MP3"),
+        ]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert [f.name for f in app.get_visible_files()] == [
+            "subtitles.srt", "info.txt", "cover.jpg", "commentary.mp3"
+        ]
+
+    def test_get_visible_files_mixed_item_exposes_only_the_large_video(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [
+            ia_minotaur.IAFile("tiny.mp4", 44 * 1024 * 1024, "MPEG4"),
+            ia_minotaur.IAFile("full.mkv", 800 * 1024 * 1024, "Matroska"),
+            ia_minotaur.IAFile("info.txt", 200, "Text"),
+        ]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert [f.name for f in app.get_visible_files()] == ["full.mkv", "info.txt"]
+
+    def test_get_visible_files_recognizes_ogv_as_video_for_size_gate(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("tiny.ogv", 44 * 1024 * 1024, "Ogg Video")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert app.get_visible_files() == []
+
+    def test_toggle_hide_small_video_files_restores_tiny_videos(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [ia_minotaur.IAFile("tiny.mp4", 44 * 1024 * 1024, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert app.get_visible_files() == []
+
+        app.hide_small_video_files = False
+
+        assert [f.name for f in app.get_visible_files()] == ["tiny.mp4"]
+
+    def test_no_eligible_video_files_when_every_video_is_undersized(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [
+            ia_minotaur.IAFile("tiny1.mp4", 44 * 1024 * 1024, "MPEG4"),
+            ia_minotaur.IAFile("tiny2.mp4", 12 * 1024 * 1024, "MPEG4"),
+        ]
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+
+        assert app._all_recognized_video_files() != []
+        assert app._eligible_video_files() == []
+
+    def test_download_selection_paths_agree_with_visible_files_on_eligibility(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.files = [
+            ia_minotaur.IAFile("tiny.mp4", 44 * 1024 * 1024, "MPEG4"),
+            ia_minotaur.IAFile("full.mkv", 800 * 1024 * 1024, "Matroska"),
+        ]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+        app.sel_f = 0
+        app.selected_file_names = set()
+        app.selected_file_order = []
+        app.save_current_file_view_state = lambda: None
+
+        # "download visible" / mark-all-visible path
+        app.mark_all_visible_files()
+        assert app.selected_file_order == ["full.mkv"]
+
+        # marked-files download path agrees with the same eligibility rule
+        assert [f.name for f in app.get_marked_visible_files()] == ["full.mkv"]
+
+        # the tiny file has no reachable index in the visible list -- there
+        # is only one visible entry, and selecting it always resolves to the
+        # eligible file, never the filtered-out one
+        app.clear_file_marks()
+        app.sel_f = 0
+        app.toggle_current_file_mark()
+        assert app.selected_file_names == {"full.mkv"}
+        assert "tiny.mp4" not in app.selected_file_names
 
     def test_prefix_suggestions_include_directory_prefixes(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
@@ -1613,6 +1765,81 @@ class TestRetroWaveIAState:
         assert [f.name for f in app.files] == ["one.mp4"]
         assert app.file_owner_item.identifier == "item1"
 
+    def test_file_load_reports_no_eligible_video_when_all_videos_undersized(self, monkeypatch):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "RESULTS"
+        app.results = [ia_minotaur.SearchResult("item1", "One")]
+        app.sel_r = 0
+        app.result_filter = ""
+        app.page = 1
+        app.file_view_state = {}
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+        app.save_current_file_view_state = lambda: None
+        app.render = lambda: None
+        app.status = ""
+
+        started = []
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=False):
+                self._target = target
+                started.append(self)
+
+            def start(self):
+                return None
+
+        monkeypatch.setattr(ia_minotaur.threading, "Thread", FakeThread)
+        monkeypatch.setattr(
+            ia_minotaur,
+            "ia_files",
+            lambda _identifier: ([ia_minotaur.IAFile("tiny.mp4", 44 * 1024 * 1024, "MPEG4")], {"metadata": {}}, ""),
+        )
+
+        app.load_files(async_load=True)
+        started[0]._target()
+        assert app.finish_file_load_if_ready() is True
+
+        assert app.get_visible_files() == []
+        assert "No video files meet the 250MB minimum" in app.status
+
+    def test_file_load_uses_normal_status_when_a_video_is_eligible(self, monkeypatch):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "RESULTS"
+        app.results = [ia_minotaur.SearchResult("item1", "One")]
+        app.sel_r = 0
+        app.result_filter = ""
+        app.page = 1
+        app.file_view_state = {}
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+        app.save_current_file_view_state = lambda: None
+        app.render = lambda: None
+        app.status = ""
+
+        started = []
+
+        class FakeThread:
+            def __init__(self, target=None, daemon=False):
+                self._target = target
+                started.append(self)
+
+            def start(self):
+                return None
+
+        monkeypatch.setattr(ia_minotaur.threading, "Thread", FakeThread)
+        monkeypatch.setattr(
+            ia_minotaur,
+            "ia_files",
+            lambda _identifier: ([ia_minotaur.IAFile("big.mp4", 300 * 1024 * 1024, "MPEG4")], {"metadata": {}}, ""),
+        )
+
+        app.load_files(async_load=True)
+        started[0]._target()
+        assert app.finish_file_load_if_ready() is True
+
+        assert "No video files meet" not in app.status
+
     def test_file_preview_pins_loaded_owner_when_search_selection_changes(self, monkeypatch):
         app = RetroWaveIA.__new__(RetroWaveIA)
         owner = ia_minotaur.SearchResult("item-a", "Item A")
@@ -2005,6 +2232,42 @@ class TestRetroWaveIAState:
 
         assert app.min_item_size_mb == 500
         assert calls == [True]
+
+    def test_toggle_hide_small_video_files_action_flips_and_persists(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "FILES"
+        app.files = [ia_minotaur.IAFile("tiny.mp4", 44 * 1024 * 1024, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+        app.sel_f = 0
+        app._save_session = lambda: None
+        app.focus = "MENU"
+
+        app.activate_menu_action("toggle_hide_small_video_files")
+
+        assert app.hide_small_video_files is False
+        assert "off" in app.status
+        assert [f.name for f in app.get_visible_files()] == ["tiny.mp4"]
+
+    def test_edit_min_video_file_size_action_updates_threshold(self):
+        app = RetroWaveIA.__new__(RetroWaveIA)
+        app.mode = "FILES"
+        app.files = [ia_minotaur.IAFile("mid.mp4", 300 * 1024 * 1024, "MPEG4")]
+        app.file_kw = ""
+        app.video_only = False
+        app.hide_small_video_files = True
+        app.min_video_file_size_mb = 250
+        app.sel_f = 0
+        app._save_session = lambda: None
+        app.focus = "MENU"
+        app.prompt = lambda _label, _default="", history=None: "500"
+
+        app.activate_menu_action("edit_min_video_file_size")
+
+        assert app.min_video_file_size_mb == 500
+        assert app.get_visible_files() == []
 
     def test_search_min_item_size_bytes_converts_mb_and_respects_toggle(self):
         app = RetroWaveIA.__new__(RetroWaveIA)
