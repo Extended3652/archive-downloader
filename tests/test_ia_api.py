@@ -222,7 +222,10 @@ def test_min_item_size_excludes_small_and_keeps_unknown_and_large():
     )
 
     assert err == ""
-    assert total == 7
+    # A single fetch (7 docs, fewer than RANK_POOL_ROWS) confirms genuine
+    # exhaustion, so the exact eligible count (4) is known and reported --
+    # not IA's raw numFound (7), which would expose a phantom extra page.
+    assert total == 4
     assert [r.identifier for r in results] == ["at-threshold", "big600", "big2_4g", "unknown-size"]
 
 
@@ -254,7 +257,9 @@ def test_min_item_size_backfills_page_from_wider_pool_instead_of_shrinking_it():
     page2, total2, err2 = ia_api.ia_search_via_curl("q", 3, 2, runner=runner, min_item_size_bytes=250 * MB)
 
     assert err1 == err2 == ""
-    assert total1 == total2 == 6
+    # Exhaustion confirmed in one fetch (6 docs, fewer than RANK_POOL_ROWS):
+    # the exact eligible count (3) is known and reported for both pages.
+    assert total1 == total2 == 3
     assert [r.identifier for r in page1] == ["big0", "big1", "big2"]
     assert page2 == []
     cmd = runner.calls[0][0]
@@ -263,19 +268,159 @@ def test_min_item_size_backfills_page_from_wider_pool_instead_of_shrinking_it():
     assert _cmd_has(cmd, "page=1")
 
 
-def test_min_item_size_deep_page_falls_back_to_raw_paging_without_backfill():
+def test_min_item_size_deep_page_still_backfills_not_bounded_by_rerank_pool():
+    # Unlike reranking (which only pools the leading pool_pages), the size
+    # filter has to hold at any depth -- a small-item-heavy run can appear
+    # anywhere, not just early on. A deep page request with only one raw doc
+    # total (genuinely exhausted, and it's below threshold) must still come
+    # back empty rather than erroring or hanging, and the fetch must be a
+    # pool-style walk (RANK_POOL_ROWS from page 1), not a bare rows=5/page=41
+    # request the way the old rerank-only pool bound produced.
     docs = [_sized_doc("tiny", 10 * MB)]
     payload = {"response": {"numFound": 1, "docs": docs}}
     runner = runner_for(stdout=json.dumps(payload))
 
-    # Page far beyond the pool bound (200 // 5 rows = 40 pages): no backfill,
-    # filtered in place, same documented limitation the reranker already has.
     results, _total, _err = ia_api.ia_search_via_curl("q", 5, 41, runner=runner, min_item_size_bytes=250 * MB)
 
     assert results == []
     cmd = runner.calls[0][0]
-    assert _cmd_has(cmd, "rows=5")
-    assert _cmd_has(cmd, "page=41")
+    assert _cmd_has(cmd, f"rows={ia_api.RANK_POOL_ROWS}")
+    assert _cmd_has(cmd, "page=1")
+    # Only one request: the single raw doc is fewer than RANK_POOL_ROWS, so
+    # exhaustion is detected immediately without spending the full batch cap.
+    assert len(runner.calls) == 1
+
+
+def test_min_item_size_page6_backfills_past_first_pool_batch():
+    # The exact scenario this fix targets: more than RANK_POOL_ROWS=200 raw
+    # results, with few enough eligible docs in the first 200 that filtered
+    # page 6 (rows=30 -> positions 150-179) can't be filled from that first
+    # batch alone (100 eligible < 180 needed), but a second batch (raw
+    # positions 200-399, another 100 eligible) pushes the cumulative eligible
+    # count past 180. Page 6 must come back full by walking into that second
+    # batch, not return a near-empty page just because the first 200-row pool
+    # ran dry. A final third, shorter batch (20 more, all eligible) lets a
+    # later page hit genuine exhaustion (220 eligible total).
+    docs = []
+    for batch_start in (0, 200):
+        for i in range(200):
+            # Every other doc is eligible: 100 per 200-row batch.
+            if i % 2 == 0:
+                docs.append(_sized_doc(f"big{batch_start + i}", 600 * MB))
+            else:
+                docs.append(_sized_doc(f"small{batch_start + i}", 10 * MB))
+    docs += [_sized_doc(f"big-tail{i}", 600 * MB) for i in range(20)]  # raw 400-419, all eligible
+    assert len(docs) == 420
+
+    def paged_runner(cmd, timeout=60):
+        # Extract page/rows from the --data-urlencode args and slice the
+        # fixture like a real paginated IA response would.
+        rows_arg = next(p for p in cmd if p.startswith("rows="))
+        page_arg = next(p for p in cmd if p.startswith("page="))
+        rows = int(rows_arg.split("=", 1)[1])
+        page_num = int(page_arg.split("=", 1)[1])
+        start = (page_num - 1) * rows
+        page_docs = docs[start : start + rows]
+        payload = {"response": {"numFound": len(docs), "docs": page_docs}}
+        return 0, json.dumps(payload), ""
+
+    calls = []
+    def counting_runner(cmd, timeout=60):
+        calls.append(cmd)
+        return paged_runner(cmd, timeout)
+    counting_runner.calls = calls
+
+    eligible_total = sum(1 for d in docs if d.get("item_size", 0) >= 250 * MB)
+    assert eligible_total == 220  # 100 + 100 + 20
+
+    page6, total6, err6 = ia_api.ia_search_via_curl("q", 30, 6, runner=counting_runner, min_item_size_bytes=250 * MB)
+
+    assert err6 == ""
+    assert len(page6) == 30, f"page 6 should be a full backfilled page, got {len(page6)}"
+    assert all(r.item_size >= 250 * MB for r in page6)
+    # 100 eligible in the first batch alone can't cover page 6 (needs 180);
+    # walking into a second raw batch (page=2, positions 200-399) was required.
+    assert len(calls) >= 2
+    assert _cmd_has(calls[1], "page=2")
+    # Page 6 stopped once it had enough for the page (both raw batches were
+    # full-length, RANK_POOL_ROWS docs each) -- exhaustion was never
+    # confirmed, so the exact total beyond what was walked is unknown and the
+    # raw total (420) is reported, not a guess.
+    assert total6 == len(docs)
+
+    # Paging onward must not skip or duplicate eligible items, and must
+    # eventually hit the genuine end (220 eligible items -> 7 full pages of
+    # 30, 10 left over on a short-but-real final page).
+    seen_ids = set()
+    for page_num in range(1, 8):
+        page_results, _t, _e = ia_api.ia_search_via_curl(
+            "q", 30, page_num, runner=counting_runner, min_item_size_bytes=250 * MB
+        )
+        ids = [r.identifier for r in page_results]
+        assert not (seen_ids & set(ids)), f"page {page_num} overlapped an earlier page"
+        assert len(page_results) == 30, f"page {page_num} should be a full page, got {len(page_results)}"
+        seen_ids.update(ids)
+    assert len(seen_ids) == eligible_total - 10
+
+    # A genuinely final short page (page 8: only 10 of 220 eligible remain)
+    # is allowed to be short -- exhaustion is real here, not a pool artifact.
+    # Reaching it required a third, short batch (20 docs, raw 400-419), which
+    # positively confirms exhaustion -- so the exact eligible total (220) is
+    # now known and reported instead of the raw total (420).
+    page8, total8, _e = ia_api.ia_search_via_curl("q", 30, 8, runner=counting_runner, min_item_size_bytes=250 * MB)
+    assert len(page8) == 10
+    assert total8 == eligible_total == 220
+
+    # No phantom later pages: page 9 is entirely past the exact, now-known
+    # end (220 eligible / 30 rows = 8 pages), and reports the same exact
+    # total rather than the total bouncing back up to the raw count.
+    page9, total9, _e = ia_api.ia_search_via_curl("q", 30, 9, runner=counting_runner, min_item_size_bytes=250 * MB)
+    assert page9 == []
+    assert total9 == 220
+
+
+def test_min_item_size_capped_before_exhaustion_uses_conservative_total_not_partial():
+    # State B: MAX_POOL_BATCHES is reached without IA ever signalling true
+    # exhaustion (every batch is a full RANK_POOL_ROWS docs, never short).
+    # A deep page with a very low eligibility rate can't be filled within the
+    # batch cap. The exact filtered total is genuinely unknown here -- it
+    # must not collapse to the small partial eligible count accumulated so
+    # far, and repeat calls must not bounce.
+    num_found = 100000
+
+    def infinite_low_density_runner(cmd, timeout=60):
+        page_arg = next(p for p in cmd if p.startswith("page="))
+        page_num = int(page_arg.split("=", 1)[1])
+        # 1 eligible doc per 200-row batch (0.5% density): every batch is a
+        # full RANK_POOL_ROWS docs, so raw exhaustion is never confirmed.
+        docs = [
+            _sized_doc(f"p{page_num}-{i}", 600 * MB if i == 0 else 10 * MB)
+            for i in range(ia_api.RANK_POOL_ROWS)
+        ]
+        payload = {"response": {"numFound": num_found, "docs": docs}}
+        return 0, json.dumps(payload), ""
+
+    calls = []
+    def counting_runner(cmd, timeout=60):
+        calls.append(cmd)
+        return infinite_low_density_runner(cmd, timeout)
+
+    # Deep enough that MAX_POOL_BATCHES * 1 eligible/batch can't reach it.
+    results, total, err = ia_api.ia_search_via_curl(
+        "q", 30, 50, runner=counting_runner, min_item_size_bytes=250 * MB
+    )
+
+    assert err == ""
+    assert len(results) < 30  # short page, but exhaustion was never confirmed
+    assert len(calls) == ia_api.MAX_POOL_BATCHES  # cap reached, not exceeded
+    assert total != 5, "must not collapse to the partial eligible count accumulated before the cap"
+    assert total == num_found, "capped-before-exhaustion must report the conservative raw total"
+
+    # Repeating the same call (as paging would) must not bounce the total.
+    _results2, total2, _err2 = ia_api.ia_search_via_curl(
+        "q", 30, 50, runner=counting_runner, min_item_size_bytes=250 * MB
+    )
+    assert total2 == total
 
 
 def test_min_item_size_filters_before_rerank_and_keeps_ranked_order():

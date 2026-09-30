@@ -23,6 +23,14 @@ METADATA_CURL_CONNECT_TIMEOUT_S = 4
 # pages and deeper pages fall back to IA's raw ordering.
 RANK_POOL_ROWS = 200
 
+# A min-item-size filter can thin out any one RANK_POOL_ROWS-sized batch of
+# raw candidates (small items removed). One batch not containing enough
+# eligible items isn't evidence the result list is exhausted -- it may just
+# be a locally dense run of small items -- so up to this many batches are
+# fetched, walking further into IA's raw ordering, before giving up and
+# returning whatever was found. Bounds worst-case requests per call.
+MAX_POOL_BATCHES = 5
+
 
 def run_cmd(cmd: List[str], timeout: int = 60, logger: Optional[Logger] = None) -> Tuple[int, str, str]:
     try:
@@ -74,37 +82,20 @@ def _passes_min_item_size(result: SearchResult, min_item_size_bytes: int) -> boo
     return size <= 0 or size >= min_item_size_bytes
 
 
-def ia_search_via_curl(
+def _fetch_ia_page(
     query: str,
-    rows: int,
-    page: int,
-    sort: str = "",
-    runner: Callable[..., Tuple[int, str, str]] = run_cmd,
-    *,
-    rerank_text: str = "",
-    media_filter: str = "any",
-    min_item_size_bytes: int = 0,
-) -> Tuple[List[SearchResult], int, str]:
-    # Local re-ranking only applies to relevance ordering (empty sort); when the
-    # user chose an explicit IA sort we honour it untouched. It also only kicks
-    # in for the leading pages that the candidate window can cover.
-    rows = max(1, int(rows or 1))
-    min_item_size_bytes = max(0, int(min_item_size_bytes or 0))
-    size_filter_active = min_item_size_bytes > 0
-    pool_pages = max(1, RANK_POOL_ROWS // rows)
-    do_rerank = bool((rerank_text or "").strip()) and not sort and page <= pool_pages
-    # A minimum-size filter can thin out a raw IA page (small items removed),
-    # which would otherwise hand back a partial page post-pagination. Fetch
-    # the same wide candidate window the reranker uses so filtered-out items
-    # get backfilled from later results in the pool instead of just vanishing
-    # from the page. Deep pages beyond the pool fall back to a raw per-page
-    # fetch and are filtered in place, same limitation the reranker already has.
-    use_pool = do_rerank or (size_filter_active and page <= pool_pages)
-    if use_pool:
-        fetch_rows, fetch_page = RANK_POOL_ROWS, 1
-    else:
-        fetch_rows, fetch_page = rows, page
+    fetch_rows: int,
+    fetch_page: int,
+    sort: str,
+    runner: Callable[..., Tuple[int, str, str]],
+) -> Tuple[List[SearchResult], int, int, str]:
+    """Fetch one raw page from IA's advancedsearch endpoint.
 
+    Returns (results, raw_doc_count, num_found, err). raw_doc_count is how
+    many docs IA actually returned (before the missing-identifier skip below),
+    which is what tells a caller walking multiple pages whether this was a
+    full page or the true end of the raw result list.
+    """
     cmd = [
         "curl",
         "-sS",
@@ -157,12 +148,12 @@ def ia_search_via_curl(
     code, out, err = runner(cmd, timeout=SEARCH_TIMEOUT_S)
     if code != 0:
         msg = (err or out).strip()
-        return [], 0, msg or f"search failed (code {code})"
+        return [], 0, 0, msg or f"search failed (code {code})"
 
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
-        return [], 0, "search returned non-JSON"
+        return [], 0, 0, "search returned non-JSON"
 
     response = (data or {}).get("response") or {}
     num_found = int(response.get("numFound") or 0)
@@ -215,15 +206,86 @@ def ia_search_via_curl(
             )
         )
 
-    if size_filter_active:
-        results = [r for r in results if _passes_min_item_size(r, min_item_size_bytes)]
+    return results, len(docs), num_found, ""
+
+
+def ia_search_via_curl(
+    query: str,
+    rows: int,
+    page: int,
+    sort: str = "",
+    runner: Callable[..., Tuple[int, str, str]] = run_cmd,
+    *,
+    rerank_text: str = "",
+    media_filter: str = "any",
+    min_item_size_bytes: int = 0,
+) -> Tuple[List[SearchResult], int, str]:
+    # Local re-ranking only applies to relevance ordering (empty sort); when the
+    # user chose an explicit IA sort we honour it untouched. It also only kicks
+    # in for the leading pages that the candidate window can cover.
+    rows = max(1, int(rows or 1))
+    min_item_size_bytes = max(0, int(min_item_size_bytes or 0))
+    size_filter_active = min_item_size_bytes > 0
+    pool_pages = max(1, RANK_POOL_ROWS // rows)
+    do_rerank = bool((rerank_text or "").strip()) and not sort and page <= pool_pages
+    # Reranking only pools the leading pages (bounded window, see above); a
+    # size filter has to hold for every page, since a small-item-heavy run
+    # can appear at any depth, not just early on -- so it isn't bounded by
+    # pool_pages the way reranking is.
+    use_pool = do_rerank or size_filter_active
+
+    if not use_pool:
+        results, _raw_count, num_found, err = _fetch_ia_page(query, rows, page, sort, runner)
+        return results, num_found, err
+
+    # Pool path: walk raw IA pages from page 1, RANK_POOL_ROWS at a time,
+    # keeping eligible (post-size-filter) candidates, until there are enough
+    # to cover the requested page, IA's raw list is genuinely exhausted (a
+    # batch comes back shorter than requested), or MAX_POOL_BATCHES is hit.
+    # A batch being thin on eligible items is not itself evidence of
+    # exhaustion -- it may just be a locally dense run of filtered-out items
+    # -- so we keep walking forward instead of stopping there.
+    target_count = page * rows
+    eligible: List[SearchResult] = []
+    num_found = 0
+    raw_page = 1
+    exhausted_confirmed = False
+    for _ in range(MAX_POOL_BATCHES):
+        batch_results, raw_count, batch_num_found, err = _fetch_ia_page(query, RANK_POOL_ROWS, raw_page, sort, runner)
+        if err:
+            return [], 0, err
+        num_found = batch_num_found
+        if size_filter_active:
+            eligible.extend(r for r in batch_results if _passes_min_item_size(r, min_item_size_bytes))
+        else:
+            eligible.extend(batch_results)
+        # A batch shorter than requested is IA saying its raw list ends here,
+        # not just this batch being thin on eligible items -- that's the one
+        # unambiguous exhaustion signal (see MAX_POOL_BATCHES vs. genuine
+        # end-of-list note below).
+        exhausted_confirmed = raw_count < RANK_POOL_ROWS
+        if len(eligible) >= target_count or exhausted_confirmed:
+            break
+        raw_page += 1
 
     if do_rerank:
-        results = ia_ranking.rerank(results, rerank_text, media_filter)
+        eligible = ia_ranking.rerank(eligible, rerank_text, media_filter)
 
-    if use_pool:
-        start = (page - 1) * rows
-        results = results[start : start + rows]
+    start = (page - 1) * rows
+    results = eligible[start : start + rows]
+
+    # If the walk positively confirmed it reached the true end of IA's raw
+    # result list, `eligible` is the complete filtered set and its length is
+    # the exact total -- report that instead of IA's raw numFound, so paging
+    # built from it doesn't expose phantom pages past the last real eligible
+    # result. If we only stopped because the requested page was already full,
+    # or because MAX_POOL_BATCHES was hit, there may be more eligible items
+    # further into the raw list that were never looked at, so the exact total
+    # is genuinely unknown -- keep reporting the conservative raw total in
+    # that case (never the partial eligible count; that would just trade one
+    # wrong number for a differently wrong, and unstable, one).
+    if size_filter_active and exhausted_confirmed:
+        num_found = len(eligible)
 
     return results, num_found, ""
 
